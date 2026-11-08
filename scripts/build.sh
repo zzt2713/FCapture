@@ -75,13 +75,11 @@ fi
 cp -f "$ELA_DLL" "$DIST_DIR/"
 echo "[build] 已复制: $ELA_DLL → $DIST_DIR/"
 
-step "5/5 生成更新包（自动更新用）"
-# 包结构必须是"解压后直接就是 exe 所在目录的内容"，
-# 应用内更新会把 zip 解压覆盖到安装目录。
+step "5/5 生成发布包"
+
 if [[ -f "$PROJECT_ROOT/docs/user-guide.md" ]]; then
     cp -f "$PROJECT_ROOT/docs/user-guide.md" "$DIST_DIR/用户手册.md"
 fi
-touch "$DIST_DIR/portable.txt"
 
 # 版本号从 CMakeLists 的 project(VERSION) 读，和程序内版本保持一致
 APP_VERSION="$(sed -nE 's/^project\(FCapture VERSION ([0-9.]+).*/\1/p' \
@@ -90,27 +88,32 @@ if [[ -z "$APP_VERSION" ]]; then
     APP_VERSION="1.0.0"
 fi
 
+# ---------------------------------------------------------------- 便携包
+# 便携包带 portable.txt，配置落在 data/ 子目录，拷走即可。
 # 命名约定必须与 UpdateChecker::assetNamePattern() 一致：
 #   F-Capture-<version>-portable.zip
+touch "$DIST_DIR/portable.txt"
+
 ZIP_NAME="F-Capture-${APP_VERSION}-portable.zip"
 rm -f "$PROJECT_ROOT/dist/$ZIP_NAME"
 
 WIN_SRC="$(cygpath -w "$PROJECT_ROOT/$DIST_DIR" 2>/dev/null || echo "$PROJECT_ROOT/$DIST_DIR")"
 WIN_DST="$(cygpath -w "$PROJECT_ROOT/dist/$ZIP_NAME" 2>/dev/null || echo "$PROJECT_ROOT/dist/$ZIP_NAME")"
 # -Path 传目录会多带一层目录名；用通配符把目录内容放到 zip 根
-powershell -NoProfile -Command     "Compress-Archive -Path '$WIN_SRC\*' -DestinationPath '$WIN_DST' -Force"
+powershell -NoProfile -Command \
+    "Compress-Archive -Path '$WIN_SRC\*' -DestinationPath '$WIN_DST' -Force"
 
 ZIP_FILE="$PROJECT_ROOT/dist/$ZIP_NAME"
 if [[ -f "$ZIP_FILE" ]]; then
-    echo "[build] 更新包: $ZIP_FILE ($(du -h "$ZIP_FILE" | cut -f1))"
+    echo "[build] 便携包: $ZIP_FILE ($(du -h "$ZIP_FILE" | cut -f1))"
 
     # 输出 SHA256 —— 发布到 GitHub Release 时把这一行写进 release 说明，
     # 客户端更新时会据此校验下载完整性（UpdateChecker::parseSha256FromBody）。
-    SHA256="$(powershell -NoProfile -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath '$WIN_DST').Hash.ToLower()" | tr -d '')"
+    SHA256="$(powershell -NoProfile -Command \
+        "(Get-FileHash -Algorithm SHA256 -LiteralPath '$WIN_DST').Hash.ToLower()" | tr -d '\r')"
     echo ""
     echo "[build] ====== 发布用信息 ======"
     echo "[build] 资产文件: $ZIP_NAME"
-    echo "[build] SHA256:   $SHA256"
     echo "[build] 请把下一行写进 GitHub Release 说明："
     echo "[build] SHA256: $SHA256"
     echo "[build] ========================"
@@ -119,12 +122,42 @@ if [[ -f "$ZIP_FILE" ]]; then
         echo "SHA256: $SHA256" > "$PROJECT_ROOT/dist/SHA256.txt"
     fi
 else
-    echo "[build] WARN: 更新包未生成" >&2
+    echo "[build] WARN: 便携包未生成" >&2
+fi
+
+# ---------------------------------------------------------------- 安装包
+# 安装版**不能**带 portable.txt，否则配置会写进 Program Files（无权限）。
+# iss 脚本里已经明确不打包该文件，这里把 dist 里的删掉更保险。
+rm -f "$DIST_DIR/portable.txt"
+
+ISCC=""
+for candidate in \
+    "C:/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+    "C:/Program Files/Inno Setup 6/ISCC.exe" \
+    "D:/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+    "D:/Program Files/Inno Setup 6/ISCC.exe"; do
+    if [[ -f "$candidate" ]]; then
+        ISCC="$candidate"
+        break
+    fi
+done
+
+if [[ -n "$ISCC" ]]; then
+    echo "[build] 使用 Inno Setup: $ISCC"
+    "$ISCC" //Qp "$PROJECT_ROOT/installer/FCapture.iss"
+    if [[ $? -eq 0 ]]; then
+        SETUP_FILE="$PROJECT_ROOT/dist/installer/F-Capture-${APP_VERSION}-setup.exe"
+        if [[ -f "$SETUP_FILE" ]]; then
+            echo "[build] 安装包: $SETUP_FILE ($(du -h "$SETUP_FILE" | cut -f1))"
+        fi
+    else
+        echo "[build] WARN: Inno Setup 编译失败" >&2
+    fi
+else
+    echo "[build] SKIP: 未找到 Inno Setup 6（ISCC.exe）"
+    echo "[build]       安装后可用以下命令单独打包："
+    echo "[build]       \"C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe\" installer\\FCapture.iss"
 fi
 
 echo ""
 echo "=========================================="
-echo "[build] 构建完成"
-echo "=========================================="
-echo "可执行文件: $PROJECT_ROOT/$DIST_DIR/$EXE_NAME"
-echo "运行冒烟测试: ./scripts/smoke-test.sh"
