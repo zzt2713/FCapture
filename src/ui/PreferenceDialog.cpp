@@ -908,6 +908,10 @@ QWidget *PreferenceDialog::buildSnipPage()
     ocrForm->addRow(new ElaText(QStringLiteral("识别语言")), ocrLang);
     ocrLayout->addLayout(ocrForm);
 
+    ocrLayout->addWidget(toggleRow(
+        ocrBox, QStringLiteral("识别增强（对比度预处理 + 模糊时二次识别，稍慢但更准）"),
+        QStringLiteral("ocr/enhance")));
+
     auto *hint = new ElaText(
         QStringLiteral("可用的 OCR 语言包：%1")
             .arg(langs.isEmpty() ? QStringLiteral("无")

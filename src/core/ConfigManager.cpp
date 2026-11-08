@@ -89,6 +89,8 @@ QVariant ConfigManager::value(const QString &key, const QVariant &fallback) cons
         {QStringLiteral("output/quality"), -1},
         {QStringLiteral("output/auto_alpha_channel_removal"), false},
         {QStringLiteral("ocr/language"), QStringLiteral("zh-Hans-CN")},
+        // OCR 识别增强：对比度预处理 + 可疑时二次识别（默认开）
+        {QStringLiteral("ocr/enhance"), true},
         {QStringLiteral("hotcorner/enabled"), false},
         {QStringLiteral("hotcorner/top_left"), QStringLiteral("none")},
         {QStringLiteral("hotcorner/top_right"), QStringLiteral("none")},

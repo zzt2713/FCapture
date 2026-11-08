@@ -3134,12 +3134,10 @@ void SnipOverlay::runOcr()
 
 void SnipOverlay::runBarcodeScan()
 {
-    // 二维码识别依赖 zxing-cpp；本机离线环境拉不到该依赖，
-    // 这里给出明确提示而不是静默失败。
     m_paintBar->setTool(Tool::None);
-    QMessageBox::information(this, QStringLiteral("识别二维码"),
-                             QStringLiteral("二维码识别需要 zxing-cpp 依赖，\n"
-                                            "当前构建未包含该依赖（离线环境无法拉取）。"));
+    // 二维码功能排在 2.0，用居中 toast 提示，不弹模态框打断截图流程
+    OperationToast::centerInfo(
+        QStringLiteral("二维码识别将在 2.0 版本实现，敬请期待！"));
 }
 
 void SnipOverlay::sendToApplication()

@@ -34,8 +34,21 @@ QStringList availableLanguages();
 QString languageDisplayName(const QString &languageTag);
 
 
+// 识别选项
+struct Options
+{
+    // 识别前做对比度增强（灰度 + 自动色阶拉伸 + 锐化）。
+    // 对浅色小字、低对比度截图有效；关闭时只做必要的放大。
+    bool enhanceContrast = true;
+
+    // 第一次结果"可疑"时，用 1.6 倍放大再识别一次并取更好的那份。
+    // 代价约多一倍耗时，只会在可疑时触发。
+    bool retryWhenUncertain = true;
+};
+
 // 同步识别。**必须在非 UI 线程调用**（RecognizeAsync().get() 会阻塞）。
 // language 为空时用系统用户配置语言。
-Result recognize(const QImage &image, const QString &language = QString());
+Result recognize(const QImage &image, const QString &language = QString(),
+                 const Options &options = Options());
 
 } // namespace WinOcr

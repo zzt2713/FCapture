@@ -108,6 +108,123 @@ QString fixSymbolMisreads(const QString &text)
     return out;
 }
 
+
+// 对比度增强：灰度 → 自动色阶拉伸 → 轻微锐化。
+//
+// 截图里的浅灰小字（比如深色主题下的次要说明）原始对比度很低，
+// OCR 引擎容易把笔画切错。拉伸色阶能把"看起来几乎一样"的笔画分开。
+QImage enhanceForOcr(const QImage &src)
+{
+    if (src.isNull())
+        return src;
+
+    QImage img = src.convertToFormat(QImage::Format_RGB32);
+    if (img.isNull())
+        return src;
+
+    // 1) 转灰度并统计直方图（只取亮度）
+    const int w = img.width();
+    const int h = img.height();
+    QVector<int> histogram(256, 0);
+    for (int y = 0; y < h; ++y) {
+        const auto *line = reinterpret_cast<const QRgb *>(img.constScanLine(y));
+        for (int x = 0; x < w; ++x)
+            ++histogram[qGray(line[x])];
+    }
+
+    // 2) 找到 1% 与 99% 分位，作为拉伸区间
+    const int total = w * h;
+    const int lowerTarget = total / 100;
+    const int upperTarget = total - total / 100;
+
+    int low = 0;
+    int high = 255;
+    int acc = 0;
+    for (int v = 0; v < 256; ++v) {
+        acc += histogram.at(v);
+        if (acc >= lowerTarget) {
+            low = v;
+            break;
+        }
+    }
+    acc = 0;
+    for (int v = 0; v < 256; ++v) {
+        acc += histogram.at(v);
+        if (acc >= upperTarget) {
+            high = v;
+            break;
+        }
+    }
+    // 区间过窄说明整张图几乎单色，拉伸没有意义（还会放大噪点）
+    if (high - low < 24)
+        return src;
+
+    const double scale = 255.0 / double(high - low);
+    for (int y = 0; y < h; ++y) {
+        auto *line = reinterpret_cast<QRgb *>(img.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const int v = qGray(line[x]);
+            const int mapped = qBound(0, qRound((v - low) * scale), 255);
+            line[x] = qRgb(mapped, mapped, mapped);
+        }
+    }
+
+    // 3) 轻微锐化（3x3 拉普拉斯），让笔画边缘更硬
+    QImage sharpened = img;
+    for (int y = 1; y < h - 1; ++y) {
+        const auto *prev = reinterpret_cast<const QRgb *>(img.constScanLine(y - 1));
+        const auto *cur = reinterpret_cast<const QRgb *>(img.constScanLine(y));
+        const auto *next = reinterpret_cast<const QRgb *>(img.constScanLine(y + 1));
+        auto *out = reinterpret_cast<QRgb *>(sharpened.scanLine(y));
+        for (int x = 1; x < w - 1; ++x) {
+            const int center = qGray(cur[x]);
+            const int sum = qGray(prev[x]) + qGray(next[x])
+                            + qGray(cur[x - 1]) + qGray(cur[x + 1]);
+            // center*5 - 邻居和，约等于原图 + 拉普拉斯
+            const int v = qBound(0, center * 5 - sum, 255);
+            out[x] = qRgb(v, v, v);
+        }
+    }
+    return sharpened;
+}
+
+// 把图像放大到"短边接近 targetShortSide"（只放大、不缩小）
+QImage upscaleForOcr(const QImage &src, int targetShortSide, double maxScale)
+{
+    if (src.isNull())
+        return src;
+
+    const double dpr = src.devicePixelRatio() > 0.0 ? src.devicePixelRatio() : 1.0;
+    const QSize logical(qRound(src.width() / dpr), qRound(src.height() / dpr));
+    const int shortSide = qMin(logical.width(), logical.height());
+    if (shortSide <= 0 || shortSide >= targetShortSide)
+        return src;
+
+    const double scale = qBound(1.0, double(targetShortSide) / shortSide, maxScale);
+    if (scale <= 1.05)
+        return src;
+
+    QImage out = src.scaled(qRound(src.width() * scale),
+                            qRound(src.height() * scale),
+                            Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    out.setDevicePixelRatio(dpr * scale);
+    return out;
+}
+
+// 结果"可疑"的判定：没有任何词、或平均词长过短（大量单字往往意味着切错）。
+bool looksUncertain(const QString &text, int wordCount)
+{
+    const QString trimmed = text.trimmed();
+    if (trimmed.isEmpty())
+        return true;
+    if (wordCount == 0)
+        return true;
+
+    // 平均每个"词"只有 1 个字符，且总长很短 → 大概率切错了
+    const double avg = double(trimmed.size()) / qMax(1, wordCount);
+    return trimmed.size() < 12 && avg < 1.6;
+}
+
 } // namespace
 
 namespace WinOcr {
@@ -143,7 +260,60 @@ QString languageDisplayName(const QString &languageTag)
     return languageTag;
 }
 
-Result recognize(const QImage &image, const QString &language)
+namespace {
+
+// 对一张已准备好的图跑一次 OCR，返回文本 + 词数 + 词表。
+struct PassResult
+{
+    bool ok = false;
+    QString text;
+    QVector<WinOcr::Word> words;
+    QString language;
+};
+
+PassResult runOnce(winrt::Windows::Media::Ocr::OcrEngine engine, const QImage &image)
+{
+    PassResult pass;
+    if (!engine || image.isNull())
+        return pass;
+
+    auto bitmap = toSoftwareBitmap(image);
+    if (!bitmap)
+        return pass;
+
+    const winrt::Windows::Media::Ocr::OcrResult ocr = engine.RecognizeAsync(bitmap).get();
+
+    const double dpr = image.devicePixelRatio() > 0.0 ? image.devicePixelRatio() : 1.0;
+    QStringList lines;
+    for (const auto &line : ocr.Lines()) {
+        QString lineText;
+        for (const auto &word : line.Words()) {
+            const QString w = fixSymbolMisreads(
+                QString::fromWCharArray(word.Text().c_str()));
+            if (!w.isEmpty()) {
+                if (!lineText.isEmpty())
+                    lineText += QLatin1Char(' ');
+                lineText += w;
+            }
+
+            const auto r = word.BoundingRect();
+            WinOcr::Word info;
+            info.text = w;
+            info.box = QRectF(r.X / dpr, r.Y / dpr, r.Width / dpr, r.Height / dpr);
+            pass.words.append(info);
+        }
+        if (!lineText.isEmpty())
+            lines.append(lineText);
+    }
+
+    pass.text = lines.join(QLatin1Char('\n'));
+    pass.ok = true;
+    return pass;
+}
+
+} // namespace
+
+Result recognize(const QImage &image, const QString &language, const Options &options)
 {
     Result result;
     if (image.isNull()) {
@@ -175,60 +345,74 @@ Result recognize(const QImage &image, const QString &language)
             return result;
         }
 
-        // Windows OCR 对小于约 40px 高的文字识别率明显下降。
-        // 官方建议先把图像放大到 2~3 倍再识别，这也是"识别不准"的主因之一。
-        // 只放大小图，大图保持原样（避免不必要的耗时）。
-        QImage prepared = image;
-        const double dpr = prepared.devicePixelRatio() > 0.0
-                               ? prepared.devicePixelRatio() : 1.0;
-        const QSize logical(qRound(prepared.width() / dpr),
-                            qRound(prepared.height() / dpr));
-        const int minSide = qMin(logical.width(), logical.height());
-        if (minSide > 0 && minSide < 400) {
-            // 目标：短边约 800px（约 2~3 倍），上限 4 倍避免过度放大产生噪点
-            const double scale = qBound(2.0, 800.0 / minSide, 4.0);
-            prepared = prepared.scaled(qRound(prepared.width() * scale),
-                                       qRound(prepared.height() * scale),
-                                       Qt::KeepAspectRatio,
-                                       Qt::SmoothTransformation);
-            prepared.setDevicePixelRatio(dpr * scale);
+        // 候选 A：对比度增强 + 放大（默认路径）
+        // 候选 B：只放大、不增强（增强过度时反而更差，用作兜底比较）
+        QImage base = upscaleForOcr(image, 800, 4.0);
+
+        QVector<QImage> candidates;
+        if (options.enhanceContrast) {
+            QImage enhanced = enhanceForOcr(base);
+            // enhanceForOcr 内部会把图转成 RGB32，这里重新放一次以保留 dpr
+            enhanced.setDevicePixelRatio(base.devicePixelRatio());
+            candidates.append(enhanced);
+            candidates.append(base);
+        } else {
+            candidates.append(base);
         }
 
-        auto bitmap = toSoftwareBitmap(prepared);
-        if (!bitmap) {
-            result.error = QStringLiteral("图像格式转换失败");
+        // 逐候选识别，保留"看起来更可信"的那份：
+        // 判定顺序 = 有结果 > 文本更长 > 平均词长更长
+        PassResult best;
+        int bestScore = -1;
+        for (const QImage &candidate : candidates) {
+            PassResult pass = runOnce(engine, candidate);
+            if (!pass.ok)
+                continue;
+            const int score = pass.words.isEmpty()
+                                  ? 0
+                                  : pass.text.trimmed().size() * 100
+                                        + pass.words.size();
+            if (score > bestScore) {
+                bestScore = score;
+                best = pass;
+            }
+        }
+
+        if (!best.ok || best.text.trimmed().isEmpty()) {
+            result.error = QStringLiteral("未识别到文字");
             return result;
         }
 
-        // RecognizeAsync().get() 会阻塞，所以本函数只能在非 UI 线程调用
-        const OcrResult ocr = engine.RecognizeAsync(bitmap).get();
-
-        QStringList lines;
-        for (const auto &line : ocr.Lines()) {
-            QString lineText;
-            for (const auto &word : line.Words()) {
-                const QString w = fixSymbolMisreads(
-                    QString::fromWCharArray(word.Text().c_str()));
-                if (!w.isEmpty()) {
-                    if (!lineText.isEmpty())
-                        lineText += QLatin1Char(' ');
-                    lineText += w;
+        // 二次识别：结果可疑时，把图再放大到短边 1400 重跑一次，取更好的
+        if (options.retryWhenUncertain
+            && looksUncertain(best.text, best.words.size())) {
+            const QImage retryBase = upscaleForOcr(image, 1400, 6.0);
+            if (retryBase.size() != base.size()) {
+                QVector<QImage> retryCandidates{retryBase};
+                if (options.enhanceContrast) {
+                    QImage enhanced = enhanceForOcr(retryBase);
+                    enhanced.setDevicePixelRatio(retryBase.devicePixelRatio());
+                    retryCandidates.prepend(enhanced);
                 }
-
-                const auto r = word.BoundingRect();
-                Word info;
-                info.text = w;
-                // WinRT 返回的是像素坐标，换算成逻辑坐标
-                info.box = QRectF(r.X / dpr, r.Y / dpr, r.Width / dpr, r.Height / dpr);
-                result.words.append(info);
+                for (const QImage &candidate : retryCandidates) {
+                    PassResult pass = runOnce(engine, candidate);
+                    if (!pass.ok || pass.words.isEmpty())
+                        continue;
+                    const int score = pass.text.trimmed().size() * 100
+                                      + pass.words.size();
+                    if (score > bestScore) {
+                        bestScore = score;
+                        best = pass;
+                    }
+                }
             }
-            if (!lineText.isEmpty())
-                lines.append(lineText);
         }
 
-        result.text = lines.join(QLatin1Char('\n'));
-        result.language = QString::fromWCharArray(engine.RecognizerLanguage().LanguageTag().c_str());
+        result.text = best.text;
+        result.words = best.words;
         result.ok = true;
+        result.language = QString::fromWCharArray(
+            engine.RecognizerLanguage().LanguageTag().c_str());
     } catch (const hresult_error &e) {
         result.error = QString::fromWCharArray(e.message().c_str());
         qWarning() << "WinOcr: recognize failed:" << result.error;

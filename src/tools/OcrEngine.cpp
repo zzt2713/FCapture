@@ -39,7 +39,14 @@ public:
 
     void run() override
     {
-        const WinOcr::Result result = WinOcr::recognize(m_image, m_language);
+        // 增强开关来自配置（首选项 → 截图 → 识别增强）
+        WinOcr::Options options;
+        options.enhanceContrast = ConfigManager::instance()
+                                      ->value(QStringLiteral("ocr/enhance"), true)
+                                      .toBool();
+        options.retryWhenUncertain = options.enhanceContrast;
+
+        const WinOcr::Result result = WinOcr::recognize(m_image, m_language, options);
 
         QPointer<OcrEngine> guard(m_owner);
         QMetaObject::invokeMethod(m_owner,
