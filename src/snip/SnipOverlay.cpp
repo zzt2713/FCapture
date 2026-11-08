@@ -1719,7 +1719,21 @@ void SnipOverlay::finishSnip(SnipOutput output)
     ToolStyleStore::instance()->save();
 
     emit snipFinished(result, output);
+
+    // 立刻丢掉全屏快照（物理像素，多屏时可达几十 MB）。
+    // 窗口还没销毁，但会话已经结束，不会再绘制；留着只是白占内存。
+    releaseSessionImages();
     close();
+}
+
+void SnipOverlay::releaseSessionImages()
+{
+    m_snapshot.pixmap = QPixmap();
+    m_snapshot.cursorPixmap = QPixmap();
+    m_snapshotImage = QImage();
+    m_snapshotLayer = QPixmap();
+    PixelShape::clearSourceImage();
+    invalidateBackgroundCache();
 }
 
 void SnipOverlay::abortSnip()
@@ -1738,6 +1752,7 @@ void SnipOverlay::abortSnip()
     endContinuousRefresh();
     if (m_paintBar)
         m_paintBar->hide();
+    releaseSessionImages();
     emit snipAborted();
     close();
 }
@@ -1780,7 +1795,17 @@ void SnipOverlay::rebuildBackgroundCache()
         return;
     }
 
-    // 只做一次：把物理像素快照重采样到逻辑尺寸（×dpr 的位图）。
+    // 快照本身尺寸就与窗口一致时（常见情况：单屏 100% 缩放），
+    // 直接复用那份 pixmap，省掉一整份全屏副本（4K 下约 30MB）。
+    const QPixmap &shot = m_snapshot.pixmap;
+    if (!shot.isNull() && shot.size() == size() * dpr) {
+        m_snapshotLayer = shot;
+        m_snapshotLayerSize = size();
+        m_snapshotLayerDpr = dpr;
+        return;
+    }
+
+    // 只在需要缩放时（多屏不同 dpr / 混合 DPI）才重建一份。
     // 之后每帧 drawPixmap 是 1:1 拷贝，不再重采样。
     QPixmap layer(size() * dpr);
     layer.setDevicePixelRatio(dpr);

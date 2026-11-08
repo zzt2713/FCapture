@@ -16,6 +16,7 @@
 #include <QApplication>
 #include <QMessageBox>
 #include <QStyleFactory>
+#include <QThreadPool>
 #include <QTimer>
 
 namespace {
@@ -73,6 +74,10 @@ int main(int argc, char *argv[])
 
     // 改名后首次启动：把旧的 SnipasteClone 数据目录整份搬过来
     AppPaths::migrateLegacyDataIfNeeded();
+
+    // 限制全局线程池：本项目只有 OCR 用到它，默认上限会按 CPU 核数
+    // 预建一堆线程（每个 1MB 栈）。1 个就够，识别本来就是串行的。
+    QThreadPool::globalInstance()->setMaxThreadCount(1);
 
     Logger::init(debugLoggingRequested(argc, argv));
     Logger::installCrashHandler();

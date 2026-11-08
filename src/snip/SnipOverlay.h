@@ -84,6 +84,8 @@ private:
 
     // --- 绘制 ---
     void drawMask(QPainter &p);
+    // 会话结束后立刻释放全屏快照（几十 MB），不等窗口析构
+    void releaseSessionImages();
     void drawCapturedCursor(QPainter &p);
     void drawSelectionFrame(QPainter &p);
     void drawSizeLabel(QPainter &p);

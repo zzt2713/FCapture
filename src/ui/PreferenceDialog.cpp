@@ -339,8 +339,9 @@ public:
     // 这里不用信号：HistoryGrid 定义在 .cpp 的匿名命名空间里，
     // 带 Q_OBJECT 会要求 AUTOMOC 生成一个不存在的 moc 文件。
     // 回调比信号更直接，也不需要连接生命周期管理。
-    std::function<void(const QImage &)> onRecordActivated;
-    std::function<void(const QImage &)> onSaveRequested;
+    // 回调带 index：历史只对最新一条保留原图，需要按索引取（见 SnipHistory::imageFor）
+    std::function<void(int index)> onRecordActivated;
+    std::function<void(int index)> onSaveRequested;
     std::function<void(int index)> onDeleteRequested;
 
 protected:
@@ -351,31 +352,30 @@ protected:
         if (e->button() != Qt::LeftButton)
             return;
         const int index = indexAt(e->position().toPoint());
-        if (index < 0)
+        if (index < 0 || index >= m_records.size())
             return;
-        const QImage img = m_records.at(index).image;
-        if (img.isNull())
+        if (m_records.at(index).image.isNull())
             return;
         if (onRecordActivated)
-            onRecordActivated(img);
+            onRecordActivated(index);
     }
 
     void contextMenuEvent(QContextMenuEvent *e) override
     {
         const int index = indexAt(e->pos());
-        if (index < 0)
+        if (index < 0 || index >= m_records.size())
             return;
-        const QImage img = m_records.at(index).image;
+        const bool hasImage = !m_records.at(index).image.isNull();
 
         QMenu menu(this);
         QAction *save = menu.addAction(QStringLiteral("保存图片…"));
         menu.addSeparator();
         QAction *remove = menu.addAction(QStringLiteral("从历史中删除"));
-        save->setEnabled(!img.isNull());
+        save->setEnabled(hasImage);
 
         QAction *chosen = menu.exec(e->globalPos());
-        if (chosen == save && !img.isNull() && onSaveRequested)
-            onSaveRequested(img);
+        if (chosen == save && hasImage && onSaveRequested)
+            onSaveRequested(index);
         else if (chosen == remove && onDeleteRequested)
             onDeleteRequested(index);
     }
@@ -1263,10 +1263,13 @@ QWidget *PreferenceDialog::buildHistoryPage()
             this, &PreferenceDialog::refreshHistory);
     auto *grid = static_cast<HistoryGrid *>(m_historyList);
     // 单击 = 以贴图形式贴到屏幕上（和 F3 贴图同一条路径，可缩放/旋转/置顶）
-    grid->onRecordActivated = [](const QImage &image) {
-        PinManager::instance()->pasteImage(image);
+    grid->onRecordActivated = [](int index) {
+        // 只有最新一条保留了原图，更早的退化为缩略图（贴出来是缩小版）
+        PinManager::instance()->pasteImage(
+            SnipHistory::instance()->imageFor(index));
     };
-    grid->onSaveRequested = [this](const QImage &image) {
+    grid->onSaveRequested = [this](int index) {
+        const QImage image = SnipHistory::instance()->imageFor(index);
         const QString path = QFileDialog::getSaveFileName(
             this, QStringLiteral("保存历史截图"),
             QDir(QStandardPaths::writableLocation(QStandardPaths::PicturesLocation))

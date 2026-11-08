@@ -478,7 +478,9 @@ ElementDetector::ElementDetector(QObject *parent)
     : QObject(parent)
 {
     qRegisterMetaType<QVector<ElementInfo>>("QVector<ElementInfo>");
-    ensureWorker();
+    // 不在这里建工作线程：SnipOverlay 构造时就会 connect 本单例的信号，
+    // 若此时 ensureWorker()，等于每次开始截图都白建一个线程 + COM 公寓。
+    // 线程延迟到第一次 request() 时才创建（见 request() 里的 ensureWorker）。
 }
 
 ElementDetector::~ElementDetector()
