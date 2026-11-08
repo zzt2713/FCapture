@@ -1,0 +1,2 @@
+// exe 文件图标（资源管理器、任务栏显示）
+IDI_ICON1 ICON "app.ico"

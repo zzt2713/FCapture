@@ -1,0 +1,31 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource prefix="/icons">
+        <file>square.svg</file>
+        <file>circle.svg</file>
+        <file>minus.svg</file>
+        <file>arrow-up-right.svg</file>
+        <file>spline.svg</file>
+        <file>pencil.svg</file>
+        <file>highlighter.svg</file>
+        <file>type.svg</file>
+        <file>grid-3x3.svg</file>
+        <file>circle-dashed.svg</file>
+        <file>eraser.svg</file>
+        <file>undo-2.svg</file>
+        <file>redo-2.svg</file>
+        <file>x.svg</file>
+        <file>copy.svg</file>
+        <file>save.svg</file>
+        <file>pin.svg</file>
+        <file>hash.svg</file>
+        <file>lasso-select.svg</file>
+        <file>scan-search.svg</file>
+        <file>line-style.svg</file>
+        <file>arrow-left-right.svg</file>
+        <file>send.svg</file>
+        <file>scan-text.svg</file>
+        <file>qr-code.svg</file>
+        <file>check.svg</file>
+    </qresource>
+</RCC>

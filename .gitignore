@@ -1,0 +1,52 @@
+# ---- 构建产物 ----
+build/
+out/
+dist/
+bin/
+obj/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.obj
+
+# ---- Qt / CMake 生成物 ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeUserPresets.json
+*_autogen/
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.user
+*.sln
+*.vcxproj
+*.vcxproj.filters
+
+# ---- 运行时数据（含本机配置 / 日志 / 崩溃转储）----
+data/
+config.ini
+portable.txt
+*.log
+*.dmp
+crash/
+
+# ---- 本地产出 / 备份 ----
+beifen/
+preview/
+probe_tmp/
+*.zip
+
+# ---- AI 协作工具本机配置 ----
+.claude/
+
+# ---- IDE / 系统 ----
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

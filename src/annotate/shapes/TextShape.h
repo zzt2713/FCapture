@@ -1,0 +1,74 @@
+#pragma once
+
+#include "annotate/Annotation.h"
+
+#include <QFont>
+#include <QPainterPath>
+#include <QString>
+
+class QTextDocument;
+
+// 文字标注
+class TextShape : public Annotation
+{
+public:
+    TextShape();
+
+    Type type() const override;
+    QRectF rawBoundingRect() const override;
+    void paintContent(QPainter *p) const override;
+    bool hitTestContent(const QPointF &pt, qreal tolerance) const override;
+    void translate(const QPointF &delta) override;
+    void scaleAbout(const QPointF &center, qreal factor) override;
+    QVector<QPointF> rawHandles() const override;
+    void moveHandleRaw(int index, const QPointF &pos) override;
+    bool isEditable() const override { return true; }
+    QJsonObject toJson() const override;
+    std::shared_ptr<Annotation> clone() const override;
+
+    void setText(const QString &t);
+    QString text() const { return m_text; }
+
+    void setPosition(const QPointF &pos);
+    QPointF position() const { return m_pos; }
+
+    void setFontSize(int px);
+    int fontSize() const { return m_fontSize; }
+
+    // 拖动右下角改宽度（高度自适应）；0 = 按内容撑开
+    void setBoxWidth(qreal w);
+    qreal boxWidth() const { return m_boxWidth; }
+
+    // 文字背景填充
+    void setBackgroundColor(const QColor &c) { m_bgColor = c; }
+    QColor backgroundColor() const { return m_bgColor; }
+
+    // 文字描边
+    void setOutline(bool on) { m_outline = on; }
+    bool outline() const { return m_outline; }
+    void setOutlineColor(const QColor &c) { m_outlineColor = c; }
+    QColor outlineColor() const { return m_outlineColor; }
+    void setOutlineWidth(int w) { m_outlineWidth = qMax(1, w); }
+    int outlineWidth() const { return m_outlineWidth; }
+
+    QFont font() const;
+    QRectF layoutRect() const;
+
+    // 拖角等比缩放：直接按比例改字号（文本框高度自适应内容，所以只有字号有意义）
+    void scaleFontBy(qreal factor);
+
+private:
+    // 构建与输入框一致的 QTextDocument
+    QTextDocument *createDocument() const;
+    // 逐字形取轮廓路径（坐标原点 = layoutRect 左上角），用于描边
+    QPainterPath buildGlyphPath() const;
+
+    QString m_text;
+    QPointF m_pos;
+    int     m_fontSize = 16;
+    qreal   m_boxWidth = 0;
+    QColor  m_bgColor = Qt::transparent;
+    bool    m_outline = false;
+    QColor  m_outlineColor = QColor(Qt::black);
+    int     m_outlineWidth = 2;
+};
