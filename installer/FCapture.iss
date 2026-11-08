@@ -96,7 +96,7 @@ Source: "{#DistDir}\generic\*";                DestDir: "{app}\generic";        
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"
-Name: "{group}\用户手册"; Filename: "{app}\用户手册.md"; Check: ManualIconWanted
+Name: "{group}\用户手册"; Filename: "{app}\用户手册.md"; Check: FileExists(ExpandConstant('{app}\用户手册.md'))
 Name: "{group}\卸载 {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
@@ -109,17 +109,10 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#AppExeName}"; Flags: runhidden skipifdoesntexist; RunOnceId: "KillApp"
 
 [Code]
-var
-  // 用户手册是否随包发布（编译期已知：dist\F-Capture\用户手册.md 是否存在）
-  ManualIconWanted: Boolean;
-
 function InitializeSetup(): Boolean;
 var
   ResultCode: Integer;
 begin
-  // 用户手册是否随包发布（决定是否创建对应快捷方式）
-  ManualIconWanted := FileExists('{#DistDir}\用户手册.md');
-
   // 结束正在运行的实例，否则 exe 被占用会导致写入失败。
   // taskkill 退出码：0 = 已结束，128 = 进程不存在；都不阻塞安装。
   Exec(ExpandConstant('{sys}\taskkill.exe'),
