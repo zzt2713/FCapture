@@ -52,11 +52,6 @@ D:/CMake/bin/cmake --build build --config Release
 #    build/Release/FCapture.exe
 ```
 
-打包（windeployqt + Ela DLL 复制）见 `scripts/build.sh`，冒烟测试见 `scripts/smoke-test.sh`。
-
-> `ElaWidgetTools` 是预编译的第三方控件库（Qt 6 的 MDI 风格控件集合），
-> 不在本仓库内，需要自行获取并放到 `ELA_ROOT` 指向的位置。
-
 ## 项目结构
 
 ```
@@ -71,6 +66,18 @@ src/
 ```
 
 关键设计约定见 [`docs/00-全局约定.md`](docs/00-全局约定.md)。
+
+## 便携模式
+
+> 本程序默认使用系统标准路径存储配置与日志；若在 exe 同目录放置 `portable.txt` 即进入便携模式，所有数据改存于 `data/` 子目录、系统盘零残留（因需写注册表，便携模式下开机自启被禁用）。
+
+| 项       | 普通模式                            | 便携模式                           |
+| -------- | ----------------------------------- | ---------------------------------- |
+| 触发条件 | 默认                                | exe 同目录存在 portable.txt        |
+| 配置     | %LOCALAPPDATA%/F-Capture/config.ini | <exe目录>/data/config.ini          |
+| 日志     | %LOCALAPPDATA%/F-Capture/log/       | <exe目录>/data/log/                |
+| 崩溃转储 | %LOCALAPPDATA%/F-Capture/crash/     | <exe目录>/data/crash/              |
+| 开机自启 | 可用（写注册表）                    | 禁用（注册表会留痕，破坏便携语义） |
 
 ## 更新
 

@@ -37,6 +37,7 @@ set(APP_SOURCES
     src/core/ConfigManager.cpp
     src/core/Diagnostics.cpp
     src/core/UpdateChecker.cpp
+    src/core/UpdateInstaller.cpp
     src/core/ImageOutput.cpp
     src/core/Watchdog.cpp
     src/core/ZipStoreWriter.cpp
@@ -108,6 +109,7 @@ set(HEADERS
     src/core/ConfigManager.h
     src/core/Diagnostics.h
     src/core/UpdateChecker.h
+    src/core/UpdateInstaller.h
     src/core/Watchdog.h
     src/core/ZipStoreWriter.h
     src/core/HotkeyManager.h

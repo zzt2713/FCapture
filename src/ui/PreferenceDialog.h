@@ -2,6 +2,8 @@
 
 #include "ElaDialog.h"
 
+#include "core/UpdateChecker.h"
+
 #include <QHash>
 #include <QPointer>
 #include <QSet>
@@ -14,7 +16,7 @@ class ElaText;
 class ElaToggleSwitch;
 class HotkeyRecorder;
 class NavList;
-class UpdateChecker;
+class ElaPushButton;
 
 class QHideEvent;
 class QShowEvent;
@@ -66,10 +68,14 @@ private:
     void refreshHistory();
     // 关于页：查询 GitHub Releases 并比较版本
     void checkForUpdates();
+    // 关于页：下载并安装待处理的更新
+    void startUpdateDownload();
 
     QWidget *m_historyList = nullptr;
     ElaText *m_updateStatus = nullptr;
+    ElaPushButton *m_updateInstallBtn = nullptr;
     UpdateChecker *m_updateChecker = nullptr;
+    UpdateChecker::Release m_pendingRelease;
     ElaText *m_historyHint = nullptr;
     int m_historyPageIndex = -1;
 

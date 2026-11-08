@@ -1750,6 +1750,7 @@ void SnipOverlay::paintEvent(QPaintEvent *e)
     drawMagnifier(p);
     drawHint(p);
     drawShortcutTips(p);
+    drawCenterNotice(p);
 }
 
 void SnipOverlay::rebuildBackgroundCache()
@@ -3135,9 +3136,64 @@ void SnipOverlay::runOcr()
 void SnipOverlay::runBarcodeScan()
 {
     m_paintBar->setTool(Tool::None);
-    // 二维码功能排在 2.0，用居中 toast 提示，不弹模态框打断截图流程
-    OperationToast::centerInfo(
-        QStringLiteral("二维码识别将在 2.0 版本实现，敬请期待！"));
+    // 二维码功能排在 2.0。这里不用 ElaToast：
+    // 截图层是全屏 WindowStaysOnTopHint 窗口，独立 toast 窗口会被它盖住看不见。
+    // 直接在遮罩上画一条居中提示，保证一定可见，也不会打断截图流程。
+    showCenterNotice(QStringLiteral("二维码识别将在 2.0 版本实现，敬请期待！"));
+}
+
+void SnipOverlay::showCenterNotice(const QString &text, int msec)
+{
+    m_centerNotice = text;
+    m_centerNoticeTimer.restart();
+    update();
+
+    // 到点自动清除（定时器只负责重绘，时间判断在 drawCenterNotice 里做）
+    QTimer::singleShot(msec, this, [this, msec]() {
+        if (m_centerNoticeTimer.isValid() && m_centerNoticeTimer.elapsed() >= msec - 50) {
+            m_centerNotice.clear();
+            update();
+        }
+    });
+}
+
+void SnipOverlay::drawCenterNotice(QPainter &p)
+{
+    if (m_centerNotice.isEmpty())
+        return;
+    // 超过 2.6s 兜底清理（singleShot 可能因多次调用而错位）
+    if (m_centerNoticeTimer.isValid() && m_centerNoticeTimer.elapsed() > 3200) {
+        m_centerNotice.clear();
+        return;
+    }
+
+    QFont f = Theme::appFont();
+    f.setPointSize(11);
+    const QFontMetrics fm(f);
+
+    const int padH = 28;
+    const int padV = 18;
+    const int w = qMin(width() - 80, fm.horizontalAdvance(m_centerNotice) + padH * 2);
+    const int h = fm.height() + padV * 2;
+
+    const QRect box((width() - w) / 2, (height() - h) / 2, w, h);
+
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setRenderHint(QPainter::TextAntialiasing, true);
+
+    p.setPen(Qt::NoPen);
+    p.setBrush(QColor(0, 0, 0, 220));
+    p.drawRoundedRect(box, 8, 8);
+
+    p.setPen(QPen(QColor(0x3D, 0x8B, 0xFD), 1));
+    p.setBrush(Qt::NoBrush);
+    p.drawRoundedRect(box.adjusted(0, 0, -1, -1), 8, 8);
+
+    p.setFont(f);
+    p.setPen(QColor(0xF2, 0xF2, 0xF2));
+    p.drawText(box, Qt::AlignCenter, m_centerNotice);
+    p.restore();
 }
 
 void SnipOverlay::sendToApplication()

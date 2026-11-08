@@ -75,25 +75,51 @@ fi
 cp -f "$ELA_DLL" "$DIST_DIR/"
 echo "[build] 已复制: $ELA_DLL → $DIST_DIR/"
 
-step "5/5 生成便携版 zip"
-# 便携包：exe + 依赖 + 用户手册 + portable.txt（开箱即用，配置落在 data/ 下）
+step "5/5 生成更新包（自动更新用）"
+# 包结构必须是"解压后直接就是 exe 所在目录的内容"，
+# 应用内更新会把 zip 解压覆盖到安装目录。
 if [[ -f "$PROJECT_ROOT/docs/user-guide.md" ]]; then
     cp -f "$PROJECT_ROOT/docs/user-guide.md" "$DIST_DIR/用户手册.md"
 fi
 touch "$DIST_DIR/portable.txt"
 
-ZIP_NAME="F-Capture-1.0.0-portable.zip"
+# 版本号从 CMakeLists 的 project(VERSION) 读，和程序内版本保持一致
+APP_VERSION="$(sed -nE 's/^project\(FCapture VERSION ([0-9.]+).*/\1/p' \
+    "$PROJECT_ROOT/CMakeLists.txt" | head -1)"
+if [[ -z "$APP_VERSION" ]]; then
+    APP_VERSION="1.0.0"
+fi
+
+# 命名约定必须与 UpdateChecker::assetNamePattern() 一致：
+#   F-Capture-<version>-portable.zip
+ZIP_NAME="F-Capture-${APP_VERSION}-portable.zip"
 rm -f "$PROJECT_ROOT/dist/$ZIP_NAME"
-# 本机没有 zip 命令，用 PowerShell 的 Compress-Archive。
-# 注意：PowerShell 不认 /d/... 这种 MSYS 路径，必须先转成 Windows 路径。
+
 WIN_SRC="$(cygpath -w "$PROJECT_ROOT/$DIST_DIR" 2>/dev/null || echo "$PROJECT_ROOT/$DIST_DIR")"
 WIN_DST="$(cygpath -w "$PROJECT_ROOT/dist/$ZIP_NAME" 2>/dev/null || echo "$PROJECT_ROOT/dist/$ZIP_NAME")"
-powershell -NoProfile -Command \
-    "Compress-Archive -Path '$WIN_SRC' -DestinationPath '$WIN_DST' -Force"
-if [[ -f "$PROJECT_ROOT/dist/$ZIP_NAME" ]]; then
-    echo "[build] 便携包: $PROJECT_ROOT/dist/$ZIP_NAME ($(du -h "$PROJECT_ROOT/dist/$ZIP_NAME" | cut -f1))"
+# -Path 传目录会多带一层目录名；用通配符把目录内容放到 zip 根
+powershell -NoProfile -Command     "Compress-Archive -Path '$WIN_SRC\*' -DestinationPath '$WIN_DST' -Force"
+
+ZIP_FILE="$PROJECT_ROOT/dist/$ZIP_NAME"
+if [[ -f "$ZIP_FILE" ]]; then
+    echo "[build] 更新包: $ZIP_FILE ($(du -h "$ZIP_FILE" | cut -f1))"
+
+    # 输出 SHA256 —— 发布到 GitHub Release 时把这一行写进 release 说明，
+    # 客户端更新时会据此校验下载完整性（UpdateChecker::parseSha256FromBody）。
+    SHA256="$(powershell -NoProfile -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath '$WIN_DST').Hash.ToLower()" | tr -d '')"
+    echo ""
+    echo "[build] ====== 发布用信息 ======"
+    echo "[build] 资产文件: $ZIP_NAME"
+    echo "[build] SHA256:   $SHA256"
+    echo "[build] 请把下一行写进 GitHub Release 说明："
+    echo "[build] SHA256: $SHA256"
+    echo "[build] ========================"
+    echo ""
+    if [[ -n "$SHA256" ]]; then
+        echo "SHA256: $SHA256" > "$PROJECT_ROOT/dist/SHA256.txt"
+    fi
 else
-    echo "[build] WARN: 便携包未生成" >&2
+    echo "[build] WARN: 更新包未生成" >&2
 fi
 
 echo ""

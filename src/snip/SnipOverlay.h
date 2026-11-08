@@ -96,9 +96,15 @@ private:
     void drawHint(QPainter &p);
     // 左下角快捷键帮助浮层：鼠标移动或开始选区后自动消失
     void drawShortcutTips(QPainter &p);
+    // 居中提示条（在截图层内部绘制，保证一定可见）
+    void showCenterNotice(const QString &text, int msec = 2600);
+    void drawCenterNotice(QPainter &p);
     bool shortcutTipsVisible() const;
     QRect shortcutTipsRect() const;
     bool  m_hoveringTips = false;
+
+    QString m_centerNotice;
+    QElapsedTimer m_centerNoticeTimer;
     void drawWindowHighlight(QPainter &p);
     void drawLassoPreview(QPainter &p);
     QRect sizeLabelRect() const;

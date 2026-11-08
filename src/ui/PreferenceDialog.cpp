@@ -9,6 +9,7 @@
 #include "core/HotkeyManager.h"
 #include "core/ImageOutput.h"
 #include "core/UpdateChecker.h"
+#include "core/UpdateInstaller.h"
 #include "paste/PinManager.h"
 #include "snip/SnipHistory.h"
 #include "tools/HotCorner.h"
@@ -17,6 +18,7 @@
 #include "ui/NavList.h"
 
 #include "ElaComboBox.h"
+#include "ElaContentDialog.h"
 #include "ElaGroupBox.h"
 #include "ElaLineEdit.h"
 #include "ElaMessageBar.h"
@@ -50,6 +52,7 @@
 #include <QShowEvent>
 #include <QStackedWidget>
 #include <QStandardPaths>
+#include <QTimer>
 #include <QStringList>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -1230,9 +1233,15 @@ QWidget *PreferenceDialog::buildHistoryPage()
 
     QVBoxLayout *boxLayout = nullptr;
     QWidget *box = groupBox(w, QStringLiteral("截图历史"), &boxLayout);
+    // 这一页的内容区要撑满，底部提示/按钮才能贴到页底
+    box->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
 
     m_historyList = new HistoryGrid(box);
-    boxLayout->addWidget(m_historyList);
+    boxLayout->addWidget(m_historyList, 1);
+
+    // 「还没有截图记录」和「清空历史」都放到最下方，
+    // 让缩略图区域始终从顶部开始排列，空状态也不会顶在标题下面。
+    boxLayout->addStretch(1);
 
     auto *hint = new ElaText(box);
     hint->setTextStyle(ElaTextType::Caption);
@@ -1278,8 +1287,8 @@ QWidget *PreferenceDialog::buildHistoryPage()
         SnipHistory::instance()->removeAt(index);
     };
 
-    layout->addWidget(box);
-    layout->addStretch();
+    // box 撑满整页高度，底部提示/按钮才会贴到页底
+    layout->addWidget(box, 1);
     return w;
 }
 
@@ -1430,6 +1439,11 @@ QWidget *PreferenceDialog::buildAboutPage()
     auto *checkUpdateBtn = iconButton(QStringLiteral("检查更新"), aboutBox,
                                       ElaIconType::CloudArrowDown);
     updateRow->addWidget(checkUpdateBtn);
+
+    m_updateInstallBtn = iconButton(QStringLiteral("立即更新"), aboutBox,
+                                    ElaIconType::Download);
+    m_updateInstallBtn->setVisible(false);
+    updateRow->addWidget(m_updateInstallBtn);
     m_updateStatus = new ElaText(aboutBox);
     m_updateStatus->setTextStyle(ElaTextType::Caption);
     updateRow->addWidget(m_updateStatus, 1);
@@ -1439,6 +1453,8 @@ QWidget *PreferenceDialog::buildAboutPage()
 
     connect(checkUpdateBtn, &ElaPushButton::clicked, this,
             &PreferenceDialog::checkForUpdates);
+    connect(m_updateInstallBtn, &ElaPushButton::clicked, this,
+            &PreferenceDialog::startUpdateDownload);
 
     aboutLayout->addWidget(headerRow);
 
@@ -1533,8 +1549,11 @@ void PreferenceDialog::checkForUpdates()
 {
     if (m_updateStatus) {
         m_updateStatus->setText(QStringLiteral("正在检查…"));
+        m_updateStatus->setTextFormat(Qt::PlainText);
         m_updateStatus->show();
     }
+    if (m_updateInstallBtn)
+        m_updateInstallBtn->setVisible(false);
 
     if (!m_updateChecker)
         m_updateChecker = new UpdateChecker(this);
@@ -1543,31 +1562,40 @@ void PreferenceDialog::checkForUpdates()
     disconnect(m_updateChecker, nullptr, this, nullptr);
 
     connect(m_updateChecker, &UpdateChecker::finished, this,
-            [this](bool available, const QString &latestVersion,
-                   const QString &url, const QString &notes) {
-                Q_UNUSED(notes);
+            [this](const UpdateChecker::Release &release) {
+                m_pendingRelease = release;
                 if (!m_updateStatus)
                     return;
 
-                if (latestVersion.isEmpty()) {
+                if (release.version.isEmpty()) {
                     m_updateStatus->setText(QStringLiteral("暂无可用的发布版本"));
                     return;
                 }
 
-                if (!available) {
+                if (!release.available) {
                     m_updateStatus->setText(
-                        QStringLiteral("已是最新版本（%1）").arg(latestVersion));
+                        QStringLiteral("已是最新版本（%1）").arg(release.version));
                     return;
                 }
 
-                // 有新版本：状态文字 + 可点击打开 release 页
+                if (!release.assetUrl.isValid()) {
+                    // 有新版本但没有安装包：退回"打开 release 页"
+                    m_updateStatus->setTextFormat(Qt::RichText);
+                    m_updateStatus->setTextInteractionFlags(Qt::TextBrowserInteraction);
+                    m_updateStatus->setOpenExternalLinks(true);
+                    m_updateStatus->setText(
+                        QStringLiteral("发现新版本 <a href=\"%1\">%2</a>，"
+                                       "但该版本没有可自动更新的安装包")
+                            .arg(release.pageUrl, release.version));
+                    return;
+                }
+
                 m_updateStatus->setText(
-                    QStringLiteral("发现新版本 <a href=\"%1\">%2</a>（当前 %3）")
-                        .arg(url, latestVersion,
+                    QStringLiteral("发现新版本 %1（当前 %2）")
+                        .arg(release.version,
                              QCoreApplication::applicationVersion()));
-                m_updateStatus->setTextFormat(Qt::RichText);
-                m_updateStatus->setTextInteractionFlags(Qt::TextBrowserInteraction);
-                m_updateStatus->setOpenExternalLinks(true);
+                if (m_updateInstallBtn)
+                    m_updateInstallBtn->setVisible(true);
             });
 
     connect(m_updateChecker, &UpdateChecker::failed, this,
@@ -1577,5 +1605,77 @@ void PreferenceDialog::checkForUpdates()
                         QStringLiteral("检查失败：%1").arg(error));
             });
 
+    // 下载进度
+    connect(m_updateChecker, &UpdateChecker::downloadProgress, this,
+            [this](qint64 received, qint64 total) {
+                if (!m_updateStatus)
+                    return;
+                if (total > 0) {
+                    m_updateStatus->setText(
+                        QStringLiteral("正在下载更新… %1 / %2 MB")
+                            .arg(received / 1024.0 / 1024.0, 0, 'f', 1)
+                            .arg(total / 1024.0 / 1024.0, 0, 'f', 1));
+                } else {
+                    m_updateStatus->setText(
+                        QStringLiteral("正在下载更新… %1 MB")
+                            .arg(received / 1024.0 / 1024.0, 0, 'f', 1));
+                }
+            });
+
+    connect(m_updateChecker, &UpdateChecker::downloadFinished, this,
+            [this](const QString &filePath) {
+                QString error;
+                if (!UpdateInstaller::canInstall(&error)) {
+                    if (m_updateStatus)
+                        m_updateStatus->setText(error);
+                    return;
+                }
+
+                // 二次确认，避免误点导致程序重启
+                ElaContentDialog confirm(this);
+                confirm.setWindowTitle(QStringLiteral("安装更新"));
+                const QString confirmText = QStringLiteral(
+                    "将关闭程序、覆盖安装并自动重启。\n"
+                    "当前配置会保留，更新失败会自动回滚。\n\n继续吗？");
+                auto *msg = new ElaText(confirmText, &confirm);
+                msg->setTextStyle(ElaTextType::Body);
+                confirm.setCentralWidget(msg);
+                confirm.setLeftButtonText(QStringLiteral("取消"));
+                confirm.setMiddleButtonVisible(false);
+                confirm.setRightButtonText(QStringLiteral("立即更新"));
+                if (confirm.exec() != QDialog::Accepted)
+                    return;
+
+                QString installError;
+                if (!UpdateInstaller::installAndRestart(filePath, &installError)) {
+                    if (m_updateStatus)
+                        m_updateStatus->setText(installError);
+                    return;
+                }
+
+                if (m_updateStatus)
+                    m_updateStatus->setText(QStringLiteral("正在重启以完成更新…"));
+                // 立刻退出，让外部脚本接管
+                QTimer::singleShot(300, qApp, []() {
+                    QCoreApplication::quit();
+                });
+            });
+
+    connect(m_updateChecker, &UpdateChecker::downloadFailed, this,
+            [this](const QString &error) {
+                if (m_updateStatus)
+                    m_updateStatus->setText(
+                        QStringLiteral("下载失败：%1").arg(error));
+            });
+
     m_updateChecker->check();
+}
+
+void PreferenceDialog::startUpdateDownload()
+{
+    if (!m_updateChecker || m_pendingRelease.assetUrl.isEmpty())
+        return;
+    if (m_updateStatus)
+        m_updateStatus->setText(QStringLiteral("准备下载…"));
+    m_updateChecker->download(m_pendingRelease);
 }
