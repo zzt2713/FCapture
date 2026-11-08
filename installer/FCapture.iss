@@ -56,7 +56,9 @@ OutputBaseFilename={#AppShortName}-{#AppVersion}-setup
 Compression=lzma2/max
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
+; 若使用 Inno Setup < 6.3，请把上面这行改成：ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64compatible
+; 若使用 Inno Setup < 6.3，请把上面这行改成：ArchitecturesInstallIn64BitMode=x64
 WizardStyle=modern
 ShowLanguageDialog=no
 
@@ -64,6 +66,7 @@ LicenseFile={#ProjectRoot}\LICENSE
 ; 顶层只装发布时需要的文件，不打包源码
 
 [Languages]
+; ShowLanguageDialog=no 时使用第一条。中文语言包随 Inno Setup 安装提供。
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
@@ -92,10 +95,10 @@ Source: "{#DistDir}\generic\*";                DestDir: "{app}\generic";        
 ; 否则配置会写进 Program Files（无权限）导致启动即失败。
 
 [Icons]
-Name: "{group}\{#AppName}";          Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"
-Name: "{group}\用户手册";             Filename: "{app}\用户手册.md";   Flags: skipifsourcedoesntexist
-Name: "{group}\卸载 {#AppName}";      Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppName}";     Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"
+Name: "{group}\用户手册"; Filename: "{app}\用户手册.md"; Check: ManualIconWanted
+Name: "{group}\卸载 {#AppName}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
 ; 安装完成后可选启动。程序是托盘常驻，用 nowait 避免安装向导阻塞
@@ -106,15 +109,23 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#AppExeName}"; Flags: runhidden skipifdoesntexist; RunOnceId: "KillApp"
 
 [Code]
-// 安装前结束正在运行的实例，否则 exe 被占用会导致写入失败。
-// taskkill 退出码：0 = 已结束，128 = 进程不存在；其余视为无需处理。
+var
+  // 用户手册是否随包发布（编译期已知：dist\F-Capture\用户手册.md 是否存在）
+  ManualIconWanted: Boolean;
+
 function InitializeSetup(): Boolean;
 var
   ResultCode: Integer;
 begin
+  // 用户手册是否随包发布（决定是否创建对应快捷方式）
+  ManualIconWanted := FileExists('{#DistDir}\用户手册.md');
+
+  // 结束正在运行的实例，否则 exe 被占用会导致写入失败。
+  // taskkill 退出码：0 = 已结束，128 = 进程不存在；都不阻塞安装。
   Exec(ExpandConstant('{sys}\taskkill.exe'),
        '/F /IM {#AppExeName}', '', SW_HIDE,
        ewWaitUntilTerminated, ResultCode);
+
   Result := True;
 end;
 
