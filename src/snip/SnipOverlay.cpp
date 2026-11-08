@@ -57,6 +57,8 @@ constexpr int kMagnifierOffset = 22;
 constexpr int kMinSelection = 3;
 // 短边小于这个值时算"小元素"，不画锚点（否则锚点比内容还大）
 constexpr int kAnchorMinSide = 48;
+// 鼠标静止多久后才发起 UIA 请求（UIA 跨进程很慢，必须防抖）
+constexpr int kElementSettleMs = 90;
 constexpr int kMinCornerRadius = 4;   // 小于这个值肉眼看不出来，按"关闭"处理
 constexpr int kDefaultCornerRadius = 12;
 
@@ -161,6 +163,17 @@ SnipOverlay::SnipOverlay(QWidget *parent)
     m_ocr = new OcrEngine(this);
 
     // 长按 F5 连续刷新：每 500ms 刷一次，F5 松开后自动停
+    // 鼠标静止 90ms 后补发一次元素检测（防抖）。
+    // 没有这个定时器，快速移动时 requestElementDetection 会一直因为
+    // "还没静置够"而提前 return，停下来之后也没人再触发，导致检测不出来。
+    m_settleTimer = new QTimer(this);
+    m_settleTimer->setSingleShot(true);
+    m_settleTimer->setInterval(kElementSettleMs);
+    connect(m_settleTimer, &QTimer::timeout, this, [this]() {
+        if (m_state == State::Idle && m_detectMode != DetectMode::Free)
+            requestElementDetection();
+    });
+
     m_refreshTimer = new QTimer(this);
     m_refreshTimer->setInterval(500);
     connect(m_refreshTimer, &QTimer::timeout, this, [this]() {
@@ -1369,15 +1382,26 @@ void SnipOverlay::requestElementDetection()
     if (m_elementPending)
         return;
 
-    if (m_elementThrottle.isValid() && m_elementThrottle.elapsed() < 120)
+    // 关键节流：UIA 是跨进程调用，单次要 30~300ms（Electron/浏览器更慢）。
+    // 鼠标快速划过时逐帧请求会直接把 UI 线程拖住，表现为明显卡顿。
+    // 这里改成"鼠标停下才请求"：每次移动只重置计时器，静置 90ms 后
+    // 才真正发一次。移动过程中沿用上一次的结果，视觉上不会跳动。
+    const bool moved = (cursor - m_elementRequestPos).manhattanLength() >= 3;
+    if (moved) {
+        if (!m_elementSettleTimer.isValid())
+            m_elementSettleTimer.start();
+        if (m_elementSettleTimer.elapsed() < kElementSettleMs) {
+            // 还没停稳：等鼠标静止后再由定时器补一次
+            if (m_settleTimer && !m_settleTimer->isActive())
+                m_settleTimer->start();
+            return;
+        }
+    }
+
+    if (m_elementThrottle.isValid() && m_elementThrottle.elapsed() < 150)
         return;
 
-    // 光标在同一个元素内小幅移动时沿用上次结果；
-    // 移动超过 4px 才重新请求，既跟手又不会把 UIA 打爆。
-    if (!m_elementHierarchy.isEmpty()
-        && (cursor - m_elementRequestPos).manhattanLength() < 4)
-        return;
-
+    m_elementSettleTimer.restart();
     m_elementThrottle.restart();
     m_elementRequestPos = cursor;
     m_elementProcess = WindowDetector::processNameAt(cursor);
@@ -1477,6 +1501,10 @@ void SnipOverlay::clearDetection()
     m_elementRequestId = 0;
     m_elementPending = false;
     m_elementRequestPos = QPoint(-1, -1);
+    // 静置计时也要清掉，否则下次移动会被上一次的 elapsed 误导
+    m_elementSettleTimer.invalidate();
+    if (m_settleTimer)
+        m_settleTimer->stop();
 }
 
 void SnipOverlay::updateMagnifier()

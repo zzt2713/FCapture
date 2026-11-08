@@ -322,15 +322,22 @@ private:
         ComPtr<IUIAutomationElement> current(root);
 
         // 限制层数：控件树可能非常深，超过 24 层基本是自绘容器，没有意义
-        for (int depth = 0; depth < 24; ++depth) {
+        for (int depth = 0; depth < 12; ++depth) {
             ComPtr<IUIAutomationElement> child;
             if (FAILED(walker->GetFirstChildElement(current.Get(), child.GetAddressOf()))
                 || !child) {
                 break;
             }
 
+            // 遍历兄弟节点找命中的那个。这里是最容易变慢的地方：
+            // 列表/表格类控件的兄弟可能有几百上千个，每个都要跨进程取
+            // BoundingRectangle。限制最多检查 kMaxSiblings 个，
+            // 超出就放弃继续下钻（停在当前层，已经是一个可用的块）。
+            constexpr int kMaxSiblings = 40;
             ComPtr<IUIAutomationElement> next;
-            for (ComPtr<IUIAutomationElement> it = child; it;) {
+            int checked = 0;
+            for (ComPtr<IUIAutomationElement> it = child; it && checked < kMaxSiblings;
+                 ++checked) {
                 RECT r{};
                 if (SUCCEEDED(it->get_CurrentBoundingRectangle(&r))
                     && r.right > r.left && r.bottom > r.top
