@@ -290,9 +290,8 @@ private:
     quint64  m_elementRequestId = 0;
     QPoint   m_elementRequestPos;
     QElapsedTimer m_elementThrottle;
-    // 鼠标静置计时：UIA 跨进程很慢，只有停下 90ms 才真正请求
-    QElapsedTimer m_elementSettleTimer;
-    QTimer *m_settleTimer = nullptr;
+    // 最新鼠标位置（流水线用：结果回来时据此补发）
+    QPoint m_pendingCursor;
     bool     m_elementPending = false;
     QString  m_elementProcess;
 

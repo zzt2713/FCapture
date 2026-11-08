@@ -499,11 +499,12 @@ bool ElementDetector::prefersMsaa(const QString &processName)
     const QString cfg = ConfigManager::instance()
                             ->value(QStringLiteral("snip/element_msaa_apps"))
                             .toString();
-    static const QString kDefault =
-        QStringLiteral("code.exe,chrome.exe,electron.exe,javaw.exe,msedge.exe,"
-                       "firefox.exe,slack.exe,discord.exe,teams.exe");
-
-    const QString list = cfg.trimmed().isEmpty() ? kDefault : cfg;
+    // 现在默认就 MSAA 优先、UIA 兜底，所以不再需要按进程强制 MSAA。
+    // 这里只保留"用户显式配置"的名单：配了就强制走 MSAA（跳过 UIA 兜底），
+    // 用于某些 UIA 特别慢、宁可粗一点的程序。
+    if (cfg.trimmed().isEmpty())
+        return false;
+    const QString list = cfg;
     for (const QString &part : list.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
         if (part.trimmed().compare(processName, Qt::CaseInsensitive) == 0)
             return true;

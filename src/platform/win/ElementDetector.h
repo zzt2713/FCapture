@@ -68,6 +68,6 @@ private:
     int     m_restartCount = 0;
     bool    m_disabled = false;
 
-    static constexpr int kTimeoutMs = 500;
+    static constexpr int kTimeoutMs = 800;
     static constexpr int kMaxWorkerRestarts = 3;
 };

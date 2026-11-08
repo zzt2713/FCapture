@@ -57,8 +57,7 @@ constexpr int kMagnifierOffset = 22;
 constexpr int kMinSelection = 3;
 // 短边小于这个值时算"小元素"，不画锚点（否则锚点比内容还大）
 constexpr int kAnchorMinSide = 48;
-// 鼠标静止多久后才发起 UIA 请求（UIA 跨进程很慢，必须防抖）
-constexpr int kElementSettleMs = 90;
+
 constexpr int kMinCornerRadius = 4;   // 小于这个值肉眼看不出来，按"关闭"处理
 constexpr int kDefaultCornerRadius = 12;
 
@@ -149,6 +148,13 @@ SnipOverlay::SnipOverlay(QWidget *parent)
                     // Snipaste 的手感就是"指哪块就框哪块"，滚轮往上才是容器/窗口。
                     applyElementLevel(0);
                 }
+
+                // 流水线：结果回来时鼠标可能已经移走了，
+                // 立刻用**最新位置**再发一次，保证视觉上始终跟手。
+                if (m_state == State::Idle && m_detectMode != DetectMode::Free
+                    && (m_pendingCursor - m_elementRequestPos).manhattanLength() >= 3) {
+                    requestElementDetection();
+                }
             });
     connect(ElementDetector::instance(), &ElementDetector::timedOut, this,
             [this](quint64 id) {
@@ -158,22 +164,17 @@ SnipOverlay::SnipOverlay(QWidget *parent)
                 // 超时后降级为只显示窗口轮廓，不阻塞用户
                 m_elementHierarchy.clear();
                 update();
+
+                // 超时同样要补发（否则用户移动后就再也不更新了）
+                if (m_state == State::Idle && m_detectMode != DetectMode::Free
+                    && (m_pendingCursor - m_elementRequestPos).manhattanLength() >= 3) {
+                    requestElementDetection();
+                }
             });
 
     m_ocr = new OcrEngine(this);
 
     // 长按 F5 连续刷新：每 500ms 刷一次，F5 松开后自动停
-    // 鼠标静止 90ms 后补发一次元素检测（防抖）。
-    // 没有这个定时器，快速移动时 requestElementDetection 会一直因为
-    // "还没静置够"而提前 return，停下来之后也没人再触发，导致检测不出来。
-    m_settleTimer = new QTimer(this);
-    m_settleTimer->setSingleShot(true);
-    m_settleTimer->setInterval(kElementSettleMs);
-    connect(m_settleTimer, &QTimer::timeout, this, [this]() {
-        if (m_state == State::Idle && m_detectMode != DetectMode::Free)
-            requestElementDetection();
-    });
-
     m_refreshTimer = new QTimer(this);
     m_refreshTimer->setInterval(500);
     connect(m_refreshTimer, &QTimer::timeout, this, [this]() {
@@ -1351,7 +1352,11 @@ void SnipOverlay::updateHoverWindow()
     requestElementDetection();
 }
 
-// 元素检测：鼠标停下 100ms 后才发请求，且两次请求间隔不小于 200ms
+// 元素检测。实时策略：
+//   1. 鼠标移动即记录最新位置（m_pendingCursor）
+//   2. 同一时刻只允许一个请求在飞（m_elementPending）
+//   3. 结果回来时若鼠标已移开，立刻用最新位置补发（见 detected 回调）
+//   4. 检测本身在工作线程执行（MSAA 优先，UIA 兜底），不阻塞 UI
 void SnipOverlay::requestElementDetection()
 {
     const QPoint cursor = QCursor::pos();
@@ -1379,29 +1384,19 @@ void SnipOverlay::requestElementDetection()
         }
         return;
     }
+    // 实时策略：鼠标一动就记下最新位置，但**同一时刻只允许一个请求在飞**。
+    // 结果回来后立刻用最新位置再发一次（见 onElementDetected 末尾）。
+    // 这样既不会把 UIA/MSAA 打爆，视觉上又是"跟着鼠标走"的。
+    //
+    // 不在这里做"等鼠标停下再识别"——那会明显滞后，用户要的是实时。
+    m_pendingCursor = cursor;
     if (m_elementPending)
         return;
 
-    // 关键节流：UIA 是跨进程调用，单次要 30~300ms（Electron/浏览器更慢）。
-    // 鼠标快速划过时逐帧请求会直接把 UI 线程拖住，表现为明显卡顿。
-    // 这里改成"鼠标停下才请求"：每次移动只重置计时器，静置 90ms 后
-    // 才真正发一次。移动过程中沿用上一次的结果，视觉上不会跳动。
-    const bool moved = (cursor - m_elementRequestPos).manhattanLength() >= 3;
-    if (moved) {
-        if (!m_elementSettleTimer.isValid())
-            m_elementSettleTimer.start();
-        if (m_elementSettleTimer.elapsed() < kElementSettleMs) {
-            // 还没停稳：等鼠标静止后再由定时器补一次
-            if (m_settleTimer && !m_settleTimer->isActive())
-                m_settleTimer->start();
-            return;
-        }
-    }
-
-    if (m_elementThrottle.isValid() && m_elementThrottle.elapsed() < 150)
+    // 最小间隔只用于挡住同一帧内的重复调用（不是人为延迟）
+    if (m_elementThrottle.isValid() && m_elementThrottle.elapsed() < 16)
         return;
 
-    m_elementSettleTimer.restart();
     m_elementThrottle.restart();
     m_elementRequestPos = cursor;
     m_elementProcess = WindowDetector::processNameAt(cursor);
@@ -1501,10 +1496,6 @@ void SnipOverlay::clearDetection()
     m_elementRequestId = 0;
     m_elementPending = false;
     m_elementRequestPos = QPoint(-1, -1);
-    // 静置计时也要清掉，否则下次移动会被上一次的 elapsed 误导
-    m_elementSettleTimer.invalidate();
-    if (m_settleTimer)
-        m_settleTimer->stop();
 }
 
 void SnipOverlay::updateMagnifier()
