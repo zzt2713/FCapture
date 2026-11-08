@@ -157,7 +157,10 @@ QVector<ElementInfo> detectWithMsaa(const POINT &pt, quintptr targetHwnd)
 
     const qreal dpr = dprAtPhysical(pt);
 
-    for (int depth = 0; acc && depth < 12; ++depth) {
+    // 上溯层数从 12 降到 8：每层都要跨进程调 accLocation / get_accName /
+    // get_accRole / get_accParent，4 次往返。用户实际只会翻几层，
+    // 8 层足够覆盖"控件 → 容器 → 窗口"，还能省掉约 1/3 的往返开销。
+    for (int depth = 0; acc && depth < 8; ++depth) {
         ElementInfo info;
         info.depth = depth;
 
@@ -240,8 +243,26 @@ public slots:
         const qreal dpr = dprAtPhysical(probe);
         const POINT pt{ qRound(screenPos.x() * dpr), qRound(screenPos.y() * dpr) };
 
-        if (useMsaa || !m_uia) {
+        // 顺序很重要：**MSAA 优先，UIA 兜底**。
+        //
+        // MSAA 的 AccessibleObjectFromPoint / accHitTest 是"点查询"，
+        // 一次调用几毫秒；UIA 要遍历控件树、跨进程取每个节点的
+        // BoundingRectangle，动辄几十到几百毫秒 —— 这正是之前卡顿的原因。
+        // Snipaste 之所以跟手，就是主用 MSAA。
+        //
+        // 只有 MSAA 拿不到有用结果（纯 UWP / 部分 WPF）时才走 UIA。
+        if (!useMsaa) {
             hierarchy = detectWithMsaa(pt, targetHwnd);
+        }
+
+        if (!hierarchy.isEmpty() && !useMsaa) {
+            emit resultReady(requestId, hierarchy);
+            return;
+        }
+
+        if (useMsaa || !m_uia) {
+            if (hierarchy.isEmpty())
+                hierarchy = detectWithMsaa(pt, targetHwnd);
         } else {
             // 截图时我们自己的全屏遮罩盖在所有窗口之上。ElementFromPoint
             // 会原样返回这个遮罩（整屏），所以它永远只能拿到"整屏"。

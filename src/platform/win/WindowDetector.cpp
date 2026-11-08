@@ -6,6 +6,7 @@
 #include <QGuiApplication>
 #include <QScreen>
 #include <QElapsedTimer>
+#include <QHash>
 #include <QStringList>
 
 #include <windows.h>
@@ -291,6 +292,16 @@ QString processNameAt(const QPoint &screenPos)
         return {};
 
     HWND hwnd = reinterpret_cast<HWND>(stack.first().hwnd);
+
+    // 按 HWND 缓存：同一个窗口的进程名不会变，
+    // 而 OpenProcess + QueryFullProcessImageName 每次都是几百微秒级开销，
+    // 鼠标在同一个窗口上移动时没必要重复问。
+    static QHash<quintptr, QString> cache;
+    const quintptr key = quintptr(hwnd);
+    const auto it = cache.constFind(key);
+    if (it != cache.constEnd())
+        return it.value();
+
     DWORD winPid = 0;
     ::GetWindowThreadProcessId(hwnd, &winPid);
     if (winPid == 0)
@@ -310,7 +321,13 @@ QString processNameAt(const QPoint &screenPos)
     const int slash = name.lastIndexOf(QLatin1Char('\\'));
     if (slash >= 0)
         name = name.mid(slash + 1);
-    return name.toLower();
+    name = name.toLower();
+
+    // 缓存上限：窗口句柄数量有限，超过 256 就整体清空（简单且足够）
+    if (cache.size() > 256)
+        cache.clear();
+    cache.insert(key, name);
+    return name;
 }
 
 } // namespace WindowDetector
