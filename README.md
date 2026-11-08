@@ -1,16 +1,24 @@
-# F-Capture
+<h1 align="center">F-Capture</h1>
 
-用 Qt 6 Widgets (C++20) 实现的 Windows 截图 / 标注 / 贴图工具，仿 Snipaste 的交互。
+<p align="center">
+  <img src="logo/icon.png" width="96" alt="F-Capture" />
+</p>
+> 用 Qt 6 Widgets (C++20) 实现的 Windows 截图 / 标注 / 贴图工具，仿 Snipaste 的交互。
 
-<img src="logo/icon.png" width="96" alt="F-Capture" />
+<img src="docs/产品图.png" alt="F-Capture 产品图" width="100%" />
 
 ## 功能
 
+![image-20261108200754337](assets/image-20261108200754337.png)
+
 **截图**
+
 - 区域截图、窗口检测、界面元素检测（UI Automation，可识别按钮/输入框等具体控件）
 - 滚轮在「具体控件 ↔ 父容器 ↔ 整窗」之间切换层级，`Alt + 单击` 直接选整窗
 - 像素级微调、固定比例、圆角、阴影、延迟截图、历史回放
 - 截图包含鼠标光标（`~` 切换）
+
+![image-20261108200613808](assets/image-20261108200613808.png)
 
 **标注**
 - 矩形 / 椭圆（支持空心与实心）、直线 / 箭头（锥形笔杆）、折线、铅笔、马克笔
@@ -23,9 +31,14 @@
 - 缩放、透明度、旋转、镜像、灰度、反色、裁剪
 - 分组管理、吸附、鼠标穿透、虚拟桌面支持
 
+![image-20261108200706027](assets/image-20261108200706027.png)
+
 **其他**
+
 - OCR 文字识别（Windows.Media.Ocr，本地不联网）
 - 托盘常驻、全局快捷键、命令行参数、白板、屏幕热角
+
+![image-20261108200725571](assets/image-20261108200725571.png)
 
 ## 硬性要求
 

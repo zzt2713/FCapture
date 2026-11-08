@@ -519,6 +519,11 @@ ElaPushButton *iconButton(const QString &text, QWidget *parent,
 
 } // namespace
 
+PreferenceDialog::~PreferenceDialog()
+{
+    qInfo() << "PreferenceDialog: destroyed";
+}
+
 PreferenceDialog::PreferenceDialog(QWidget *parent)
     : ElaDialog(parent)
 {
@@ -622,6 +627,12 @@ void PreferenceDialog::hideEvent(QHideEvent *event)
     if (m_recordingRecorder)
         m_recordingRecorder->cancelRecording();
     ElaDialog::hideEvent(event);
+
+    // ElaDialog 的关闭按钮走的是 hide() 而不是 close()，
+    // 所以 WA_DeleteOnClose 不会生效。这里主动销毁，
+    // 否则 10 个设置页 + 全部 Ela 控件会常驻十几 MB 且永不回落。
+    qInfo() << "PreferenceDialog: hiding, scheduling deletion";
+    deleteLater();
 }
 
 void PreferenceDialog::buildPages()
@@ -1343,7 +1354,8 @@ QWidget *PreferenceDialog::buildHelpPage()
     auto *form = new QFormLayout;
     form->setSpacing(6);
     for (const Row &r : kRows) {
-        auto *key = new ElaText(QString::fromLatin1(r.key), hotkeyBox);
+        // key 里可能含中文（如「滚轮」），必须按 UTF-8 解码
+        auto *key = new ElaText(QString::fromUtf8(r.key), hotkeyBox);
         key->setTextStyle(ElaTextType::Body);
         auto *desc = new ElaText(QString::fromUtf8(r.desc), hotkeyBox);
         desc->setTextStyle(ElaTextType::Caption);

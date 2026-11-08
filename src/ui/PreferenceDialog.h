@@ -34,6 +34,7 @@ class PreferenceDialog : public ElaDialog
 
 public:
     explicit PreferenceDialog(QWidget *parent = nullptr);
+    ~PreferenceDialog() override;
 
     void setHotkeyConflicts(const QSet<QString> &actions);
     void showHotkeyResult(const QString &action, bool success,

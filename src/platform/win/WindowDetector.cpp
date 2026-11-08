@@ -7,6 +7,7 @@
 #include <QScreen>
 #include <QElapsedTimer>
 #include <QHash>
+#include <QDebug>
 #include <QStringList>
 
 #include <windows.h>
@@ -53,7 +54,9 @@ bool isIgnoredWindow(HWND hwnd)
 // GetWindowRect 返回的是**含不可见缩放边框**的矩形：Win10/11 上四周各多出
 // 约 7~8px（Shadow/Border），直接用它会在选区四周留一圈空隙，
 // 看起来永远"差一点严丝合缝"。
-// DWMWA_EXTENDED_FRAME_BOUNDS 才是用户眼睛看到的那一圈。
+//
+// DWMWA_EXTENDED_FRAME_BOUNDS 是 DWM 实际合成到屏幕上的窗口外沿，
+// 也就是用户眼睛看到的那一圈 —— 不再额外收边，否则会切掉内容。
 bool windowFrameRect(HWND hwnd, RECT *out)
 {
     if (!out)
@@ -63,8 +66,20 @@ bool windowFrameRect(HWND hwnd, RECT *out)
     if (SUCCEEDED(::DwmGetWindowAttribute(hwnd, kExtendedFrameBounds, out,
                                           sizeof(RECT)))) {
         // DWM 对最小化/无边框窗口可能返回空矩形，退回 GetWindowRect
-        if (out->right > out->left && out->bottom > out->top)
+        if (out->right > out->left && out->bottom > out->top) {
+            if (Q_UNLIKELY(qEnvironmentVariableIsSet("FCAPTURE_DEBUG_FRAME"))) {
+                RECT wr{};
+                ::GetWindowRect(hwnd, &wr);
+                qDebug() << "frame" << QString::number(quintptr(hwnd), 16)
+                         << "DWM" << out->left << out->top
+                         << (out->right - out->left) << (out->bottom - out->top)
+                         << "WinRect" << wr.left << wr.top
+                         << (wr.right - wr.left) << (wr.bottom - wr.top)
+                         << "delta" << (out->left - wr.left) << (out->top - wr.top)
+                         << (out->right - wr.right) << (out->bottom - wr.bottom);
+            }
             return true;
+        }
     }
     return ::GetWindowRect(hwnd, out) != FALSE;
 }

@@ -14,7 +14,6 @@
 #include "ElaApplication.h"
 
 #include <QApplication>
-#include <QMessageBox>
 #include <QStyleFactory>
 #include <QThreadPool>
 #include <QTimer>
@@ -32,25 +31,6 @@ bool debugLoggingRequested(int argc, char *argv[])
             return true;
     }
     return false;
-}
-
-// 上次异常退出：提示用户并提供 minidump 位置
-void warnAboutPreviousCrash()
-{
-    const QString marker = WinCrashHandler::consumeCrashMarker();
-    if (marker.isEmpty())
-        return;
-    qWarning() << "Previous run crashed:" << marker;
-    // 启动早期没有窗口可挂 ElaMessageBar，用标准对话框并临时套截图层暗色样式，
-    // 避免出现刺眼的白底消息框。
-    QMessageBox box(QMessageBox::Warning, QStringLiteral("上次运行异常退出"),
-                    QStringLiteral("检测到上次运行没有正常结束。\n\n"
-                                   "崩溃转储和日志已保存在数据目录，"
-                                   "可在首选项的「关于」页一次性导出诊断信息。\n\n%1")
-                        .arg(marker.left(600)),
-                    QMessageBox::Ok);
-    box.setStyleSheet(Theme::overlayStyleSheet());
-    box.exec();
 }
 
 } // namespace
@@ -81,6 +61,12 @@ int main(int argc, char *argv[])
 
     Logger::init(debugLoggingRequested(argc, argv));
     Logger::installCrashHandler();
+
+    // 上次异常退出只写日志，不弹窗打扰用户。
+    // 需要排查时去「首选项 → 关于 → 导出诊断信息」拿崩溃转储。
+    const QString crashMarker = WinCrashHandler::consumeCrashMarker();
+    if (!crashMarker.isEmpty())
+        qWarning() << "Previous run crashed:" << crashMarker;
     qInfo() << "=== F-Capture" << QApplication::applicationVersion() << "starting ===";
 
     // 顺序不能错：QApplication → Fusion → eApp->init() → 任何 Ela 控件
@@ -106,9 +92,6 @@ int main(int argc, char *argv[])
     // 主线程看门狗：每 2 秒打点，超过 5 秒未打点写 WARN（不重启，避免掩盖问题）
     Watchdog watchdog;
     watchdog.start();
-
-    // 崩溃提示放到事件循环开始后，避免阻塞启动
-    QTimer::singleShot(0, &app, warnAboutPreviousCrash);
 
     const int ret = app.exec();
 

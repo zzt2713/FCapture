@@ -365,6 +365,9 @@ void AppController::showPreferences()
     if (!m_preferenceDialog) {
         auto *dialog = new PreferenceDialog(nullptr);
         m_preferenceDialog = dialog;
+        // 关闭即销毁：首选项有 10 个页面、大量 Ela 控件，
+        // 常驻会占十几 MB 且永不回落。重新打开时重建，代价远小于常驻内存。
+        dialog->setAttribute(Qt::WA_DeleteOnClose, true);
         dialog->setHotkeyConflicts(m_hotkeyConflicts);
 
         connect(dialog, &PreferenceDialog::hotkeyRecordingChanged, this,
