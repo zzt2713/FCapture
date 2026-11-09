@@ -428,12 +428,17 @@ GroupManagerDialog::GroupManagerDialog(QWidget *parent)
 
         ElaContentDialog confirm(this);
         confirm.setWindowTitle(QStringLiteral("删除分组"));
+        // ElaContentDialog 的中央区没有内边距，文本会贴着边，用带边距的布局包一层
+        auto *body = new QWidget(&confirm);
+        auto *bodyLayout = new QVBoxLayout(body);
+        bodyLayout->setContentsMargins(24, 16, 24, 8);
         auto *msg = new ElaText(QStringLiteral("确定删除分组「%1」？组内贴图会被一起移除。")
                                     .arg(group),
-                                &confirm);
+                                body);
         msg->setTextStyle(ElaTextType::Body);
         msg->setWordWrap(true);
-        confirm.setCentralWidget(msg);
+        bodyLayout->addWidget(msg);
+        confirm.setCentralWidget(body);
         confirm.setLeftButtonText(QStringLiteral("取消"));
         confirm.setMiddleButtonVisible(false);
         confirm.setRightButtonText(QStringLiteral("删除"));

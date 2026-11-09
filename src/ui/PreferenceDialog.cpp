@@ -1709,9 +1709,15 @@ void PreferenceDialog::checkForUpdates()
                 const QString confirmText = QStringLiteral(
                     "将关闭程序、覆盖安装并自动重启。\n"
                     "当前配置会保留，更新失败会自动回滚。\n\n继续吗？");
-                auto *msg = new ElaText(confirmText, &confirm);
+                // ElaContentDialog 的中央区没有内边距，文本会贴着边，
+                // 用带边距的布局包一层
+                auto *body = new QWidget(&confirm);
+                auto *bodyLayout = new QVBoxLayout(body);
+                bodyLayout->setContentsMargins(24, 16, 24, 8);
+                auto *msg = new ElaText(confirmText, body);
                 msg->setTextStyle(ElaTextType::Body);
-                confirm.setCentralWidget(msg);
+                bodyLayout->addWidget(msg);
+                confirm.setCentralWidget(body);
                 confirm.setLeftButtonText(QStringLiteral("取消"));
                 confirm.setMiddleButtonVisible(false);
                 confirm.setRightButtonText(QStringLiteral("立即更新"));
