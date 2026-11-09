@@ -130,6 +130,26 @@ OCR 完全本地运行；二维码支持一图多码，识别结果可复制，�
 
 ![image-20261108200613808](assets/image-20261108200613808.png)
 
+## 特别感谢
+
+F-Capture 站在这些优秀开源项目的肩膀上，特此致谢：
+
+| 项目 | 版本 | 许可证 | 在本项目中的用途 |
+|---|---|---|---|
+| [Qt](https://www.qt.io/) | 6.8.3 | LGPL-3.0 / 商业 | 全部 UI、图形绘制、网络、SVG 渲染的基础框架 |
+| [ElaWidgetTools](https://github.com/Liniyous/ElaWidgetTools) | 2.0.2 | MIT | 对话框、菜单、首选项、消息提示等应用层控件（Ela 暗色/亮色主题） |
+| [ZXing-C++](https://github.com/zxing-cpp/zxing-cpp) | 2.3.0 | Apache-2.0 | 二维码 / 条码识别（QR、DataMatrix、Aztec 及各类一维码），完全离线 |
+| [Lucide](https://lucide.dev/) | 1.70.0 | ISC | 工具栏、菜单、对话框内的全部矢量图标（29 个 SVG） |
+
+此外还使用了 Windows 平台自带的 **Windows.Media.Ocr**（系统 OCR 引擎，本地运行、不联网）与 **UI Automation / MSAA**（界面元素识别）。
+
+### 致谢
+
+- **Snipaste** —— 本项目的交互设计与功能规划的重要参考，截图工具的标杆
+- **ElaWidgetTools 作者** —— 提供了完善且易于接入的 Fluent 风格 Qt 控件库
+- **ZXing-C++ 维护者与贡献者** —— 让离线二维码识别成为可能
+- **Lucide 团队** —— 提供风格统一、可自由使用的开源图标
+
 ## 许可
 
 本仓库仅用于学习与个人使用。
