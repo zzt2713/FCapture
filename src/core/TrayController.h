@@ -27,6 +27,7 @@ public:
 
 signals:
     void captureRequested();
+    void longScreenshotRequested();
     void pasteRequested();
     void toggleImagesRequested();
     void preferencesRequested();
@@ -42,6 +43,7 @@ private:
     AppMenu::Menu *m_menu = nullptr;
 
     QAction *m_captureAction = nullptr;
+    QAction *m_longShotAction = nullptr;
     QAction *m_pasteAction = nullptr;
     QAction *m_toggleAction = nullptr;
     QAction *m_prefAction = nullptr;

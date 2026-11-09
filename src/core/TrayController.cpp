@@ -54,6 +54,12 @@ void TrayController::buildMenu()
                                              QStringLiteral("截图"));
     connect(m_captureAction, &QAction::triggered, this, &TrayController::captureRequested);
 
+    // 长截图：框选区域后滚动拼接长图（F2 也可以进入）
+    m_longShotAction = AppMenu::addIconAction(m_menu->get(), ElaIconType::ExpandWide,
+                                             QStringLiteral("长截图"));
+    connect(m_longShotAction, &QAction::triggered, this,
+            &TrayController::longScreenshotRequested);
+
     m_pasteAction = AppMenu::addIconAction(m_menu->get(), ElaIconType::Image,
                                            QStringLiteral("贴图"));
     connect(m_pasteAction, &QAction::triggered, this, &TrayController::pasteRequested);
@@ -126,6 +132,11 @@ void TrayController::refreshMenus()
     const QString captureText = hotkeyText(QStringLiteral("capture"));
     if (m_captureAction)
         m_captureAction->setText(QStringLiteral("截图\t%1").arg(captureText));
+
+    if (m_longShotAction)
+        m_longShotAction->setText(
+            QStringLiteral("长截图\t%1")
+                .arg(hotkeyText(QStringLiteral("long-screenshot"))));
 
     if (m_pasteAction)
         m_pasteAction->setText(

@@ -28,8 +28,10 @@ class SnipHistory : public QObject
 public:
     static SnipHistory *instance();
 
-    // 最长边超过该值的记录会被缩成缩略图
-    static constexpr int kThumbMaxSide = 480;
+    // 最长边超过该值的记录会被缩成缩略图。
+    // 历史页只显示 104px，320 足够 3 倍 DPI；点击旧记录贴出的也是缩略图，
+    // 再大只是白占内存（20 条 × 480px 约 10MB，320px 约 4.6MB）
+    static constexpr int kThumbMaxSide = 320;
 
     void add(const QImage &image, const QRect &logicalRect);
     // 取某条记录的可用原图（没有原图时返回缩略图）

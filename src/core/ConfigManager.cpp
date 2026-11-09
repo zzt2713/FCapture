@@ -31,6 +31,8 @@ QString ConfigManager::hotkey(const QString &action) const
         {QStringLiteral("capture-active-window"), QStringLiteral("Ctrl+Shift+A")},
         {QStringLiteral("paste"), QStringLiteral("F3")},
         {QStringLiteral("toggle-images"), QStringLiteral("Shift+F3")},
+        // 长截图：框选区域后滚动拼接长图
+        {QStringLiteral("long-screenshot"), QStringLiteral("F2")},
     };
     const QString key = QStringLiteral("hotkey/") + action;
     const QString stored = m_settings.value(key, kDefaults.value(action)).toString().trimmed();
@@ -98,6 +100,9 @@ QVariant ConfigManager::value(const QString &key, const QVariant &fallback) cons
         {QStringLiteral("hotcorner/bottom_right"), QStringLiteral("none")},
         {QStringLiteral("super_snip/enabled"), false},
         {QStringLiteral("super_snip/modifier"), QStringLiteral("Win")},
+        // 不写进 kDefaults 的话 value() 返回无效 QVariant，toInt()=0，
+        // SnipHistory 构造时 maxCount 会被 qMax(1,0) 压成 1（只剩一条历史）
+        {QStringLiteral("general/snip_history_count"), 20},
     };
     return m_settings.value(key, fallback.isValid() ? fallback : kDefaults.value(key));
 }

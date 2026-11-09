@@ -24,6 +24,10 @@ struct Snapshot
 
 Snapshot captureAllScreens(bool includeCursor = false);
 
+// 抓取屏幕上的逻辑矩形区域（不含鼠标指针）。
+// 返回物理像素尺寸的图（devicePixelRatio 附在图上），与区域所在屏幕一致。
+QImage captureRegion(const QRect &logicalRect);
+
 // 逻辑坐标 → 快照像素坐标
 inline QRect mapToSnapshot(const QRect &logical, const QRect &virtualGeometry, qreal dpr)
 {

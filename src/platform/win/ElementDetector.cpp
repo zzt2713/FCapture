@@ -205,6 +205,45 @@ QVector<ElementInfo> detectWithMsaa(const POINT &pt, quintptr targetHwnd)
     return out;
 }
 
+// MSAA 结果是不是只有"窗口壳"级别的粗命中。
+//
+// Qt / WPF / Electron 的 MSAA 桥常常只暴露顶层窗口或客户区一大块。
+// 以前只要 MSAA 非空就直接返回，UIA 兜底永远没机会跑 —— 这就是
+// "有的软件识别不到具体控件"的主要原因。粗命中时继续走 UIA 拿更具体的块。
+bool isCoarseHit(const QVector<ElementInfo> &hierarchy, quintptr targetHwnd)
+{
+    if (hierarchy.isEmpty() || !targetHwnd)
+        return false;
+
+    RECT wr{};
+    if (!::GetWindowRect(reinterpret_cast<HWND>(targetHwnd), &wr)
+        || wr.right <= wr.left || wr.bottom <= wr.top)
+        return false;
+
+    const POINT center{ (wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2 };
+    const QRectF win = rectToLogical(wr, dprAtPhysical(center));
+    const QRectF hit = hierarchy.first().logicalRect;
+    if (!hit.isValid() || hit.isEmpty() || win.isEmpty())
+        return false;
+
+    // 命中块和窗口一样大（±3px，留 DWM 边框误差）→ 就是窗口壳
+    if (qAbs(hit.width() - win.width()) <= 3.0
+        && qAbs(hit.height() - win.height()) <= 3.0)
+        return true;
+
+    // 层级很浅（只到客户区/面板）且覆盖窗口 85% 以上 → 同样视为粗命中
+    return hierarchy.size() <= 2
+           && hit.width() * hit.height() >= win.width() * win.height() * 0.85;
+}
+
+qreal hitArea(const QVector<ElementInfo> &hierarchy)
+{
+    if (hierarchy.isEmpty())
+        return 0.0;
+    const QRectF r = hierarchy.first().logicalRect;
+    return r.width() * r.height();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------- Worker
@@ -245,24 +284,21 @@ public slots:
 
         // 顺序很重要：**MSAA 优先，UIA 兜底**。
         //
-        // MSAA 的 AccessibleObjectFromPoint / accHitTest 是"点查询"，
-        // 一次调用几毫秒；UIA 要遍历控件树、跨进程取每个节点的
-        // BoundingRectangle，动辄几十到几百毫秒 —— 这正是之前卡顿的原因。
-        // Snipaste 之所以跟手，就是主用 MSAA。
+        // MSAA 的 accHitTest 是"点查询"，一次调用几毫秒；UIA 要遍历控件树、
+        // 跨进程取每个节点的 BoundingRectangle，动辄几十到几百毫秒 ——
+        // 这正是之前卡顿的原因。Snipaste 之所以跟手，就是主用 MSAA。
         //
-        // 只有 MSAA 拿不到有用结果（纯 UWP / 部分 WPF）时才走 UIA。
-        if (!useMsaa) {
-            hierarchy = detectWithMsaa(pt, targetHwnd);
-        }
+        // 例外：MSAA 只给出"窗口壳"级粗命中时不能直接返回，必须让 UIA
+        // 有机会给出更具体的控件（Qt / WPF / Electron 的 MSAA 桥就是这种情况）。
+        const QVector<ElementInfo> msaaResult = detectWithMsaa(pt, targetHwnd);
 
-        if (!hierarchy.isEmpty() && !useMsaa) {
-            emit resultReady(requestId, hierarchy);
+        if (!useMsaa && !msaaResult.isEmpty() && !isCoarseHit(msaaResult, targetHwnd)) {
+            emit resultReady(requestId, msaaResult);
             return;
         }
 
         if (useMsaa || !m_uia) {
-            if (hierarchy.isEmpty())
-                hierarchy = detectWithMsaa(pt, targetHwnd);
+            hierarchy = msaaResult;
         } else {
             // 截图时我们自己的全屏遮罩盖在所有窗口之上。ElementFromPoint
             // 会原样返回这个遮罩（整屏），所以它永远只能拿到"整屏"。
@@ -305,9 +341,13 @@ public slots:
                     hierarchy = buildHierarchyUp(fromPoint.Get(), dpr);
                 }
             }
-            if (hierarchy.isEmpty())
-                hierarchy = detectWithMsaa(pt, targetHwnd);
         }
+
+        // MSAA 粗结果兜底：UIA 也失败时至少还有窗口级命中；
+        // 两边都有结果时保留命中块更小（更具体）的那个。
+        if (!msaaResult.isEmpty()
+            && (hierarchy.isEmpty() || hitArea(msaaResult) < hitArea(hierarchy)))
+            hierarchy = msaaResult;
 
         emit resultReady(requestId, hierarchy);
     }

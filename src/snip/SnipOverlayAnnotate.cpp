@@ -35,6 +35,13 @@ void SnipOverlay::showPaintBar()
 
     m_currentTool = m_paintBar->currentTool();
     update();
+
+    // 长截图意图（F2 / 托盘进入）：选区一就绪自动进入准备态
+    if (m_longShotIntent && m_longShotState == LongShotState::Off
+        && !localSelection().isEmpty()) {
+        m_longShotIntent = false;
+        enterLongShot();
+    }
 }
 
 void SnipOverlay::hidePaintBar()

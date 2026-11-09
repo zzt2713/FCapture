@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FCapture VERSION 1.0.0 LANGUAGES CXX)
+project(FCapture VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,6 +65,8 @@ set(APP_SOURCES
     src/paste/PinWindow.cpp
 
     src/snip/ImageEffects.cpp
+    src/snip/LongShotBar.cpp
+    src/snip/LongShotStitcher.cpp
     src/snip/ScreenCapturer.cpp
     src/snip/SizeInputBox.cpp
     src/snip/SnipHistory.cpp
@@ -137,6 +139,8 @@ set(HEADERS
     src/paste/PinWindow.h
 
     src/snip/ImageEffects.h
+    src/snip/LongShotBar.h
+    src/snip/LongShotStitcher.h
     src/snip/ScreenCapturer.h
     src/snip/SizeInputBox.h
     src/snip/SnipHistory.h
@@ -262,6 +266,8 @@ qt_add_resources(FCapture "icon_resources"
         resources/icons/scan-text.svg
         resources/icons/qr-code.svg
         resources/icons/check.svg
+        resources/icons/play.svg
+        resources/icons/pause.svg
 )
 
 # 头文件路径、Qt 模块、Win32 库、编译选项都由 fcapture_core 的 PUBLIC 属性传递

@@ -2,6 +2,7 @@
 
 #include "annotate/AnnotationTool.h"
 #include "platform/win/ElementDetector.h"
+#include "snip/LongShotStitcher.h"
 #include "snip/ScreenCapturer.h"
 #include "snip/SnipResult.h"
 
@@ -23,6 +24,7 @@ class TextInputBox;
 class SizeInputBox;
 class OcrEngine;
 class OcrResultDialog;
+class LongShotBar;
 
 // 截图层：全屏遮罩 + 选区 + 放大镜 + 取色 + 窗口检测 + 标注
 class SnipOverlay : public QWidget
@@ -45,6 +47,10 @@ public:
 
     // 仅供离屏测试观察内部状态
     AnnotationModel *modelForTest() const { return m_model; }
+
+    // 长截图入口（热键 F2 / 托盘菜单）：已有选区直接进入准备态，
+    // 否则记住意图，选区一就绪自动进入
+    void requestLongScreenshot();
 
 signals:
     void snipFinished(const SnipResult &result, SnipOutput output);
@@ -119,7 +125,8 @@ private:
     void pickColor();
     QString colorString() const;
     QImage  composeResultImage() const;
-    void    finishSnip(SnipOutput output);
+    // 返回是否真正结束了会话（保存对话框被取消 = false）
+    bool    finishSnip(SnipOutput output);
     void    abortSnip();
 
     // --- P4 检测 ---
@@ -161,6 +168,32 @@ private:
     void restorePaintBarAfterAsync();
     void runBarcodeScan();
     QImage selectionImage() const;
+
+    // --- 长截图（滚动拼接）---
+    // Off=普通模式 / Paused=工具栏打开未捕获 / Capturing=滚动拼接中。
+    // 长截图有自己的独立工具栏（LongShotBar），与正常截图工具栏互不干扰。
+    // 进入后：外圈与普通截图一致（冻结快照 + 半透明黑遮罩），选区用 setMask
+    // 从窗口形状里挖掉（真"天窗"），实时页面直接透出来；
+    // 鼠标穿透 + 焦点让给下层窗口，保证滚轮能滚动页面。
+    enum class LongShotState { Off, Paused, Capturing };
+    void enterLongShot();
+    void startLongCapture();
+    void pauseLongCapture();
+    void cancelLongShot();
+    void saveLongShot();
+    void copyLongShot();
+    void pinLongShot();
+    void grabLongShotFrame();
+    void syncLongShotUi();
+    void drawLongShotRing(QPainter &p);
+    LongShotState m_longShotState = LongShotState::Off;
+    bool  m_longShotIntent = false;    // 选区就绪后自动进入长截图
+    bool  m_longShotGrabbing = false;  // 抓帧在途（防 150ms 定时器重入）
+    QRect m_longShotRect;              // 捕获视口（全局逻辑坐标），进入时定死
+    QString m_longShotStatus;          // 外框上的状态提示（空 = 默认引导语）
+    QTimer *m_longShotTimer = nullptr;
+    LongShotStitcher m_stitcher;
+    LongShotBar *m_longShotBar = nullptr;
 
     void loadHistory(int offset);
     void resetToFullScreen();

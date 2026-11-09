@@ -46,6 +46,7 @@ const QStringList &hotkeyActions()
         QStringLiteral("capture-active-window"),
         QStringLiteral("paste"),
         QStringLiteral("toggle-images"),
+        QStringLiteral("long-screenshot"),
     };
     return actions;
 }
@@ -74,6 +75,8 @@ void AppController::initialize()
     if (ConfigManager::instance()->value(QStringLiteral("general/hide_tray_icon")).toBool())
         m_tray->hideTrayIcon();
     connect(m_tray, &TrayController::captureRequested, this, &AppController::startCapture);
+    connect(m_tray, &TrayController::longScreenshotRequested, this,
+            &AppController::startLongScreenshot);
     connect(m_tray, &TrayController::pasteRequested, this, &AppController::startPaste);
     connect(m_tray, &TrayController::toggleImagesRequested, this, &AppController::toggleAllImages);
     connect(m_tray, &TrayController::preferencesRequested, this, &AppController::showPreferences);
@@ -93,6 +96,8 @@ void AppController::initialize()
             startPaste();
         else if (action == QStringLiteral("toggle-images"))
             toggleAllImages();
+        else if (action == QStringLiteral("long-screenshot"))
+            startLongScreenshot();
     });
 
     registerHotkeys();
@@ -202,6 +207,20 @@ void AppController::startActiveWindowCapture()
     captureCommon();
 }
 
+// F2 / 托盘「长截图」：已有截图会话直接进入长截图流程；
+// 否则开新会话，选区就绪后自动进入（用户流程：先框选，再滚动拼接）
+void AppController::startLongScreenshot()
+{
+    if (m_capturing) {
+        if (m_overlay)
+            m_overlay->requestLongScreenshot();
+        return;
+    }
+
+    m_longShotPending = true;
+    startCapture();
+}
+
 void AppController::captureCommon()
 {
     // 先隐藏当前截图层（如果还在），再抓屏
@@ -223,13 +242,21 @@ void AppController::captureCommon()
         m_overlay = overlay;
         connect(overlay, &SnipOverlay::snipFinished, this, &AppController::onSnipFinished);
         connect(overlay, &SnipOverlay::snipAborted, this, [this]() { m_capturing = false; });
-        connect(overlay, &QObject::destroyed, this, [this]() { m_capturing = false; });
+        connect(overlay, &QObject::destroyed, this, [this]() {
+            m_capturing = false;
+            // 会话期的全屏快照释放后，把空闲工作集立即还给系统
+            WinUtil::trimWorkingSet();
+        });
 
         overlay->startSession(snap);
         if (m_captureActiveWindow)
             overlay->captureActiveWindow(m_activeWindowRect);
         if (m_hasPendingRequest)
             applySnipRequest(overlay);
+        if (m_longShotPending) {
+            m_longShotPending = false;
+            overlay->requestLongScreenshot();
+        }
         // 截图窗口不抢任务栏
         WinUtil::applyToolWindowStyle(overlay->winId());
     });
@@ -405,6 +432,9 @@ void AppController::showPreferences()
                 });
         connect(dialog, &QObject::destroyed, this, [this]() {
             restoreHotkeys();
+            // 10 个设置页 + Ela 控件销毁后，Qt 的分配器不把内存还给 OS，
+            // 任务管理器里会一直显示峰值；这里显式裁剪工作集
+            WinUtil::trimWorkingSet();
         });
     }
 
@@ -417,6 +447,7 @@ void AppController::showGroupManager()
 {
     auto *dialog = new GroupManagerDialog(nullptr);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
+    connect(dialog, &QObject::destroyed, this, []() { WinUtil::trimWorkingSet(); });
     dialog->show();
     dialog->raise();
     dialog->activateWindow();

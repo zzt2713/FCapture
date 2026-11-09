@@ -28,7 +28,9 @@
 #include "ElaTheme.h"
 #include "ElaToggleSwitch.h"
 
+#include <QAbstractItemView>
 #include <QClipboard>
+#include <QComboBox>
 #include <functional>
 #include <QContextMenuEvent>
 #include <QCoreApplication>
@@ -57,6 +59,8 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
+#include <functional>
+
 namespace {
 
 constexpr int kToggleWidth = 44;
@@ -81,6 +85,7 @@ QString findHotkeyConflict(const QString &candidate, const QString &currentActio
         QStringLiteral("capture-active-window"),
         QStringLiteral("paste"),
         QStringLiteral("toggle-images"),
+        QStringLiteral("long-screenshot"),
     };
 
     for (const QString &action : kActions) {
@@ -175,6 +180,9 @@ void applyInputTheme(QWidget *box)
     const auto edits = box->findChildren<QLineEdit *>();
     for (QLineEdit *edit : edits)
         applyPalette(edit);
+    // 下拉弹层是独立窗口且常在首次展开时才建好样式，颜色最容易滞后
+    if (auto *combo = qobject_cast<QComboBox *>(box))
+        applyPalette(combo->view());
 }
 
 // 一次性处理某个设置页里的所有输入类控件
@@ -211,17 +219,57 @@ public:
         applyTheme();
     }
 
+    void setOnShow(std::function<void()> onShow) { m_onShow = std::move(onShow); }
+
 protected:
+    void showEvent(QShowEvent *event) override
+    {
+        QScrollArea::showEvent(event);
+        // 页面重新可见时兜底重刷输入控件主题（下拉弹层等首次展开才定型）
+        if (m_onShow)
+            m_onShow();
+        // 首次显示时子控件布局还没结算完，滚动条会按过期的 sizeHint 误判
+        // （表现为"刚打开有滚动条，切一次页面就消失"）。
+        // 这里做两轮结算：先把宽度夹紧并同步激活布局，再让 QScrollArea
+        // 重算滚动条 —— 等价于"切走再切回"的修复效果，但自动完成。
+        // 两轮是因为 Ela 控件的尺寸要等 polish/字体结算后才稳定。
+        settle(0);
+        settle(60);
+    }
+
     void resizeEvent(QResizeEvent *event) override
     {
+        // 必须先夹紧宽度再让基类算滚动条：基类按夹紧前的 sizeHint 判断，
+        // 偏宽的内容会让虚高的文本换行变多、高度偏大，误显示竖向滚动条。
+        fitWidget();
         QScrollArea::resizeEvent(event);
+    }
+
+private:
+    std::function<void()> m_onShow;
+
+    void fitWidget()
+    {
         if (QWidget *w = widget()) {
             w->setMinimumWidth(0);
             w->setMaximumWidth(viewport()->width());
         }
     }
 
-private:
+    void settle(int delayMs)
+    {
+        QTimer::singleShot(delayMs, this, [this]() {
+            fitWidget();
+            if (QWidget *w = widget()) {
+                w->updateGeometry();
+                if (w->layout())
+                    w->layout()->activate();
+            }
+            QResizeEvent ev(size(), size());
+            QScrollArea::resizeEvent(&ev);
+        });
+    }
+
     void applyTheme()
     {
         // 视口自己上 Ela 对话框底色，不能靠透明透出（ElaDialog 不画内容区）。
@@ -246,10 +294,11 @@ private:
     }
 };
 
-QWidget *wrapScrollable(QWidget *content)
+QWidget *wrapScrollable(QWidget *content, std::function<void()> onShow = {})
 {
     auto *scroll = new FittedScrollArea;
     scroll->setWidget(content);
+    scroll->setOnShow(std::move(onShow));
     return scroll;
 }
 
@@ -662,11 +711,18 @@ void PreferenceDialog::buildPages()
     for (const Entry &e : entries) {
         m_nav->addItem(e.icon, QString::fromUtf8(e.title));
         QWidget *content = e.build(this);
-        // 输入类控件要按当前主题重设调色板，并在主题切换时再刷一遍
+        // 输入类控件要按当前主题重设调色板，并在主题切换时再刷一遍。
+        // Ela 内部会异步重设输入控件的内部调色板，切换主题时要晚一步
+        // 再覆盖一次，否则输入框文字会残留旧主题的颜色（白底白字/黑底黑字）。
         themeInputs(content);
         connect(ElaThemeBridge::instance(), &ElaThemeBridge::themeChanged,
-                content, [content]() { themeInputs(content); });
-        m_stack->addWidget(wrapScrollable(content));
+                content, [content]() {
+                    themeInputs(content);
+                    QTimer::singleShot(0, content, [content]() { themeInputs(content); });
+                    QTimer::singleShot(150, content, [content]() { themeInputs(content); });
+                });
+        // 切到该页时兜底再刷一遍（覆盖下拉弹层等首次展开才定型的控件）
+        m_stack->addWidget(wrapScrollable(content, [content]() { themeInputs(content); }));
     }
 
     // 一次只显示一页，避免隐藏页仍参与绘制
@@ -959,6 +1015,7 @@ QWidget *PreferenceDialog::buildControlPage()
         { "capture-active-window", "抓活动窗口" },
         { "paste", "贴图" },
         { "toggle-images", "隐藏/显示所有贴图" },
+        { "long-screenshot", "长截图" },
     };
 
     for (const Binding &b : bindings) {

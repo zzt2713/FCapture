@@ -49,6 +49,19 @@ QRect toLogical(const RECT &r)
                  qRound((r.right - r.left) / dpr), qRound((r.bottom - r.top) / dpr));
 }
 
+// 逻辑坐标 → 物理像素（与 windowRectAt 相同的换算约定）
+POINT toPhysicalPoint(const QPoint &logical)
+{
+    qreal dpr = 1.0;
+    for (QScreen *screen : QGuiApplication::screens()) {
+        if (screen->geometry().contains(logical)) {
+            dpr = screen->devicePixelRatio();
+            break;
+        }
+    }
+    return POINT{ qRound(logical.x() * dpr), qRound(logical.y() * dpr) };
+}
+
 } // namespace
 
 QRect activeWindowRect()
@@ -110,9 +123,57 @@ void applyNoActivateStyle(quintptr wid)
     ::SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
 }
 
+void setClickThrough(quintptr wid, bool on)
+{
+    HWND hwnd = reinterpret_cast<HWND>(wid);
+    if (!hwnd)
+        return;
+    LONG_PTR ex = ::GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (on)
+        ex |= WS_EX_TRANSPARENT;
+    else
+        ex &= ~WS_EX_TRANSPARENT;
+    ::SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+}
+
+void activateWindowAt(const QPoint &logicalPos)
+{
+    const POINT pt = toPhysicalPoint(logicalPos);
+    HWND target = ::WindowFromPoint(pt);
+    if (!target)
+        return;
+    target = ::GetAncestor(target, GA_ROOT);
+    if (!target || target == ::GetForegroundWindow())
+        return;
+    ::SetForegroundWindow(target);
+}
+
+void forwardWheel(quintptr selfWid, int delta, const QPoint &logicalPos)
+{
+    const POINT pt = toPhysicalPoint(logicalPos);
+    HWND target = ::WindowFromPoint(pt);
+    if (!target)
+        return;
+    // 自己（含子窗口）不再收，防止转发给自己造成死循环
+    const HWND self = reinterpret_cast<HWND>(selfWid);
+    if (self && (target == self || ::GetAncestor(target, GA_ROOT) == self))
+        return;
+    ::PostMessageW(target, WM_MOUSEWHEEL,
+                   MAKEWPARAM(0, static_cast<SHORT>(delta)),
+                   MAKELPARAM(pt.x, pt.y));
+}
+
 void beep()
 {
     ::MessageBeep(MB_OK);
+}
+
+void trimWorkingSet()
+{
+    // 释放的工作集不会自动还给 OS，任务管理器的"内存"会一直停在峰值。
+    // 两个 (SIZE_T)-1 是文档化的"立即裁剪工作集"用法（kernel32，无额外依赖）。
+    ::SetProcessWorkingSetSize(::GetCurrentProcess(), static_cast<SIZE_T>(-1),
+                              static_cast<SIZE_T>(-1));
 }
 
 bool isFunctionKeyHeld(const QString &keyName)

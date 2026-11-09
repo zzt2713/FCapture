@@ -37,6 +37,13 @@ void showToast(const QString &text)
         if (!toast || existingTopLevels.contains(widget))
             continue;
 
+        // ElaToast 是普通顶层窗口，进程不在前台时 Windows 会把新窗口压到
+        // 前台应用窗口后面（表现为"通知时有时无"）。强制置顶层 + 不抢焦点。
+        toast->setWindowFlag(Qt::WindowStaysOnTopHint, true);
+        toast->setAttribute(Qt::WA_ShowWithoutActivating);
+        toast->show();
+        toast->raise();
+
         QScreen *screen = QGuiApplication::screenAt(QCursor::pos());
         if (!screen)
             screen = QGuiApplication::primaryScreen();

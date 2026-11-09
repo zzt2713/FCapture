@@ -49,7 +49,7 @@ void trackIconAction(QAction *action, ElaIconType::IconName icon)
 namespace AppMenu {
 
 Menu::Menu(QWidget *parent)
-    : m_menu(new CompactMenu(parent))
+    : m_menu(new ElaMenu(parent))
 {
 }
 

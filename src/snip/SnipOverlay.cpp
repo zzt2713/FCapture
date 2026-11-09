@@ -24,6 +24,8 @@
 #include "ui/OperationToast.h"
 #include "ui/Theme.h"
 
+#include "snip/LongShotBar.h"
+
 #include <QInputDialog>
 #include <QMenu>
 #include <QMessageBox>
@@ -60,6 +62,19 @@ constexpr int kAnchorMinSide = 48;
 
 constexpr int kMinCornerRadius = 4;   // 小于这个值肉眼看不出来，按"关闭"处理
 constexpr int kDefaultCornerRadius = 12;
+
+// candidate 是否基本覆盖了 full（按 full 的面积算 ≥ 92%）。
+// 用于判断"元素链顶端就是整个窗口"：MSAA accLocation / UIA BoundingRectangle
+// 上报的窗口矩形常比可见边框小一圈（内缩 1~2px 或只给客户区），
+// 而 DWMWA_EXTENDED_FRAME_BOUNDS 才是屏幕上真实可见的窗口边框。
+bool coversMostOf(const QRectF &candidate, const QRectF &full)
+{
+    if (!candidate.isValid() || !full.isValid() || candidate.isEmpty() || full.isEmpty())
+        return false;
+    const QRectF inter = candidate.intersected(full);
+    const qreal fullArea = full.width() * full.height();
+    return fullArea > 0 && inter.width() * inter.height() >= fullArea * 0.92;
+}
 
 QString defaultFileName()
 {
@@ -184,6 +199,11 @@ SnipOverlay::SnipOverlay(QWidget *parent)
         }
         refreshSnapshot();
     });
+
+    // 长截图：滚动期间定时抓帧拼接（150ms ≈ 6.7 帧/秒）
+    m_longShotTimer = new QTimer(this);
+    m_longShotTimer->setInterval(150);
+    connect(m_longShotTimer, &QTimer::timeout, this, &SnipOverlay::grabLongShotFrame);
 }
 
 SnipOverlay::~SnipOverlay()
@@ -196,6 +216,10 @@ SnipOverlay::~SnipOverlay()
     m_paintBar = nullptr;
     m_textBox = nullptr;
     PixelShape::clearSourceImage();
+
+    // 长截图的工具栏是独立顶层窗口，必须手动释放
+    delete m_longShotBar;
+    m_longShotBar = nullptr;
 }
 
 void SnipOverlay::startSession(const ScreenCapturer::Snapshot &snapshot)
@@ -479,6 +503,11 @@ void SnipOverlay::updateSelectionDrag(const QPoint &localPos)
 
 void SnipOverlay::mousePressEvent(QMouseEvent *e)
 {
+    // 长截图态：鼠标穿透生效时事件到不了这里；兜底一律忽略，
+    // 防止拖动把定死的捕获视口改掉
+    if (m_longShotState != LongShotState::Off)
+        return;
+
     if (e->button() == Qt::RightButton) {
         m_suppressContextMenu = false;
         // 折线：右键结束
@@ -730,6 +759,9 @@ void SnipOverlay::mousePressEvent(QMouseEvent *e)
 
 void SnipOverlay::mouseMoveEvent(QMouseEvent *e)
 {
+    if (m_longShotState != LongShotState::Off)
+        return;
+
     const QPoint local = e->position().toPoint();
     if (local != m_mouseLocal)
         m_mouseMoved = true;
@@ -885,6 +917,9 @@ void SnipOverlay::mouseMoveEvent(QMouseEvent *e)
 
 void SnipOverlay::mouseReleaseEvent(QMouseEvent *e)
 {
+    if (m_longShotState != LongShotState::Off)
+        return;
+
     if (e->button() != Qt::LeftButton)
         return;
 
@@ -950,13 +985,23 @@ void SnipOverlay::mouseReleaseEvent(QMouseEvent *e)
                 // 此时 m_hoverWindow / m_elementHierarchy 都是空的。
                 // 以前直接读它们 → 空 → 退回 bestWindowRectAt()（最顶层窗口，
                 // 最大化窗口就是整屏），这就是"点元素却截了整屏"的原因。
+                // 坐标系说明：m_clickTargetRect 是局部坐标，而 hierarchy 的矩形
+                // 与 bestWindowRectAt() 都是全局逻辑坐标，统一凑成全局后
+                // 最后一次性换算回局部。
                 QRect target = m_clickTargetRect;
-                if (target.isEmpty() && !m_elementHierarchy.isEmpty()) {
+                if (!target.isEmpty()) {
+                    target.translate(virtualTopLeft());
+                } else if (!m_elementHierarchy.isEmpty()) {
                     const int level = qBound(0, m_elementLevel, m_elementHierarchy.size() - 1);
                     target = m_elementHierarchy.at(level).logicalRect.toAlignedRect();
+                    // 链顶端 = 整窗层 → 换成 DWM 可见边框，和高亮一致（严丝合缝）
+                    if (level == m_elementHierarchy.size() - 1) {
+                        const QRect win =
+                            WindowDetector::bestWindowRectAt(e->globalPosition().toPoint());
+                        if (!win.isEmpty() && coversMostOf(QRectF(target), QRectF(win)))
+                            target = win;
+                    }
                 }
-                if (!target.isEmpty())
-                    target.translate(virtualTopLeft());
                 if (target.isEmpty())
                     target = WindowDetector::bestWindowRectAt(e->globalPosition().toPoint());
 
@@ -1004,6 +1049,9 @@ void SnipOverlay::mouseReleaseEvent(QMouseEvent *e)
 
 void SnipOverlay::mouseDoubleClickEvent(QMouseEvent *e)
 {
+    if (m_longShotState != LongShotState::Off)
+        return;
+
     if (e->button() != Qt::LeftButton)
         return;
 
@@ -1044,6 +1092,14 @@ void SnipOverlay::mouseDoubleClickEvent(QMouseEvent *e)
 
 void SnipOverlay::wheelEvent(QWheelEvent *e)
 {
+    // 长截图态：滚轮要滚动下层页面。鼠标穿透生效时事件根本到不了这里；
+    // 万一穿透失效，把滚轮转发给光标下的窗口兜底
+    if (m_longShotState != LongShotState::Off) {
+        WinUtil::forwardWheel(winId(), e->angleDelta().y(),
+                              e->globalPosition().toPoint());
+        return;
+    }
+
     // Shift + 滚轮：缩放选中图形
     if (e->modifiers().testFlag(Qt::ShiftModifier) && !m_selectedShapes.empty()) {
         scaleSelectedByWheel(e->angleDelta().y());
@@ -1072,6 +1128,10 @@ void SnipOverlay::wheelEvent(QWheelEvent *e)
 
 void SnipOverlay::keyPressEvent(QKeyEvent *e)
 {
+    // 长截图态：截图层已把焦点让给下层窗口，这里只是兜底
+    if (m_longShotState != LongShotState::Off)
+        return;
+
     const bool ctrl = e->modifiers() & Qt::ControlModifier;
     const bool shift = e->modifiers() & Qt::ShiftModifier;
 
@@ -1439,9 +1499,18 @@ void SnipOverlay::applyElementLevel(int level)
     };
 
     for (int level2 = m_elementLevel; level2 < m_elementHierarchy.size(); ++level2) {
-        const QRect candidate = localOf(m_elementHierarchy.at(level2).logicalRect);
+        QRect candidate = localOf(m_elementHierarchy.at(level2).logicalRect);
         if (candidate.isEmpty() || isFullScreen(candidate))
             continue;
+        // 链顶端 = 整窗层：换成 DWM 可见边框，做到和 Snipaste 一样严丝合缝。
+        // 只在基本覆盖整个窗口时才换，避免链被截断时把大面板误当成整窗。
+        if (level2 == m_elementHierarchy.size() - 1) {
+            const QRect win = WindowDetector::bestWindowRectAt(QCursor::pos());
+            const QRect localWin = win.isEmpty() ? QRect() : localOf(QRectF(win));
+            if (!localWin.isEmpty() && !isFullScreen(localWin)
+                && coversMostOf(QRectF(candidate), QRectF(localWin)))
+                candidate = localWin;
+        }
         m_elementLevel = level2;
         m_hoverWindow = candidate;
         update();
@@ -1611,6 +1680,10 @@ void SnipOverlay::loadHistory(int offset)
 
 QImage SnipOverlay::composeResultImage() const
 {
+    // 长截图有拼接内容：保存/复制输出的是长图（与选区/标注无关）
+    if (m_longShotState != LongShotState::Off && !m_stitcher.isEmpty())
+        return m_stitcher.canvas();
+
     const QRect sel = localSelection();
     if (sel.isEmpty() || m_snapshotImage.isNull())
         return {};
@@ -1647,7 +1720,7 @@ QImage SnipOverlay::composeResultImage() const
     return result;
 }
 
-void SnipOverlay::finishSnip(SnipOutput output)
+bool SnipOverlay::finishSnip(SnipOutput output)
 {
     // 输入框还开着：先提交内容，避免文字丢失
     if (m_textBox) {
@@ -1664,7 +1737,7 @@ void SnipOverlay::finishSnip(SnipOutput output)
 
     const QRect sel = localSelection();
     if (sel.isEmpty())
-        return;
+        return false;
 
     SnipResult result;
     result.image = composeResultImage();
@@ -1673,7 +1746,7 @@ void SnipOverlay::finishSnip(SnipOutput output)
 
     if (!result.valid) {
         abortSnip();
-        return;
+        return true;
     }
 
     switch (output) {
@@ -1688,10 +1761,10 @@ void SnipOverlay::finishSnip(SnipOutput output)
             QDir(QStandardPaths::writableLocation(QStandardPaths::PicturesLocation)).filePath(defaultFileName()),
             QStringLiteral("PNG 图片 (*.png);;JPEG 图片 (*.jpg);;BMP 图片 (*.bmp);;WebP 图片 (*.webp)"));
         if (path.isEmpty())
-            return;
+            return false;
         if (!ImageOutput::save(postProcessForOutput(result.image, path), path)) {
             qWarning() << "SnipOverlay: failed to save image to" << path;
-            return;
+            return false;
         }
         OperationToast::imageSaved();
         break;
@@ -1724,6 +1797,7 @@ void SnipOverlay::finishSnip(SnipOutput output)
     // 窗口还没销毁，但会话已经结束，不会再绘制；留着只是白占内存。
     releaseSessionImages();
     close();
+    return true;
 }
 
 void SnipOverlay::releaseSessionImages()
@@ -1764,6 +1838,18 @@ void SnipOverlay::paintEvent(QPaintEvent *e)
     Q_UNUSED(e);
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, false);
+
+    // 长截图态：外圈和普通截图一样（冻结快照 + 半透明黑遮罩）；
+    // 选区已用 setMask 从窗口形状里挖掉（真"天窗"），像素到不了选区，
+    // 实时页面直接透出来给用户滚动/观看
+    if (m_longShotState != LongShotState::Off) {
+        rebuildBackgroundCache();
+        if (!m_snapshotLayer.isNull())
+            p.drawPixmap(0, 0, m_snapshotLayer);
+        drawMask(p);
+        drawLongShotRing(p);
+        return;
+    }
 
     rebuildBackgroundCache();
     if (!m_snapshotLayer.isNull())
@@ -2667,6 +2753,9 @@ void SnipOverlay::showSnipMenu(const QPoint &globalPos)
 
 void SnipOverlay::contextMenuEvent(QContextMenuEvent *e)
 {
+    if (m_longShotState != LongShotState::Off)
+        return;
+
     // mousePressEvent 已经用这次右键做了别的事（取消选中/取消工具/中止截图）
     if (m_suppressContextMenu) {
         m_suppressContextMenu = false;
@@ -2770,10 +2859,265 @@ void SnipOverlay::toggleShadowPreview()
     update();
 }
 
-// ---------------------------------------------------------------- P4 刷新
+// ---------------------------------------------------------------- 长截图
+
+void SnipOverlay::requestLongScreenshot()
+{
+    if (m_longShotState != LongShotState::Off)
+        return;
+
+    if (!localSelection().isEmpty() && m_state == State::Adjusting) {
+        enterLongShot();
+        return;
+    }
+
+    m_longShotIntent = true;
+    showCenterNotice(QStringLiteral("长截图模式：框选区域后自动进入"));
+}
+
+// 进入长截图：弹出独立的图标工具栏（开始/暂停/保存/复制/钉/关闭）。
+// 外圈与普通截图一致（冻结快照 + 半透明黑遮罩）；选区用 setMask 从窗口
+// 形状里挖掉（真"天窗"），实时页面直接透出来；鼠标穿透 + 焦点交给下层
+// 窗口，滚轮才能滚动页面。
+void SnipOverlay::enterLongShot()
+{
+    if (m_longShotState != LongShotState::Off || localSelection().isEmpty())
+        return;
+
+    // 文字输入还开着先提交，避免悬空丢字
+    if (m_textBox) {
+        TextInputBox *box = m_textBox;
+        m_textBox = nullptr;
+        box->commit();
+    }
+
+    m_longShotRect = globalSelection();
+    if (m_longShotRect.isEmpty())
+        return;
+    m_stitcher.reset();
+    m_longShotState = LongShotState::Paused;
+    m_longShotIntent = false;
+    m_longShotStatus.clear();
+    clearDetection();
+
+    // 连续刷新（F5 长按）全程停用：refreshSnapshot 的 hide/show + 抢焦点
+    // 会打断页面滚动，长截图期间也不需要重抓底图
+    endContinuousRefresh();
+
+    // 真"天窗"：把选区从窗口形状里挖掉。选区位置不再是本窗口的一部分，
+    // 下面的实时页面直接透出来，滚动看得见、抓帧也天然干净；
+    // 不用透明像素——截图层必须保持不透明（见构造函数的说明）
+    setMask(QRegion(rect()) - QRegion(localSelection()));
+
+    // 正常截图的工具栏/输入框全部退场，两者不混在一起
+    hidePaintBar();
+    if (m_sizeBox)
+        m_sizeBox->hide();
+
+    if (!m_longShotBar) {
+        m_longShotBar = new LongShotBar();
+        connect(m_longShotBar, &LongShotBar::startRequested,
+                this, &SnipOverlay::startLongCapture);
+        connect(m_longShotBar, &LongShotBar::pauseRequested,
+                this, &SnipOverlay::pauseLongCapture);
+        connect(m_longShotBar, &LongShotBar::closeRequested,
+                this, &SnipOverlay::cancelLongShot);
+        connect(m_longShotBar, &LongShotBar::saveRequested,
+                this, &SnipOverlay::saveLongShot);
+        connect(m_longShotBar, &LongShotBar::copyRequested,
+                this, &SnipOverlay::copyLongShot);
+        connect(m_longShotBar, &LongShotBar::pinRequested,
+                this, &SnipOverlay::pinLongShot);
+    }
+    m_longShotBar->positionNear(m_longShotRect);
+    m_longShotBar->show();
+    m_longShotBar->raise();
+    WinUtil::applyToolWindowStyle(m_longShotBar->winId());
+    WinUtil::applyNoActivateStyle(m_longShotBar->winId());
+
+    // 输入放行 + 焦点让给下层窗口（滚轮默认发给焦点窗口）
+    WinUtil::setClickThrough(winId(), true);
+    WinUtil::activateWindowAt(QCursor::pos());
+
+    update();
+    syncLongShotUi();
+}
+
+void SnipOverlay::startLongCapture()
+{
+    if (m_longShotState != LongShotState::Paused)
+        return;
+    m_longShotState = LongShotState::Capturing;
+    // 每次开始都重新放行输入/让出焦点（暂停期间焦点可能被别的窗口拿走）
+    WinUtil::setClickThrough(winId(), true);
+    WinUtil::activateWindowAt(QCursor::pos());
+    grabLongShotFrame();   // 先抓一帧打底/续接
+    m_longShotTimer->start();
+    syncLongShotUi();
+}
+
+void SnipOverlay::pauseLongCapture()
+{
+    if (m_longShotState != LongShotState::Capturing)
+        return;
+    m_longShotTimer->stop();
+    m_longShotState = LongShotState::Paused;
+    syncLongShotUi();
+}
+
+// 关闭：直接退出整个截图会话（不返回普通截图）
+void SnipOverlay::cancelLongShot()
+{
+    if (m_longShotState == LongShotState::Off)
+        return;
+    m_longShotTimer->stop();
+    m_stitcher.reset();
+    m_longShotState = LongShotState::Off;
+    WinUtil::setClickThrough(winId(), false);
+    if (m_longShotBar)
+        m_longShotBar->hide();
+    abortSnip();
+}
+
+void SnipOverlay::saveLongShot()
+{
+    if (m_longShotState == LongShotState::Off || m_stitcher.isEmpty())
+        return;
+    pauseLongCapture();
+    if (m_longShotBar)
+        m_longShotBar->hide();
+    if (!finishSnip(SnipOutput::FileDialog)) {
+        // 用户取消了保存对话框：把工具栏放回来继续长截图
+        if (m_longShotBar) {
+            m_longShotBar->show();
+            m_longShotBar->raise();
+        }
+    }
+}
+
+void SnipOverlay::copyLongShot()
+{
+    if (m_longShotState == LongShotState::Off || m_stitcher.isEmpty())
+        return;
+    pauseLongCapture();
+    if (m_longShotBar)
+        m_longShotBar->hide();
+    finishSnip(SnipOutput::Copy);
+}
+
+// 钉：把长图贴到屏幕（和普通截图的 Ctrl+T 同一条输出链路）
+void SnipOverlay::pinLongShot()
+{
+    if (m_longShotState == LongShotState::Off || m_stitcher.isEmpty())
+        return;
+    pauseLongCapture();
+    if (m_longShotBar)
+        m_longShotBar->hide();
+    finishSnip(SnipOutput::Pin);
+}
+
+void SnipOverlay::syncLongShotUi()
+{
+    if (!m_longShotBar)
+        return;
+    m_longShotBar->setRunning(m_longShotState == LongShotState::Capturing);
+    m_longShotBar->setHasContent(!m_stitcher.isEmpty());
+}
+
+void SnipOverlay::grabLongShotFrame()
+{
+    if (m_longShotState != LongShotState::Capturing || m_longShotRect.isEmpty())
+        return;
+    // 防重入：抓帧本身推迟到事件循环下一轮（见下），150ms 定时器可能再次触发
+    if (m_longShotGrabbing)
+        return;
+    m_longShotGrabbing = true;
+
+    // 长截图工具栏压住捕获区域时，抓帧期间藏起来防止被拍进长图；
+    // 不相交就不会进画面，不藏（避免无谓闪烁）。
+    // 选区是挖掉的"天窗"，遮罩/圆环/提示都画在捕获区外，抓帧天然干净。
+    bool hideBar = false;
+    if (m_longShotBar && m_longShotBar->isVisible()) {
+        const QRect barRect(m_longShotBar->pos(), m_longShotBar->size());
+        if (barRect.intersects(m_longShotRect)) {
+            m_longShotBar->hide();
+            hideBar = true;
+        }
+    }
+
+    // 藏完等一拍让 DWM 合成后再抓（没藏就下一拍抓，逻辑统一）。
+    // 不能在这里 processEvents 等合成：那会重入定时器/事件处理器，
+    // 抓帧、拼接、隐藏全部乱套——这就是之前"越滚越卡、时好时坏"的来源。
+    QTimer::singleShot(hideBar ? 40 : 0, this, [this, hideBar]() {
+        const QImage frame = ScreenCapturer::captureRegion(m_longShotRect);
+        if (hideBar && m_longShotBar) {
+            m_longShotBar->show();
+            m_longShotBar->raise();
+        }
+        m_longShotGrabbing = false;
+
+        if (m_longShotState != LongShotState::Capturing || frame.isNull())
+            return;
+
+        if (!m_stitcher.feed(frame)) {
+            // 画布到顶自动暂停；其余情况（没滚动/匹配不可靠）静默丢弃该帧
+            if (m_stitcher.isFull()) {
+                pauseLongCapture();
+                m_longShotStatus = QStringLiteral("已达最大高度，已自动暂停");
+                update();
+            }
+            return;
+        }
+
+        m_longShotStatus = QStringLiteral("已拼接 %1 帧 · 高 %2 px")
+                               .arg(m_stitcher.acceptedFrames())
+                               .arg(m_stitcher.height());
+        syncLongShotUi();
+        update();
+    });
+}
+
+// 长截图态的外框：圆环画在选区外侧 + 状态提示，全部严格在捕获区外
+void SnipOverlay::drawLongShotRing(QPainter &p)
+{
+    const QRect sel = localSelection();
+    if (sel.isEmpty())
+        return;
+
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    // 圆环中心线在选区外 3px、笔宽 3 → 覆盖外侧 -4.5~-1.5px，全程在捕获区外
+    p.setPen(QPen(Theme::kAccent, 3));
+    p.setBrush(Qt::NoBrush);
+    p.drawRoundedRect(QRectF(sel).adjusted(-3, -3, 3, 3), 8, 8);
+
+    const QString text = m_longShotStatus.isEmpty()
+                             ? QStringLiteral("滚轮滚动页面拼接长图")
+                             : m_longShotStatus;
+    QFont f = font();
+    f.setPointSize(8);
+    f.setBold(true);
+    p.setFont(f);
+    QRectF chip = p.fontMetrics().boundingRect(text).adjusted(-12, -5, 12, 6);
+    chip.moveLeft(sel.left() + (sel.width() - chip.width()) / 2);
+    chip.moveTop(sel.top() - 9 - chip.height());
+    if (chip.top() < 2)
+        chip.moveTop(sel.bottom() + 9);
+
+    p.setPen(Qt::NoPen);
+    p.setBrush(QColor(0, 0, 0, 170));
+    p.drawRoundedRect(chip, 6, 6);
+    p.setPen(Qt::white);
+    p.drawText(chip, Qt::AlignCenter, text);
+    p.restore();
+}
 
 void SnipOverlay::refreshSnapshot()
 {
+    // 长截图期间禁止重抓：hide/show 闪烁 + activateWindow 抢焦点都会打断页面滚动
+    if (m_longShotState != LongShotState::Off)
+        return;
     if (m_refreshing || m_state == State::Dragging)
         return;
     // 正在输入文字 / 尺寸时不能重抓，会把输入框状态打断

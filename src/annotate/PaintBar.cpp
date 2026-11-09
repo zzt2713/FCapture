@@ -196,22 +196,24 @@ void PaintBar::rebuildLayout()
     const int toolsRowWidth = x - kGap + kPadding;
 
     struct Act { int id; bool enabled; };
+    // 最右一组固定为 关闭 / 钉子 / 保存 / 复制（从左到右，复制贴右缘）
     const Act acts[] = {
         {ActUndo, m_canUndo},
         {ActRedo, m_canRedo},
         {ActClear, true},
-        {ActCopy, true},
-        {ActSave, true},
-        {ActPin, true},
         {ActSendTo, true},
         {ActOcr, true},
         {ActBarcode, true},
         {ActClose, true},
+        {ActPin, true},
+        {ActSave, true},
+        {ActCopy, true},
     };
     int actWidth = 0;
     for (int i = 0; i < int(sizeof(acts) / sizeof(acts[0])); ++i)
         actWidth += kButtonSize + kGap;
     actWidth += kSeparatorGap;
+    actWidth += kSeparatorGap - kGap;   // 关闭按钮左侧的分隔间距
 
     // ---- 行可见性 ----
     const bool hasProps = (m_tool != Tool::None);
@@ -260,7 +262,7 @@ void PaintBar::rebuildLayout()
         b.enabled = acts[i].enabled;
         b.rect = QRect(ax, rowY, kButtonSize, kButtonSize);
         m_buttons.append(b);
-        ax -= kGap;
+        ax -= (acts[i].id == ActClose) ? kSeparatorGap : kGap;
     }
 
     if (hasProps) {
@@ -1342,18 +1344,26 @@ void PaintBar::paintEvent(QPaintEvent *e)
         }
     }
 
-    // 第一行：动作按钮组左侧的竖分隔线
+    // 第一行：动作按钮组左侧、关闭按钮左侧的竖分隔线
     {
         int firstActionX = -1;
+        int closeX = -1;
         for (const Button &b : m_buttons) {
             if (b.kind == Button::Kind::Action && b.rect.top() < kPadding + kButtonSize) {
                 if (firstActionX < 0 || b.rect.left() < firstActionX)
                     firstActionX = b.rect.left();
+                if (b.actionId == ActClose)
+                    closeX = b.rect.left();
             }
         }
-        if (firstActionX > 0) {
+        if (firstActionX > 0 || closeX > 0)
             p.setPen(QPen(QColor(0x40, 0x40, 0x40), 1));
+        if (firstActionX > 0) {
             const int sx = firstActionX - kSeparatorGap / 2;
+            p.drawLine(QPoint(sx, kPadding + 4), QPoint(sx, kPadding + kButtonSize - 4));
+        }
+        if (closeX > 0) {
+            const int sx = closeX - kSeparatorGap / 2;
             p.drawLine(QPoint(sx, kPadding + 4), QPoint(sx, kPadding + kButtonSize - 4));
         }
     }

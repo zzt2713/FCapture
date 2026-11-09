@@ -123,6 +123,8 @@ QPixmap sendIcon(int size, const QColor &color)  { return renderNamed(QStringLit
 QPixmap ocrIcon(int size, const QColor &color)   { return renderNamed(QStringLiteral("scan-text"), size, color); }
 QPixmap barcodeIcon(int size, const QColor &color) { return renderNamed(QStringLiteral("qr-code"), size, color); }
 QPixmap closeIcon(int size, const QColor &color) { return renderNamed(QStringLiteral("x"), size, color); }
+QPixmap playIcon(int size, const QColor &color)  { return renderNamed(QStringLiteral("play"), size, color); }
+QPixmap pauseIcon(int size, const QColor &color) { return renderNamed(QStringLiteral("pause"), size, color); }
 
 QPixmap lineStyleIcon(int size, const QColor &color)
 {

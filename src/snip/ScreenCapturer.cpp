@@ -226,4 +226,57 @@ Snapshot captureAllScreens(bool includeCursor)
     return snap;
 }
 
+QImage captureRegion(const QRect &logicalRect)
+{
+    if (logicalRect.isEmpty())
+        return {};
+
+    QVector<GrabUnit> units;
+    qreal maxDpr = 1.0;
+
+    for (QScreen *screen : QGuiApplication::screens()) {
+        if (!screen->geometry().intersects(logicalRect))
+            continue;
+        const QPixmap pm = screen->grabWindow(0);
+        if (pm.isNull())
+            continue;
+
+        GrabUnit u;
+        u.logicalGeometry = screen->geometry();
+        u.pixmap = pm;
+        u.dpr = screen->devicePixelRatio();
+        units.append(u);
+        maxDpr = qMax(maxDpr, u.dpr);
+    }
+
+    if (units.isEmpty())
+        return {};
+
+    // 与 captureAllScreens 相同：多屏不同 dpr 时统一按 maxDpr 缩放拼接，
+    // 保证同一区域每帧的像素尺寸完全一致（长截图拼接依赖这一点）。
+    QImage canvas(qRound(logicalRect.width() * maxDpr),
+                  qRound(logicalRect.height() * maxDpr),
+                  QImage::Format_RGB32);
+    canvas.fill(Qt::black);
+
+    QPainter p(&canvas);
+    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    for (const GrabUnit &u : units) {
+        const QRect dst(
+            qRound((u.logicalGeometry.x() - logicalRect.x()) * maxDpr),
+            qRound((u.logicalGeometry.y() - logicalRect.y()) * maxDpr),
+            qRound(u.logicalGeometry.width() * maxDpr),
+            qRound(u.logicalGeometry.height() * maxDpr));
+
+        if (qFuzzyCompare(u.dpr, maxDpr))
+            p.drawPixmap(dst, u.pixmap);
+        else
+            p.drawPixmap(dst, u.pixmap, u.pixmap.rect());
+    }
+    p.end();
+
+    canvas.setDevicePixelRatio(maxDpr);
+    return canvas;
+}
+
 } // namespace ScreenCapturer

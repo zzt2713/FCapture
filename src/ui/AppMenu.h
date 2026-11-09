@@ -23,22 +23,6 @@ class QMenu;
 //      是位图，100% 缩放下就明显发虚（实测）。
 namespace AppMenu {
 
-// ElaMenu 的默认 sizeHint 左右留白偏大（含 24px 图标位 + 大内边距），
-// 托盘右键菜单因此显得很宽。这里只收紧宽度，绘制仍完全交给 ElaMenu。
-class CompactMenu : public ElaMenu
-{
-public:
-    explicit CompactMenu(QWidget *parent = nullptr) : ElaMenu(parent) {}
-
-    QSize sizeHint() const override
-    {
-        QSize hint = ElaMenu::sizeHint();
-        // 最多收到 220px；更长的菜单项（带快捷键文本）仍保留原宽度
-        hint.setWidth(qMin(hint.width(), 220));
-        return hint;
-    }
-};
-
 // 栈上顶层菜单：析构时自动销毁。
 // 这里返回的 QMenu* 实际上是 ElaMenu，业务层用下面的自由函数加项即可。
 class Menu

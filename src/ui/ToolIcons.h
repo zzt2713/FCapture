@@ -21,6 +21,8 @@ QPixmap sendIcon(int size, const QColor &color);
 QPixmap ocrIcon(int size, const QColor &color);
 QPixmap barcodeIcon(int size, const QColor &color);
 QPixmap closeIcon(int size, const QColor &color);
+QPixmap playIcon(int size, const QColor &color);
+QPixmap pauseIcon(int size, const QColor &color);
 QPixmap lineStyleIcon(int size, const QColor &color);
 QPixmap arrowStyleIcon(int size, const QColor &color);
 // 按虚线样式画一条示意线（实/虚/点/点划线），用于样式按钮

@@ -56,6 +56,8 @@ private:
     void restoreHotkeys();
     void syncHotkeyState();
     void captureCommon();
+    // 长截图（F2 / 托盘）：截图中直接进入长截图流程，否则开新会话并记住意图
+    void startLongScreenshot();
 
     // 命令行：截图相关的参数落到待处理的请求里
     void startCaptureWith(const CommandRequest &req);
@@ -72,6 +74,7 @@ private:
     MouseHook *m_mouseHook = nullptr;
     bool m_capturing = false;
     bool m_captureActiveWindow = false;
+    bool m_longShotPending = false;    // 新会话创建后自动进入长截图流程
     QRect m_activeWindowRect;      // 热键触发瞬间的前台窗口（逻辑坐标）
     QSet<QString> m_hotkeyConflicts;
 
