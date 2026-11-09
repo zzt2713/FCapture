@@ -8,8 +8,14 @@ class LineShape : public Annotation
 public:
     enum class Kind { Line, Polyline, Arrow };
 
-    // 箭头样式：单头 / 双头 / 细单头 / 细双头 / 大单头
-    enum class ArrowStyle { Single, Double, SingleThin, DoubleThin, SingleLarge };
+    // 箭头样式：单头 / 双头（实心三角） + 标准 / 细长 / 深倒刺（锥形倒刺）
+    enum class ArrowStyle {
+        Single,       // 1 单头（实心三角，等宽笔杆）
+        Double,       // 2 双头（实心三角）
+        Tapered,      // 3 标准锥形倒刺
+        TaperedThin,  // 4 细长锥形倒刺
+        DeepBarb      // 5 深倒刺
+    };
 
     explicit LineShape(Kind kind);
 
@@ -43,10 +49,13 @@ public:
 
 private:
     qreal arrowHeadLength(bool thin, bool large) const;
+    qreal arrowHeadHalfWidth(qreal headLen, bool thin, bool large) const;
     void drawArrowHead(QPainter *p, const QPointF &from, const QPointF &tip, bool thin, bool large) const;
-    // 锥形笔杆：起点极细 → 箭头端最粗
-    void drawTaperedArrowShaft(QPainter *p, const QVector<QPointF> &pts,
-                               bool thin, bool large) const;
+
+    // 锥形倒刺箭头：整条箭头是一个闭合填充路径
+    // （起点≈1px 平头 → 线身渐粗 → 张成倒刺 → 收成尖），不用等宽 stroke
+    bool isTaperedStyle() const;
+    void drawTaperedArrow(QPainter *p, const QVector<QPointF> &pts) const;
 
     Kind m_kind;
     QVector<QPointF> m_points;

@@ -90,13 +90,31 @@ void SnipOverlay::onToolChanged(Tool tool)
 
 void SnipOverlay::onColorChanged(const QColor &color)
 {
-    Q_UNUSED(color);
+    // 选中了标注：颜色调整直接作用于选中图形（配合"新建后自动选中"）
+    for (const auto &shape : m_selectedShapes) {
+        if (shape)
+            shape->setColor(color);
+    }
     update();
 }
 
 void SnipOverlay::onPenWidthChanged(int w)
 {
-    Q_UNUSED(w);
+    // 选中了标注：粗细/字号调整直接作用于选中图形；
+    // 打开的文本输入框也同步跟随（所见即所得）
+    for (const auto &shape : m_selectedShapes) {
+        if (!shape)
+            continue;
+        shape->setPenWidth(w);
+        if (shape->type() == Annotation::Type::Text) {
+            if (auto *text = dynamic_cast<TextShape *>(shape.get()))
+                text->setFontSize(w);
+        }
+    }
+    if (m_textBox) {
+        m_textBoxFontSize = w;
+        m_textBox->setFontSize(w);
+    }
     update();
 }
 
@@ -408,6 +426,23 @@ void SnipOverlay::updateShape(const QPoint &localPos)
         if (!fh)
             break;
 
+        // 鼠标快速移动时 Qt 会合并移动事件，直接取当前位置会在笔迹上留下
+        // 大段空白（看起来就是"断裂"）。这里把上一采样点到当前位置之间的
+        // 中间点按 2px 间隔补齐，保证笔迹连续。
+        if (!fh->points().isEmpty()) {
+            const QPointF last = fh->points().last();
+            const QPointF delta = QPointF(pos) - last;
+            const qreal dist = QLineF(last, QPointF(pos)).length();
+            // 6px 步长足够让笔迹连续（笔宽最细 1px 也不会看出断点），
+            // 又不会在快速拖动时插入大量点拖慢重绘。
+            constexpr qreal kFillStep = 6.0;
+            constexpr int kMaxFill = 12;
+            if (dist > kFillStep) {
+                const int steps = qMin(kMaxFill, int(dist / kFillStep));
+                for (int i = 1; i < steps; ++i)
+                    fh->appendPoint(last + delta * (qreal(i) / steps));
+            }
+        }
         fh->appendPoint(pos);
 
         if (shift) {
@@ -561,11 +596,15 @@ void SnipOverlay::beginTextInput(const QPoint &localPos)
 
     const QPoint editPos = existing ? existing->position().toPoint() : localPos;
 
+    // 编辑期间隐藏原文字，由输入框就地显示，避免"两个框重叠"
+    if (existing)
+        existing->setEditing(true);
+
     connect(box, &TextInputBox::committed, this,
-            [this, editPos, existing, fontSize, box](const QString &text) {
-                // 输入框的排版宽度（只有手动拖过宽度才有意义）
-                m_textBoxLayoutWidth = box->layoutWidth();
+            [this, editPos, existing, fontSize](const QString &text) {
                 m_textBox = nullptr;
+                if (existing)
+                    existing->setEditing(false);
                 activateWindow();
                 setFocus(Qt::OtherFocusReason);
 
@@ -578,23 +617,18 @@ void SnipOverlay::beginTextInput(const QPoint &localPos)
 
                 // 输入框里滚轮调过字号时，以它最后的字数为准
                 const int finalSize = m_textBoxFontSize > 0 ? m_textBoxFontSize : fontSize;
-                // 输入框平时按内容撑宽；宽度只在用户显式拖过时才当作换行宽度
-                const qreal boxWidth = m_textBoxLayoutWidth;
                 m_textBoxFontSize = 0;
-                m_textBoxLayoutWidth = 0;
 
+                // 文本不自动换行：只有用户在标注上拖过左右侧边手柄
+                // 才会设置 boxWidth，输入框宽度不回写（否则可能被意外折行）
                 if (existing) {
                     existing->setText(text);
                     existing->setFontSize(finalSize);
-                    if (boxWidth > 20)
-                        existing->setBoxWidth(boxWidth);
                 } else {
                     const ToolStyle style = ToolStyleStore::instance()->style(Tool::Text);
                     auto shape = std::make_shared<TextShape>();
                     shape->setColor(style.color);
                     shape->setFontSize(finalSize);
-                    if (boxWidth > 20)
-                        shape->setBoxWidth(boxWidth);
                     shape->setText(text);
                     shape->setPosition(QPointF(editPos));
                     shape->setBackgroundColor(style.textBg);
@@ -606,8 +640,10 @@ void SnipOverlay::beginTextInput(const QPoint &localPos)
                 update();
             });
 
-    connect(box, &TextInputBox::cancelled, this, [this]() {
+    connect(box, &TextInputBox::cancelled, this, [this, existing]() {
         m_textBox = nullptr;
+        if (existing)
+            existing->setEditing(false);
         activateWindow();
         setFocus(Qt::OtherFocusReason);
         update();
@@ -619,7 +655,9 @@ void SnipOverlay::beginTextInput(const QPoint &localPos)
     });
     m_textBoxFontSize = fontSize;
 
-    box->startEditing(localPos, color, fontSize, initial);
+    // 编辑已有文字时输入框必须落在**文字原位置**，而不是双击点。
+    // 否则双击文字会在旁边多出一个框，看起来像「又新建了一个」。
+    box->startEditing(editPos, color, fontSize, initial);
 }
 
 void SnipOverlay::beginRectCornerEdit(const std::shared_ptr<Annotation> &shape)

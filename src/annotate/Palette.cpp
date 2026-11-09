@@ -22,7 +22,7 @@ Palette::Palette()
 QVector<QColor> Palette::defaultColors() const
 {
     return {
-        QColor(0xFF, 0x4A, 0x4A), QColor(0xFF, 0x9F, 0x1C), QColor(0xFF, 0xD6, 0x0A),
+        QColor(0xED, 0x1C, 0x24), QColor(0xFF, 0x9F, 0x1C), QColor(0xFF, 0xD6, 0x0A),
         QColor(0x34, 0xC7, 0x59), QColor(0x3D, 0x8B, 0xFD), QColor(0xAF, 0x52, 0xDE),
         QColor(0xFF, 0xFF, 0xFF), QColor(0x00, 0x00, 0x00)
     };
@@ -86,7 +86,10 @@ void Palette::load()
 
     QVector<QColor> colors;
     for (const QJsonValue &v : doc.array()) {
-        const QColor c(v.toString());
+        QColor c(v.toString());
+        // 迁移：旧默认红 #FF4A4A → 新默认红 #ED1C24（只改这一种颜色）
+        if (c.isValid() && c.rgb() == QColor(0xFF, 0x4A, 0x4A).rgb() && c.alpha() == 255)
+            c = QColor(0xED, 0x1C, 0x24);
         if (c.isValid())
             colors.append(c);
     }

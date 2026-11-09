@@ -36,12 +36,15 @@ TextInputBox::TextInputBox(QWidget *parent)
     m_edit->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_edit->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_edit->setAcceptRichText(false);
-    m_edit->setLineWrapMode(QTextEdit::WidgetWidth);
+    // 不自动换行：只有用户按回车才断行，输入框随内容横向撑开
+    m_edit->setLineWrapMode(QTextEdit::NoWrap);
     m_edit->setTabChangesFocus(false);
     m_edit->installEventFilter(this);
     layout->addWidget(m_edit);
 
     // 完全透明：你看到的就是最终效果
+    // 字号必须写进 QSS：截图层挂的 QSS 里有 QWidget{font-size:9pt}，
+    // 样式表字体会压过 setFont()，导致输入时永远是 9pt、和落定后的字号不一致。
     m_edit->setStyleSheet(QStringLiteral(
         "QTextEdit {"
         "  background: transparent;"
@@ -111,6 +114,21 @@ void TextInputBox::applyFont()
     f.setPixelSize(m_fontSize);
     m_edit->setFont(f);
     m_edit->document()->setDocumentMargin(0);
+
+    // 字号同时写进 QSS：截图层 QSS 里有 QWidget{font-size:9pt}，
+    // 样式表字体优先级高于 setFont()，不写这里输入时永远是 9pt，
+    // 和落定后的字号对不上（"输入时和选择的大小不一样"）
+    m_edit->setStyleSheet(QStringLiteral(
+        "QTextEdit {"
+        "  background: transparent;"
+        "  border: none;"
+        "  padding: 0px;"
+        "  margin: 0px;"
+        "  font-family: \"Microsoft YaHei UI\";"
+        "  font-size: %1px;"
+        "  selection-background-color: rgba(61,139,253,140);"
+        "}")
+        .arg(m_fontSize));
 
     // 颜色写进"当前字符格式"，接下来键入的每个字都会带上它。
     //
@@ -242,12 +260,17 @@ void TextInputBox::keyPressEvent(QKeyEvent *e)
     QWidget::keyPressEvent(e);
 }
 
+void TextInputBox::setFontSize(int px)
+{
+    m_fontSize = qBound(6, px, 400);
+    applyFont();
+    relayout();
+}
+
 void TextInputBox::wheelEvent(QWheelEvent *e)
 {
     const int delta = e->angleDelta().y() > 0 ? 1 : -1;
-    m_fontSize = qBound(6, m_fontSize + delta, 400);
-    applyFont();
-    relayout();
+    setFontSize(m_fontSize + delta);
     emit fontResized(m_fontSize);
     e->accept();
 }

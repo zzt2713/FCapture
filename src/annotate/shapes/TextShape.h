@@ -22,6 +22,8 @@ public:
     void scaleAbout(const QPointF &center, qreal factor) override;
     QVector<QPointF> rawHandles() const override;
     void moveHandleRaw(int index, const QPointF &pos) override;
+    void beginHandleDrag() override;
+    void endHandleDrag() override { m_hasDragBaseline = false; }
     bool isEditable() const override { return true; }
     QJsonObject toJson() const override;
     std::shared_ptr<Annotation> clone() const override;
@@ -35,8 +37,7 @@ public:
     void setFontSize(int px);
     int fontSize() const { return m_fontSize; }
 
-    // 拖动右下角改宽度（高度自适应）；0 = 按内容撑开
-    void setBoxWidth(qreal w);
+    // 拖动左右侧边手柄改宽度（自动换行）；0 = 按内容撑开不换行
     qreal boxWidth() const { return m_boxWidth; }
 
     // 文字背景填充
@@ -67,6 +68,14 @@ private:
     QPointF m_pos;
     int     m_fontSize = 16;
     qreal   m_boxWidth = 0;
+
+    // 拖拽缩放基准（beginHandleDrag 时快照）。
+    // 没有它就只能"相对当前值再乘一次比例"，拖一下放大十倍、反向缩不回去。
+    bool    m_hasDragBaseline = false;
+    int     m_dragBaseFontSize = 16;
+    qreal   m_dragBaseBoxWidth = 0;
+    QRectF  m_dragBaseRect;
+    QPointF m_dragAnchor;
     QColor  m_bgColor = Qt::transparent;
     bool    m_outline = false;
     QColor  m_outlineColor = QColor(Qt::black);

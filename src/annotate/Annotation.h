@@ -45,6 +45,12 @@ public:
     // 子类自己的控制点（矩形 8 个、直线 2 个端点、文字 1 个角点、序号 1 个中心……）
     virtual QVector<QPointF> rawHandles() const = 0;
     virtual void moveHandleRaw(int index, const QPointF &pos) = 0;
+    // 开始拖动控制点时调用一次：子类在这里记录基准状态。
+    // 依赖"每次相对当前值再算一次"的实现（比如按比例缩字号）会累积误差，
+    // 表现为拖动时图形疯长或反向缩不小。
+    virtual void beginHandleDrag() {}
+    // 拖拽结束：子类清掉基准，下次拖拽重新快照
+    virtual void endHandleDrag() {}
 
     virtual void translate(const QPointF &delta) = 0;
     // 以 center 为基准整体缩放几何数据（Shift+滚轮 / 套索缩放）
@@ -93,14 +99,20 @@ public:
     bool isSelected() const { return m_selected; }
     void setSelected(bool sel) { m_selected = sel; }
 
+    // 正在原地编辑（文字被输入框接管）：绘制时跳过它，
+    // 否则输入框会和原文字重叠成"两个框"
+    bool isEditing() const { return m_editing; }
+    void setEditing(bool e) { m_editing = e; }
+
     // 用于马赛克/模糊：形状改变后需要重新计算缓存
     virtual void invalidateCache() {}
 
 protected:
-    QColor m_color = QColor(0xFF, 0x4A, 0x4A);
+    QColor m_color = QColor(0xED, 0x1C, 0x24);
     int    m_penWidth = 4;
     bool   m_finished = true;
     bool   m_selected = false;
+    bool   m_editing = false;
     qreal  m_rotation = 0.0;
 
 };

@@ -17,7 +17,7 @@ QMap<int, int> &counters()
 
 NumberShape::NumberShape()
 {
-    m_color = QColor(0xFF, 0x4A, 0x4A);
+    m_color = QColor(0xED, 0x1C, 0x24);
     m_penWidth = 4;
 }
 

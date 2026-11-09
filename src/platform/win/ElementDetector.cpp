@@ -12,6 +12,8 @@
 #include <UIAutomation.h>
 #include <wrl/client.h>
 
+#include <atomic>
+
 using Microsoft::WRL::ComPtr;
 
 namespace {
@@ -248,6 +250,10 @@ qreal hitArea(const QVector<ElementInfo> &hierarchy)
 
 // ---------------------------------------------------------------- Worker
 
+// 最新一次请求的 id：UIA 精化任务开始前用它判断自己是否已被新请求取代。
+// 移动鼠标时旧精化直接作废，流水线不被 300ms 的 UIA 拖慢（识别框一顿一顿的根因）
+std::atomic<quint64> g_latestDetectId{0};
+
 class ElementDetector::Worker : public QObject
 {
     Q_OBJECT
@@ -276,8 +282,6 @@ public slots:
 
     void detect(quint64 requestId, QPoint screenPos, quintptr targetHwnd, bool useMsaa)
     {
-        QVector<ElementInfo> hierarchy;
-
         const POINT probe{ screenPos.x(), screenPos.y() };
         const qreal dpr = dprAtPhysical(probe);
         const POINT pt{ qRound(screenPos.x() * dpr), qRound(screenPos.y() * dpr) };
@@ -293,55 +297,89 @@ public slots:
         const QVector<ElementInfo> msaaResult = detectWithMsaa(pt, targetHwnd);
 
         if (!useMsaa && !msaaResult.isEmpty() && !isCoarseHit(msaaResult, targetHwnd)) {
-            emit resultReady(requestId, msaaResult);
+            emit resultReady(requestId, msaaResult, false);
             return;
         }
 
         if (useMsaa || !m_uia) {
-            hierarchy = msaaResult;
-        } else {
-            // 截图时我们自己的全屏遮罩盖在所有窗口之上。ElementFromPoint
-            // 会原样返回这个遮罩（整屏），所以它永远只能拿到"整屏"。
-            //
-            // 正确做法：主线程按 Z 序算出遮罩下面那个真实窗口，用
-            // ElementFromHandle 取它的 UIA 根，再从根一路向下找光标命中的
-            // 最具体控件。这样既绕开遮罩，又能拿到按钮/输入框/列表项。
-            ComPtr<IUIAutomationElement> hit;
-            if (targetHwnd) {
-                ComPtr<IUIAutomationElement> root;
-                if (SUCCEEDED(m_uia->ElementFromHandle(
-                        reinterpret_cast<UIA_HWND>(targetHwnd), root.GetAddressOf()))
-                    && root) {
-                    deepestElementAt(root.Get(), pt, hit);
-                }
-            }
+            emit resultReady(requestId, msaaResult, false);
+            return;
+        }
 
-            // 没有目标窗口句柄（或该窗口不提供 UIA 树）时的兜底：
-            // 直接用 ElementFromPoint，命中本进程元素就丢掉，退回 MSAA。
-            if (!hit) {
-                ComPtr<IUIAutomationElement> fromPoint;
-                if (SUCCEEDED(m_uia->ElementFromPoint(pt, fromPoint.GetAddressOf()))
-                    && fromPoint && !isOwnProcess(fromPoint.Get())) {
-                    hit = fromPoint;
-                }
-            }
+        // 粗命中：先把窗口级结果发出去保证跟手（interim），
+        // UIA 精化拆到下一个任务步骤——本步骤必须立刻返回，
+        // 否则新请求会在队列里干等 300ms 的 UIA，识别框一顿一顿的就是这么来的。
+        if (!msaaResult.isEmpty())
+            emit resultReady(requestId, msaaResult, true);
 
-            if (hit) {
-                hierarchy = buildHierarchyUp(hit.Get(), dpr);
-            }
+        QMetaObject::invokeMethod(this,
+                                  [this, requestId, pt, targetHwnd, dpr, msaaResult]() {
+                                      refineWithUia(requestId, pt, targetHwnd, dpr,
+                                                    msaaResult);
+                                  },
+                                  Qt::QueuedConnection);
+    }
 
-            // 三层回退：目标窗口 UIA → 全局 ElementFromPoint → MSAA。
-            // 很多自绘程序（WPF 老版本、Qt 程序、部分 Electron）单靠某一条
-            // 路径都拿不到控件，必须三条都试一遍，这才是 Snipaste 能覆盖
-            // 大部分软件的原因。
-            if (hierarchy.isEmpty()) {
-                ComPtr<IUIAutomationElement> fromPoint;
-                if (SUCCEEDED(m_uia->ElementFromPoint(pt, fromPoint.GetAddressOf()))
-                    && fromPoint && !isOwnProcess(fromPoint.Get())) {
-                    hierarchy = buildHierarchyUp(fromPoint.Get(), dpr);
-                }
+signals:
+    void resultReady(quint64 requestId, const QVector<ElementInfo> &hierarchy,
+                     bool interim);
+
+private:
+    // UIA 精化：把粗命中细化到具体控件。排队执行且开头先查"是否已被新请求取代"，
+    // 移动鼠标时旧精化直接作废，只在鼠标停下的最后一单上真正花 300ms。
+    void refineWithUia(quint64 requestId, POINT pt, quintptr targetHwnd, qreal dpr,
+                       const QVector<ElementInfo> &msaaResult)
+    {
+        if (requestId != g_latestDetectId.load())
+            return;
+
+        QVector<ElementInfo> hierarchy;
+
+        // 截图时我们自己的全屏遮罩盖在所有窗口之上。ElementFromPoint
+        // 会原样返回这个遮罩（整屏），所以它永远只能拿到"整屏"。
+        //
+        // 正确做法：主线程按 Z 序算出遮罩下面那个真实窗口，用
+        // ElementFromHandle 取它的 UIA 根，再从根一路向下找光标命中的
+        // 最具体控件。这样既绕开遮罩，又能拿到按钮/输入框/列表项。
+        ComPtr<IUIAutomationElement> hit;
+        if (targetHwnd) {
+            ComPtr<IUIAutomationElement> root;
+            if (SUCCEEDED(m_uia->ElementFromHandle(
+                    reinterpret_cast<UIA_HWND>(targetHwnd), root.GetAddressOf()))
+                && root) {
+                deepestElementAt(root.Get(), pt, hit);
             }
         }
+
+        // 没有目标窗口句柄（或该窗口不提供 UIA 树）时的兜底：
+        // 直接用 ElementFromPoint，命中本进程元素就丢掉，退回 MSAA。
+        if (!hit) {
+            ComPtr<IUIAutomationElement> fromPoint;
+            if (SUCCEEDED(m_uia->ElementFromPoint(pt, fromPoint.GetAddressOf()))
+                && fromPoint && !isOwnProcess(fromPoint.Get())) {
+                hit = fromPoint;
+            }
+        }
+
+        if (hit) {
+            hierarchy = buildHierarchyUp(hit.Get(), dpr);
+        }
+
+        // 三层回退：目标窗口 UIA → 全局 ElementFromPoint → MSAA。
+        // 很多自绘程序（WPF 老版本、Qt 程序、部分 Electron）单靠某一条
+        // 路径都拿不到控件，必须三条都试一遍，这才是 Snipaste 能覆盖
+        // 大部分软件的原因。
+        if (hierarchy.isEmpty()) {
+            ComPtr<IUIAutomationElement> fromPoint;
+            if (SUCCEEDED(m_uia->ElementFromPoint(pt, fromPoint.GetAddressOf()))
+                && fromPoint && !isOwnProcess(fromPoint.Get())) {
+                hierarchy = buildHierarchyUp(fromPoint.Get(), dpr);
+            }
+        }
+
+        // 精化期间来了新请求就丢弃本次结果（回了也是旧位置的）
+        if (requestId != g_latestDetectId.load())
+            return;
 
         // MSAA 粗结果兜底：UIA 也失败时至少还有窗口级命中；
         // 两边都有结果时保留命中块更小（更具体）的那个。
@@ -349,13 +387,9 @@ public slots:
             && (hierarchy.isEmpty() || hitArea(msaaResult) < hitArea(hierarchy)))
             hierarchy = msaaResult;
 
-        emit resultReady(requestId, hierarchy);
+        emit resultReady(requestId, hierarchy, false);
     }
 
-signals:
-    void resultReady(quint64 requestId, const QVector<ElementInfo> &hierarchy);
-
-private:
     static bool isOwnProcess(IUIAutomationElement *element)
     {
         if (!element)
@@ -565,10 +599,12 @@ void ElementDetector::ensureWorker()
 
     connect(m_thread, &QThread::finished, m_worker, &QObject::deleteLater);
     connect(m_worker, &Worker::resultReady, this,
-            [this](quint64 id, const QVector<ElementInfo> &hierarchy) {
+            [this](quint64 id, const QVector<ElementInfo> &hierarchy, bool interim) {
                 if (id != m_pendingRequestId)
                     return;                 // 已超时或被新请求取代
-                m_pendingRequestId = 0;
+                // interim（窗口级粗结果）先亮出来但不结单：同一单的 UIA 精化随后就到
+                if (!interim)
+                    m_pendingRequestId = 0;
                 emit detected(id, hierarchy);
             },
             Qt::QueuedConnection);
@@ -610,6 +646,7 @@ quint64 ElementDetector::request(const QPoint &screenPos, const QString &process
 
     const quint64 id = m_nextRequestId++;
     m_pendingRequestId = id;
+    g_latestDetectId.store(id);   // 工作线程据此作废过期的 UIA 精化
 
     const bool useMsaa = prefersMsaa(processName);
     QMetaObject::invokeMethod(m_worker, [this, id, screenPos, targetWindow, useMsaa]() {

@@ -44,6 +44,7 @@ void FreehandShape::appendPoint(const QPointF &pt)
             return;
     }
     m_points.append(pt);
+    m_pathDirty = true;
 }
 
 QPainterPath FreehandShape::buildPath() const
@@ -92,8 +93,13 @@ void FreehandShape::paintContent(QPainter *p) const
     p->setBrush(Qt::NoBrush);
 
     if (!m_ellipseBrush) {
+        // 路径缓存：快速长笔迹每帧重建 Catmull-Rom 太慢，会掉帧显得像"断裂"
+        if (m_pathDirty) {
+            m_pathCache = buildPath();
+            m_pathDirty = false;
+        }
         p->setPen(QPen(m_color, m_penWidth, m_penStyle, Qt::RoundCap, Qt::RoundJoin));
-        p->drawPath(buildPath());
+        p->drawPath(m_pathCache);
         return;
     }
 

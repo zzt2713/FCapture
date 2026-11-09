@@ -21,9 +21,13 @@
 #include "tools/OcrEngine.h"
 #include "ui/AppMenu.h"
 #include "ui/OcrResultDialog.h"
+#include "ui/BarcodeResultDialog.h"
 #include "ui/OperationToast.h"
 #include "ui/Theme.h"
 
+#include "platform/win/QrScanner.h"
+#include "snip/InfoPanel.h"
+#include "snip/MagnifierPanel.h"
 #include "snip/LongShotBar.h"
 
 #include <QInputDialog>
@@ -137,6 +141,25 @@ SnipOverlay::SnipOverlay(QWidget *parent)
     connect(m_paintBar, &PaintBar::closeRequested, this, [this]() { abortSnip(); });
     connect(m_paintBar, &PaintBar::resetNumberRequested, this,
             [](int groupId) { NumberShape::resetNumbering(groupId); });
+    // 线型/箭头样式变更：同步到已选中的标注（否则改虚线对已画的图形无效）
+    connect(m_paintBar, &PaintBar::styleChanged, this, [this]() {
+        const ToolStyle st = ToolStyleStore::instance()->style(m_currentTool);
+        for (const auto &shape : m_selectedShapes) {
+            if (!shape)
+                continue;
+            if (auto *line = dynamic_cast<LineShape *>(shape.get())) {
+                line->setPenStyle(st.penStyle);
+                line->setArrowStyle(static_cast<LineShape::ArrowStyle>(st.arrowStyle));
+            } else if (auto *rect = dynamic_cast<RectShape *>(shape.get())) {
+                rect->setPenStyle(st.penStyle);
+            } else if (auto *fh = dynamic_cast<FreehandShape *>(shape.get())) {
+                fh->setPenStyle(st.penStyle);
+            } else if (auto *px = dynamic_cast<PixelShape *>(shape.get())) {
+                px->invalidateCache();
+            }
+        }
+        update();
+    });
     connect(m_paintBar, &PaintBar::sendToRequested, this, &SnipOverlay::sendToApplication);
     connect(m_paintBar, &PaintBar::ocrRequested, this, &SnipOverlay::runOcr);
     connect(m_paintBar, &PaintBar::barcodeRequested, this, &SnipOverlay::runBarcodeScan);
@@ -220,6 +243,12 @@ SnipOverlay::~SnipOverlay()
     // 长截图的工具栏是独立顶层窗口，必须手动释放
     delete m_longShotBar;
     m_longShotBar = nullptr;
+
+    delete m_infoPanel;
+    m_infoPanel = nullptr;
+
+    delete m_magnifierPanel;
+    m_magnifierPanel = nullptr;
 }
 
 void SnipOverlay::startSession(const ScreenCapturer::Snapshot &snapshot)
@@ -625,7 +654,17 @@ void SnipOverlay::mousePressEvent(QMouseEvent *e)
         return;
     }
 
-    // ---- 编辑态优先：已选中形状时，旋转点 > 角手柄旋转 > 锚点 > Ctrl拖克隆 > 拖动 ----
+    // ---- 选区锚点最先判：即使有选中标注，用户也可能想调整截图区域 ----
+    // （以前形状拖动排在前面，导致选中标注后选区锚点完全拖不动）
+    if (m_state == State::Adjusting && !localSelection().isEmpty()) {
+        const Anchor selAnchor = hitTestAnchor(local);
+        if (selAnchor != Anchor::None) {
+            beginResize(selAnchor);
+            return;
+        }
+    }
+
+    // ---- 编辑态：已选中形状时，旋转点 > 角手柄旋转 > 锚点 > Ctrl拖克隆 > 拖动 ----
     if (m_state == State::Adjusting && !m_selectedShapes.empty()) {
         if (hitTestRotationHandle(local, nullptr)) {
             beginRotate(local);
@@ -655,6 +694,9 @@ void SnipOverlay::mousePressEvent(QMouseEvent *e)
             m_dragStart = local;
             m_resizeShapeHandleIndex = handleIndex;
             m_movingShape = handleShape;   // 锚点操作针对单个形状
+            // 让形状记录拖拽基准（文字缩字号必须基于固定基准，否则会累积放大）
+            if (handleShape)
+                handleShape->beginHandleDrag();
             return;
         }
 
@@ -686,6 +728,19 @@ void SnipOverlay::mousePressEvent(QMouseEvent *e)
     if (m_paintBarVisible && m_currentTool != Tool::None
         && m_state == State::Adjusting && !localSelection().isEmpty()) {
         if (m_currentTool == Tool::Text) {
+            // 文字工具激活时点到**已有文字**：进入拖动，而不是叠一个新输入框
+            const auto hit = m_model->hitTestShape(QPointF(local), 2.0);
+            if (hit && hit->type() == Annotation::Type::Text) {
+                clearSelectionSilently();
+                hit->setSelected(true);
+                m_selectedShapes.push_back(hit);
+                m_state = State::Moving;
+                m_dragStart = local;
+                m_dragOrigin = local;
+                m_movingShape = hit;
+                update();
+                return;
+            }
             beginTextInput(local);
             return;
         }
@@ -719,9 +774,16 @@ void SnipOverlay::mousePressEvent(QMouseEvent *e)
             beginRectSelect(local);
             return;
         }
+        const bool hadSelection = !m_selectedShapes.empty();
         selectShapeAt(local, ctrl);
         if (!m_selectedShapes.empty())
             return;
+        // 刚从选中态点了空白：只取消选中，不要顺手开始框新选区
+        // （否则"点别处取消选中"会变成"重新拉一个选区"）
+        if (hadSelection) {
+            update();
+            return;
+        }
     }
 
     if (m_state == State::Adjusting) {
@@ -855,9 +917,65 @@ void SnipOverlay::mouseMoveEvent(QMouseEvent *e)
     }
     case State::Adjusting:
     case State::Idle: {
-        // 选中工具时：画布内一律显示十字光标（准备绘制），
-        // 只有选区锚点仍保留缩放光标，方便继续调整区域。
-        if (m_currentTool != Tool::None && m_paintBarVisible) {
+        // 已选中标注的形状手柄永远优先：画完图形会自动选中且工具仍激活，
+        // 不先判手柄的话会一路落到"工具激活＝十字"，拖拽点永远是十字。
+        if (!m_selectedShapes.empty() && m_state == State::Adjusting) {
+            if (hitTestRotationHandle(local, nullptr)) {
+                setCursor(Qt::CrossCursor);   // 旋转点：按住 Alt/角手柄旋转
+            } else {
+                int handleIndex = -1;
+                std::shared_ptr<Annotation> handleShape;
+                if (hitTestSelectedHandle(local, &handleIndex, &handleShape)) {
+                    const bool isCorner = (handleIndex % 2) == 0;
+                    if (isCorner)
+                        setCursor(Qt::SizeFDiagCursor);
+                    else if (handleIndex == 1 || handleIndex == 5)
+                        setCursor(Qt::SizeVerCursor);
+                    else
+                        setCursor(Qt::SizeHorCursor);
+                } else {
+                    bool onShape = false;
+                    for (const auto &shape : m_selectedShapes) {
+                        if (shape && shape->hitTest(QPointF(local), 4.0)) {
+                            onShape = true;
+                            break;
+                        }
+                    }
+                    if (onShape) {
+                        setCursor(Qt::SizeAllCursor);
+                    } else if (m_currentTool != Tool::None && m_paintBarVisible) {
+                        const Anchor a = hitTestAnchor(local);
+                        switch (a) {
+                        case Anchor::NW:
+                        case Anchor::SE: setCursor(Qt::SizeFDiagCursor); break;
+                        case Anchor::NE:
+                        case Anchor::SW: setCursor(Qt::SizeBDiagCursor); break;
+                        case Anchor::N:
+                        case Anchor::S:  setCursor(Qt::SizeVerCursor);  break;
+                        case Anchor::E:
+                        case Anchor::W:  setCursor(Qt::SizeHorCursor);  break;
+                        case Anchor::None: setCursor(Qt::CrossCursor);  break;
+                        }
+                    } else {
+                        const Anchor a = hitTestAnchor(local);
+                        switch (a) {
+                        case Anchor::NW:
+                        case Anchor::SE: setCursor(Qt::SizeFDiagCursor); break;
+                        case Anchor::NE:
+                        case Anchor::SW: setCursor(Qt::SizeBDiagCursor); break;
+                        case Anchor::N:
+                        case Anchor::S:  setCursor(Qt::SizeVerCursor);  break;
+                        case Anchor::E:
+                        case Anchor::W:  setCursor(Qt::SizeHorCursor);  break;
+                        case Anchor::None:
+                            setCursor(hitTestSelection(local) ? Qt::SizeAllCursor
+                                                              : Qt::CrossCursor);
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (m_currentTool != Tool::None && m_paintBarVisible) {
             // 选中工具后，整个画布（含选区内部）统一是十字光标：
             // 此时鼠标的唯一用途就是"落笔"，在选区里显示抓手/移动光标会误导。
             // 只有拖动选区锚点时仍保留缩放光标，那是唯一需要区分的手势。
@@ -874,26 +992,17 @@ void SnipOverlay::mouseMoveEvent(QMouseEvent *e)
             case Anchor::None: setCursor(Qt::CrossCursor);  break;
             }
         } else if (m_state == State::Adjusting && !localSelection().isEmpty()) {
-            // 选区已确定、未选工具：锚点处给缩放光标，选区内部给"移动"光标，
-            // 其余地方是十字（准备重新框选）。
+            // 未选工具：选区锚点给缩放光标，选区内给移动光标，其余十字
             const Anchor a = hitTestAnchor(local);
             switch (a) {
             case Anchor::NW:
-            case Anchor::SE:
-                setCursor(Qt::SizeFDiagCursor);
-                break;
+            case Anchor::SE: setCursor(Qt::SizeFDiagCursor); break;
             case Anchor::NE:
-            case Anchor::SW:
-                setCursor(Qt::SizeBDiagCursor);
-                break;
+            case Anchor::SW: setCursor(Qt::SizeBDiagCursor); break;
             case Anchor::N:
-            case Anchor::S:
-                setCursor(Qt::SizeVerCursor);
-                break;
+            case Anchor::S:  setCursor(Qt::SizeVerCursor);  break;
             case Anchor::E:
-            case Anchor::W:
-                setCursor(Qt::SizeHorCursor);
-                break;
+            case Anchor::W:  setCursor(Qt::SizeHorCursor);  break;
             case Anchor::None:
                 setCursor(hitTestSelection(local) ? Qt::SizeAllCursor : Qt::CrossCursor);
                 break;
@@ -957,6 +1066,8 @@ void SnipOverlay::mouseReleaseEvent(QMouseEvent *e)
     }
 
     if (m_state == State::Resizing && m_resizeShapeHandleIndex >= 0) {
+        if (m_movingShape)
+            m_movingShape->endHandleDrag();
         m_state = State::Adjusting;
         m_resizeShapeHandleIndex = -1;
         m_movingShape.reset();
@@ -1084,6 +1195,21 @@ void SnipOverlay::mouseDoubleClickEvent(QMouseEvent *e)
             }
             return;
         }
+
+        // 没有选中任何形状时双击文字：直接进入编辑（Snipaste 的交互就是这样，
+        // 不需要先选中再点工具）
+        if (m_selectedShapes.empty() && m_currentTool == Tool::None) {
+            const auto hit = m_model->hitTestShape(QPointF(local), 2.0);
+            if (hit && hit->type() == Annotation::Type::Text) {
+                clearSelectionSilently();
+                hit->setSelected(true);
+                m_selectedShapes.push_back(hit);
+                update();
+                beginTextInput(local);
+                return;
+            }
+        }
+
         if (!m_selectedShapes.empty())
             return;
         finishSnip(SnipOutput::Copy);
@@ -1852,22 +1978,37 @@ void SnipOverlay::paintEvent(QPaintEvent *e)
     }
 
     rebuildBackgroundCache();
-    if (!m_snapshotLayer.isNull())
-        p.drawPixmap(0, 0, m_snapshotLayer);
-    drawMask(p);
+    rebuildMaskedCache();
+    if (!m_maskedLayer.isNull()) {
+        p.drawPixmap(0, 0, m_maskedLayer);
+    } else {
+        if (!m_snapshotLayer.isNull())
+            p.drawPixmap(0, 0, m_snapshotLayer);
+        drawMask(p);
+    }
 
     drawCapturedCursor(p);
     drawWindowHighlight(p);      // 悬停的窗口/元素块要在遮罩之上，否则被压暗看不清
     drawAnnotations(p);          // 标注画在底图之上、遮罩之下
     drawInProgressShape(p);
+    // 二维码识别结果高亮（画在标注之上、锚点之下）
+    if (!m_barcodeRects.isEmpty()) {
+        p.save();
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(Theme::kAccent, 2));
+        for (const QRectF &r : m_barcodeRects)
+            p.drawRect(r);
+        p.restore();
+    }
+
     drawSelectionHandles(p);     // 选中框 + 锚点
     drawLassoPreview(p);
     drawAuxiliaryLines(p);
     drawSelectionFrame(p);
     drawAnchors(p);
     drawSizeLabel(p);
-    drawSelectionInfo(p);
     drawMagnifier(p);
+    drawSelectionInfo(p);
     drawHint(p);
     drawShortcutTips(p);
     drawCenterNotice(p);
@@ -1906,6 +2047,27 @@ void SnipOverlay::rebuildBackgroundCache()
     m_snapshotLayer = layer;
     m_snapshotLayerSize = size();
     m_snapshotLayerDpr = dpr;
+}
+
+// 快照 + 遮罩的合成缓存：悬停/取色/元素识别阶段每帧都要重绘整屏，
+// 没缓存时每帧都做一遍整屏 alpha 混合，大屏上是肉眼可见的卡顿。
+// 只在选区形状变化时重新合成：拖选区时与原来同价，静止时几乎免费。
+void SnipOverlay::rebuildMaskedCache()
+{
+    const QRect sel = localSelection();
+    if (!m_maskedLayer.isNull() && m_maskedLayerSel == sel
+        && m_maskedLayer.size() == m_snapshotLayer.size())
+        return;
+
+    if (m_snapshotLayer.isNull()) {
+        m_maskedLayer = QPixmap();
+        return;
+    }
+
+    m_maskedLayer = m_snapshotLayer.copy();
+    QPainter p(&m_maskedLayer);
+    drawMask(p);
+    m_maskedLayerSel = sel;
 }
 
 void SnipOverlay::drawMask(QPainter &p)
@@ -2012,7 +2174,7 @@ void SnipOverlay::drawWindowHighlight(QPainter &p)
     // 不再叠主色填充：那会让整片发蓝，用户会看成"截图直接蓝屏"。
     if (m_state == State::Adjusting) {
         p.save();
-        p.setPen(QPen(Theme::kAccent, 1));
+        p.setPen(QPen(Theme::kAccent, 2));
         p.setBrush(Qt::NoBrush);
         p.drawRect(m_hoverWindow.adjusted(0, 0, -1, -1));
         p.restore();
@@ -2029,7 +2191,7 @@ void SnipOverlay::drawWindowHighlight(QPainter &p)
     p.drawImage(QRectF(m_hoverWindow), m_snapshotImage, source);
 
     p.setClipping(false);
-    p.setPen(QPen(Theme::kAccent, 1));
+    p.setPen(QPen(Theme::kAccent, 2));
     p.setBrush(Qt::NoBrush);
     p.drawRect(m_hoverWindow.adjusted(0, 0, -1, -1));
 
@@ -2078,10 +2240,10 @@ void SnipOverlay::drawSelectionFrame(QPainter &p)
     if (sel.isEmpty())
         return;
 
-    // 选区边框：单层 1px 蓝色实线（Snipaste 风格，不要虚线）
+    // 选区边框：单层 2px 蓝色实线（Snipaste 风格，不要虚线；1px 在高分屏上太细）
     p.save();
     p.setBrush(Qt::NoBrush);
-    p.setPen(QPen(Theme::kAccent, 1));
+    p.setPen(QPen(Theme::kAccent, 2));
     p.drawRect(sel.adjusted(0, 0, -1, -1));
     p.restore();
 
@@ -2145,7 +2307,7 @@ void SnipOverlay::drawShadowPreview(QPainter &p)
 void SnipOverlay::drawSizeLabel(QPainter &p)
 {
     // 悬停检测到的窗口：还没确定选区，但用户需要先看到"这个窗口多大"，
-    // 否则只能盲拖。尺寸标签画在光标右下方，不跟随窗口左上角。
+    // 否则只能盲拖。尺寸标签固定在识别框左上角（不跟随光标）。
     // 选区确定后把鼠标移回窗口上时同样显示这个尺寸（方便对照选区大小）。
     const bool hoveringDetected = !m_hoverWindow.isEmpty()
                                   && m_hoverWindow.contains(m_mouseLocal);
@@ -2169,13 +2331,13 @@ void SnipOverlay::drawSizeLabel(QPainter &p)
         const QRect sizeRect(0, 0, fm.horizontalAdvance(sizeText) + pad * 2,
                              fm.height() + pad);
 
-        // 光标右下 18px 处，靠近屏幕边缘时翻到左侧/上方
-        int x = m_mouseLocal.x() + 18;
-        int y = m_mouseLocal.y() + 18;
-        if (x + sizeRect.width() > width())
-            x = qMax(0, m_mouseLocal.x() - 18 - sizeRect.width());
-        if (y + sizeRect.height() > height())
-            y = qMax(0, m_mouseLocal.y() - 18 - sizeRect.height());
+        // 固定在识别框左上角：沿框上沿贴左缘，贴屏幕顶部时翻进框内
+        int x = m_hoverWindow.left();
+        int y = m_hoverWindow.top() - sizeRect.height() - 6;
+        if (y < 2)
+            y = m_hoverWindow.top() + 4;
+        if (x + sizeRect.width() > width() - 2)
+            x = qMax(0, width() - sizeRect.width() - 2);
 
         const QRect sBox(x, y, sizeRect.width(), sizeRect.height());
 
@@ -2241,9 +2403,24 @@ void SnipOverlay::drawSizeLabel(QPainter &p)
 
 void SnipOverlay::drawSelectionInfo(QPainter &p)
 {
+    Q_UNUSED(p);
+
+    // 面板改为独立置顶窗口绘制（见 InfoPanel）：
+    // PaintBar 是截图层子控件，画在父窗口内容之上，信息面板靠近工具栏时会被盖住。
     const QRect sel = localSelection();
-    if (m_state != State::Adjusting || sel.isEmpty() || !sel.contains(m_mouseLocal)
-        || !m_mouseMoved || m_sizeBox) {
+    // 选择绘制工具时不显示（鼠标用途是落笔，不是取色）
+    const bool toolActive = (m_currentTool != Tool::None && m_paintBarVisible);
+    // 已经框好选区时：只在选区内部显示；
+    // 还没框选区时（Idle/Dragging）：全屏都可以取色，鼠标在哪就显示哪
+    const bool insideSelection = !sel.isEmpty() && sel.contains(m_mouseLocal);
+    const bool pickingWholeScreen = sel.isEmpty()
+                                    && (m_state == State::Idle || m_state == State::Dragging);
+    const bool shouldShow = !toolActive && m_mouseMoved && !m_sizeBox
+                            && m_longShotState == LongShotState::Off
+                            && (insideSelection || pickingWholeScreen);
+    if (!shouldShow) {
+        if (m_infoPanel)
+            m_infoPanel->hideInfo();
         return;
     }
 
@@ -2252,90 +2429,40 @@ void SnipOverlay::drawSelectionInfo(QPainter &p)
     const int py = qRound(m_mouseLocal.y() * dpr);
     if (px < 0 || py < 0 || px >= m_snapshotImage.width()
         || py >= m_snapshotImage.height()) {
+        if (m_infoPanel)
+            m_infoPanel->hideInfo();
         return;
     }
 
+    if (!m_infoPanel)
+        m_infoPanel = new InfoPanel();
+
     const QColor sampled = m_snapshotImage.pixelColor(px, py);
-    const QString colorText = m_hexFormat
-                                  ? sampled.name(QColor::HexRgb)
-                                  : QStringLiteral("%1, %2, %3")
-                                        .arg(sampled.red())
-                                        .arg(sampled.green())
-                                        .arg(sampled.blue());
     const QPoint globalPos = m_mouseLocal + virtualTopLeft();
-    const QString positionText = QStringLiteral("(%1, %2)")
-                                     .arg(globalPos.x())
-                                     .arg(globalPos.y());
-    const QString copyHint = QStringLiteral("按 C 复制颜色值");
-    const QString formatHint = QStringLiteral("按 Shift 切换 RGB/HEX");
 
-    QFont f = Theme::appFont();
-    f.setPointSize(9);
-    const QFontMetrics fm(f);
-    constexpr int kPad = 10;
-    constexpr int kLineGap = 4;
-    constexpr int kSwatchSize = 14;
-    constexpr int kSwatchGap = 7;
-    const int lineH = fm.height();
-    const int textWidth = qMax(fm.horizontalAdvance(positionText),
-                               qMax(kSwatchSize + kSwatchGap
-                                        + fm.horizontalAdvance(colorText),
-                                    qMax(fm.horizontalAdvance(copyHint),
-                                         fm.horizontalAdvance(formatHint))));
-    const QSize panelSize(textWidth + kPad * 2, lineH * 4 + kLineGap * 3 + kPad * 2);
+    InfoPanel::Data data;
+    data.positionText = QStringLiteral("(%1, %2)").arg(globalPos.x()).arg(globalPos.y());
+    data.colorText = m_hexFormat ? sampled.name(QColor::HexRgb)
+                                 : QStringLiteral("%1, %2, %3")
+                                       .arg(sampled.red())
+                                       .arg(sampled.green())
+                                       .arg(sampled.blue());
+    data.swatch = sampled;
+    data.copyHint = QStringLiteral("按 C 复制颜色值");
+    data.formatHint = QStringLiteral("按 Shift 切换 RGB/HEX");
 
-    int x = m_mouseLocal.x() + 18;
-    int y = m_mouseLocal.y() + 18;
-    if (x + panelSize.width() > width())
-        x = m_mouseLocal.x() - 18 - panelSize.width();
-    if (y + panelSize.height() > height())
-        y = m_mouseLocal.y() - 18 - panelSize.height();
-    x = qBound(0, x, qMax(0, width() - panelSize.width()));
-    y = qBound(0, y, qMax(0, height() - panelSize.height()));
-
-    // 放大镜也在光标右下：面板默认避让到放大镜下方，
-    // 否则两者叠在一起，用户看不到色值。
-    QRect panel(x, y, panelSize.width(), panelSize.height());
-    const QRect magBox = magnifierRect();
-    if (!magBox.isEmpty() && panel.intersects(magBox)) {
-        const int below = magBox.bottom() + 8;
-        if (below + panel.height() <= height())
-            panel.moveTop(below);
-        else
-            panel.moveLeft(qBound(0, magBox.left() - panel.width() - 8,
-                                  qMax(0, width() - panel.width())));
+    // 和放大镜是"一块整体"：放大镜显示时，信息面板贴在它正上方、左右对齐；
+    // 放大镜没开时才退化为跟随鼠标
+    const QRect magRect = m_magnifierPanel ? m_magnifierPanel->globalRect() : QRect();
+    if (!magRect.isEmpty()) {
+        m_infoPanel->showAbove(data, magRect);
+        return;
     }
 
-    p.save();
-    p.setFont(f);
-    p.setPen(Qt::NoPen);
-    p.setBrush(QColor(0x2B, 0x2B, 0x2B, 238));
-    p.drawRoundedRect(panel, 3, 3);
-    p.setPen(QColor(0xF2, 0xF2, 0xF2));
-
-    int lineTop = panel.top() + kPad;
-    p.drawText(QRect(panel.left() + kPad, lineTop, textWidth, lineH),
-               Qt::AlignLeft | Qt::AlignVCenter, positionText);
-
-    lineTop += lineH + kLineGap;
-    const QRect swatch(panel.left() + kPad, lineTop + (lineH - kSwatchSize) / 2,
-                       kSwatchSize, kSwatchSize);
-    p.setPen(QPen(QColor(0xE6, 0xE6, 0xE6), 1));
-    p.setBrush(sampled);
-    p.drawRect(swatch);
-    p.setPen(QColor(0xF2, 0xF2, 0xF2));
-    p.drawText(QRect(swatch.right() + 1 + kSwatchGap, lineTop,
-                     textWidth - kSwatchSize - kSwatchGap, lineH),
-               Qt::AlignLeft | Qt::AlignVCenter, colorText);
-
-    lineTop += lineH + kLineGap;
-    p.drawText(QRect(panel.left() + kPad, lineTop, textWidth, lineH),
-               Qt::AlignLeft | Qt::AlignVCenter, copyHint);
-
-    lineTop += lineH + kLineGap;
-    p.drawText(QRect(panel.left() + kPad, lineTop, textWidth, lineH),
-               Qt::AlignLeft | Qt::AlignVCenter, formatHint);
-    p.restore();
+    QRect avoid;
+    if (m_paintBarVisible && m_paintBar)
+        avoid = QRect(m_paintBar->mapToGlobal(QPoint(0, 0)), m_paintBar->size());
+    m_infoPanel->showInfo(data, mapToGlobal(m_mouseLocal), avoid);
 }
 
 void SnipOverlay::drawAnchors(QPainter &p)
@@ -2381,8 +2508,17 @@ QRect SnipOverlay::magnifierRect() const
 
 void SnipOverlay::drawMagnifier(QPainter &p)
 {
-    if (!m_magnifierOn || m_snapshotImage.isNull())
+    Q_UNUSED(p);
+
+    // 放大镜改为独立置顶小窗（MagnifierPanel）：
+    // 原本画在截图层上，会被工具栏子控件盖住。
+    // 选择了绘制工具时不显示：此时鼠标是用来落笔的，取色/放大是干扰
+    if (!m_magnifierOn || m_snapshotImage.isNull()
+        || (m_currentTool != Tool::None && m_paintBarVisible)) {
+        if (m_magnifierPanel)
+            m_magnifierPanel->hidePanel();
         return;
+    }
 
     const qreal dpr = m_snapshot.devicePixelRatio;
     const int cx = qRound(m_mouseLocal.x() * dpr);
@@ -2391,68 +2527,48 @@ void SnipOverlay::drawMagnifier(QPainter &p)
     const int half = kMagnifierSamplePixels / 2;
     QRect srcRect(cx - half, cy - half, kMagnifierSamplePixels, kMagnifierSamplePixels);
     srcRect = srcRect.intersected(m_snapshotImage.rect());
-
-    const QRect box = magnifierRect();
-    if (box.isEmpty())
+    if (srcRect.isEmpty()) {
+        if (m_magnifierPanel)
+            m_magnifierPanel->hidePanel();
         return;
-
-    p.save();
-    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
-
-    // 内容
-    p.fillRect(box, Qt::black);
-    if (!srcRect.isEmpty())
-        p.drawImage(box, m_snapshotImage, srcRect);
-
-    // 十字准心 / 中心像素框只在"还没选好区域"时画。
-    // 选区确定后（Adjusting）用户是在对着一块固定画面看颜色，
-    // 红色准心横穿整个放大图反而挡视线。
-    const bool picking = m_state == State::Idle;
-    if (picking) {
-        p.setPen(QPen(Theme::kGuideLine, 1));
-        p.drawLine(box.left(), box.center().y(), box.right(), box.center().y());
-        p.drawLine(box.center().x(), box.top(), box.center().x(), box.bottom());
-
-        const int pxSize = kMagnifierSize / kMagnifierSamplePixels;
-        p.setPen(QPen(Qt::white, 1));
-        p.setBrush(Qt::NoBrush);
-        p.drawRect(QRect(box.center().x() - pxSize / 2, box.center().y() - pxSize / 2,
-                         pxSize, pxSize));
     }
 
-    // 外框
-    p.setPen(QPen(QColor(0x55, 0x55, 0x55), 1));
-    p.drawRect(box.adjusted(0, 0, -1, -1));
+    if (!m_magnifierPanel)
+        m_magnifierPanel = new MagnifierPanel();
 
-    // 坐标
-    QFont f = Theme::appFont();
-    f.setPointSize(8);
-    p.setFont(f);
+    MagnifierPanel::Data data;
+    data.sample = m_snapshotImage.copy(srcRect);
+    data.picking = (m_state == State::Idle);
+    data.pixelSize = kMagnifierSize / kMagnifierSamplePixels;
+
     QString info = QStringLiteral("%1, %2").arg(m_mouseLocal.x()).arg(m_mouseLocal.y());
-
     if (cx >= 0 && cy >= 0 && cx < m_snapshotImage.width() && cy < m_snapshotImage.height()) {
         const QColor c = m_snapshotImage.pixelColor(cx, cy);
-        const QString colorText = m_hexFormat
-                                      ? c.name(QColor::HexRgb)
-                                      : QStringLiteral("RGB(%1,%2,%3)").arg(c.red()).arg(c.green()).arg(c.blue());
-        info += QStringLiteral("  ") + colorText;
-
-        const QRect swatch(box.left() + 4, box.bottom() - 18, 12, 12);
-        p.setPen(QPen(Qt::white, 1));
-        p.setBrush(c);
-        p.drawRect(swatch);
+        data.pixelColor = c;
+        data.pixelValid = true;
+        info += QStringLiteral("  ")
+                + (m_hexFormat ? c.name(QColor::HexRgb)
+                               : QStringLiteral("RGB(%1,%2,%3)")
+                                     .arg(c.red()).arg(c.green()).arg(c.blue()));
     }
+    data.infoText = info;
 
-    const QFontMetrics fm(f);
-    const int textW = fm.horizontalAdvance(info) + 12;
-    const QRect infoBox(box.left(), box.top() - 20, qMin(textW, width() - box.left()), 18);
-    p.setPen(Qt::NoPen);
-    p.setBrush(QColor(0, 0, 0, 200));
-    p.drawRoundedRect(infoBox, 3, 3);
-    p.setPen(QColor(0xE8, 0xE8, 0xE8));
-    p.drawText(infoBox.adjusted(6, 0, -4, 0), Qt::AlignVCenter | Qt::AlignLeft, info);
+    // 避开工具栏；信息面板若已显示也避开它（两者不重叠）
+    QRect avoid;
+    if (m_paintBarVisible && m_paintBar)
+        avoid = QRect(m_paintBar->mapToGlobal(QPoint(0, 0)), m_paintBar->size());
 
-    p.restore();
+    m_magnifierPanel->showPanel(data, mapToGlobal(m_mouseLocal), avoid);
+
+    // 放大镜先定位，信息面板随后避开它
+    if (m_infoPanel && m_infoPanel->isVisible()) {
+        const QRect magRect = m_magnifierPanel->globalRect();
+        if (!magRect.isEmpty() && avoid.isEmpty())
+            avoid = magRect;
+        else if (!magRect.isEmpty())
+            avoid = avoid.united(magRect);
+    }
+    m_infoPanelAvoid = avoid;
 }
 
 bool SnipOverlay::shortcutTipsVisible() const
@@ -3476,34 +3592,38 @@ void SnipOverlay::runOcr()
         return;
     }
 
+    // 识别用的图先存一份：识别成功后截图层会关闭，重试时还要用
+    const QImage sourceImage = image;
+
     QMetaObject::Connection *okConn = new QMetaObject::Connection;
     QMetaObject::Connection *errConn = new QMetaObject::Connection;
 
     *okConn = connect(m_ocr, &OcrEngine::finished, this,
-                      [this, langs, okConn, errConn](const WinOcr::Result &result) {
+                      [this, langs, sourceImage, okConn, errConn](const WinOcr::Result &result) {
                           disconnect(*okConn);
                           disconnect(*errConn);
                           delete okConn;
                           delete errConn;
 
+                          // 识别成功：整个截图会话结束，只留结果对话框。
+                          // 否则遮罩/选区还压在桌面上，对话框会被挡住或一闪而过。
+                          releaseSessionImages();
+                          if (m_paintBar)
+                              m_paintBar->hide();
+                          close();
+
+                          // 不能以截图层为父窗口：SnipOverlay 挂着写死暗色的
+                          // overlayStyleSheet，会沿父子链把 Ela 的亮/暗配色盖掉。
                           auto *dialog = new OcrResultDialog(result.text, langs,
-                                                             result.language, this);
-                          m_ocrDialog = dialog;
-                          connect(dialog, &OcrResultDialog::retryRequested, this,
-                                  [this](const QString &lang) {
+                                                             result.language, nullptr);
+                          dialog->setWindowFlag(Qt::WindowStaysOnTopHint, true);
+                          connect(dialog, &OcrResultDialog::retryRequested, dialog,
+                                  [this, sourceImage, dialog](const QString &lang) {
                                       m_ocr->setLanguage(lang);
-                                      const QImage img = selectionImage();
-                                      if (!img.isNull())
-                                          m_ocr->recognize(img);
+                                      m_ocr->recognize(sourceImage);
                                   });
-                          connect(dialog, &QDialog::finished, this, [this]() {
-                              m_ocrDialog = nullptr;
-                          });
                           dialog->setAttribute(Qt::WA_DeleteOnClose);
                           dialog->show();
-                          // 识别是异步的：runOcr 开头隐藏了工具栏，这里必须恢复，
-                          // 否则识别完工具栏就"永久消失"了。
-                          restorePaintBarAfterAsync();
 
                           QApplication::clipboard()->setText(result.text);
                       });
@@ -3515,6 +3635,7 @@ void SnipOverlay::runOcr()
                            delete okConn;
                            delete errConn;
                            Q_UNUSED(error);
+                           // 识别失败：恢复截图层，用户可以继续框选重试
                            restorePaintBarAfterAsync();
                        });
 
@@ -3524,10 +3645,48 @@ void SnipOverlay::runOcr()
 void SnipOverlay::runBarcodeScan()
 {
     m_paintBar->setTool(Tool::None);
-    // 二维码功能排在 2.0。这里不用 ElaToast：
-    // 截图层是全屏 WindowStaysOnTopHint 窗口，独立 toast 窗口会被它盖住看不见。
-    // 直接在遮罩上画一条居中提示，保证一定可见，也不会打断截图流程。
-    showCenterNotice(QStringLiteral("二维码识别将在 2.0 版本实现，敬请期待！"));
+
+    const QImage image = selectionImage();
+    if (image.isNull()) {
+        showCenterNotice(QStringLiteral("请先框选要识别的区域"));
+        return;
+    }
+
+    // 每次识别先清掉上次的高亮框
+    m_barcodeRects.clear();
+
+    // 先在原图上扫一遍；扫不到且开了"努力模式"再试一次
+    // （同步调用：选区图通常很小，几十毫秒内出结果）
+    QVector<QrScanner::Result> results = QrScanner::scan(image, false);
+    if (results.isEmpty())
+        results = QrScanner::scan(image, true);
+
+    if (results.isEmpty()) {
+        showCenterNotice(QStringLiteral("未识别到二维码或条码"));
+        update();
+        return;
+    }
+
+    QVector<BarcodeResultDialog::Item> items;
+    items.reserve(results.size());
+    for (const auto &r : results) {
+        items.append({r.text, r.format});
+
+        // 结果位置是图片像素坐标：除以 dpr 换回逻辑坐标，再加上选区左上角
+        const qreal dpr = m_snapshot.devicePixelRatio;
+        const QRect sel = localSelection();
+        const QRectF logical(r.position.x() / dpr, r.position.y() / dpr,
+                             r.position.width() / dpr, r.position.height() / dpr);
+        m_barcodeRects.append(logical.translated(sel.topLeft()));
+    }
+    update();
+
+    // 不能以截图层为父窗口：SnipOverlay 挂着写死暗色的 overlayStyleSheet，
+    // 会沿父子链把 Ela 的亮/暗配色盖掉（字看不清）
+    auto *dialog = new BarcodeResultDialog(items, nullptr);
+    dialog->setWindowFlag(Qt::WindowStaysOnTopHint, true);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->show();
 }
 
 void SnipOverlay::showCenterNotice(const QString &text, int msec)

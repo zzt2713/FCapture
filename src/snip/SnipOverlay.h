@@ -12,6 +12,7 @@
 #include <QPixmap>
 #include <QPoint>
 #include <QRect>
+#include <QVector>
 #include <QTimer>
 #include <QWidget>
 
@@ -25,6 +26,8 @@ class SizeInputBox;
 class OcrEngine;
 class OcrResultDialog;
 class LongShotBar;
+class InfoPanel;
+class MagnifierPanel;
 
 // 截图层：全屏遮罩 + 选区 + 放大镜 + 取色 + 窗口检测 + 标注
 class SnipOverlay : public QWidget
@@ -167,6 +170,8 @@ private:
     // 异步任务（OCR）结束后恢复截图层与工具栏
     void restorePaintBarAfterAsync();
     void runBarcodeScan();
+    // 二维码识别结果的位置高亮（逻辑坐标，相对截图层）
+    QVector<QRectF> m_barcodeRects;
     QImage selectionImage() const;
 
     // --- 长截图（滚动拼接）---
@@ -265,6 +270,11 @@ private:
     OcrEngine *m_ocr = nullptr;
     QPointer<OcrResultDialog> m_ocrDialog;
 
+    // 取色/坐标信息面板：独立置顶小窗，避免被工具栏子控件遮住
+    InfoPanel *m_infoPanel = nullptr;
+    MagnifierPanel *m_magnifierPanel = nullptr;
+    QRect m_infoPanelAvoid;   // 信息面板要避开的区域（工具栏 + 放大镜）
+
     // --- 数据 ---
     ScreenCapturer::Snapshot m_snapshot;
     QImage  m_snapshotImage;
@@ -285,8 +295,13 @@ private:
     QPixmap m_snapshotLayer;
     QSize   m_snapshotLayerSize;
     qreal   m_snapshotLayerDpr = 1.0;
-    void    invalidateBackgroundCache() { m_snapshotLayer = QPixmap(); }
+    // 快照 + 遮罩的合成缓存：选区形状不变时每帧直接整块 blit，
+    // 省掉整屏 alpha 混合（悬停/元素识别阶段卡顿的主要来源）
+    QPixmap m_maskedLayer;
+    QRect   m_maskedLayerSel;
+    void    invalidateBackgroundCache() { m_snapshotLayer = QPixmap(); m_maskedLayer = QPixmap(); }
     void    rebuildBackgroundCache();
+    void    rebuildMaskedCache();
     bool    m_showCursor = false;
 
     State   m_state = State::Idle;
@@ -374,7 +389,6 @@ private:
     PaintBar        *m_paintBar = nullptr;
     QPointer<TextInputBox> m_textBox;
     int              m_textBoxFontSize = 0;   // 输入框当前字号（滚轮可调），落定后直接采用
-    qreal            m_textBoxLayoutWidth = 0; // 输入框排版宽度，落定后写进 TextShape
     bool             m_paintBarVisible = false;
     Tool             m_currentTool = Tool::None;
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FCapture VERSION 1.1.0 LANGUAGES CXX)
+project(FCapture VERSION 1.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,6 +65,8 @@ set(APP_SOURCES
     src/paste/PinWindow.cpp
 
     src/snip/ImageEffects.cpp
+    src/snip/InfoPanel.cpp
+    src/snip/MagnifierPanel.cpp
     src/snip/LongShotBar.cpp
     src/snip/LongShotStitcher.cpp
     src/snip/ScreenCapturer.cpp
@@ -79,6 +81,7 @@ set(APP_SOURCES
     src/platform/win/HotkeyHook.cpp
     src/platform/win/WinOcr.cpp
     src/platform/win/VirtualDesktop.cpp
+    src/platform/win/QrScanner.cpp
     src/platform/win/WinUtil.cpp
     src/platform/win/WinCrashHandler.cpp
     src/platform/win/WinHotkey.cpp
@@ -91,6 +94,9 @@ set(APP_SOURCES
     src/tools/Whiteboard.cpp
 
     src/ui/AppMenu.cpp
+    src/ui/BarcodeResultDialog.cpp
+    src/ui/ElaColorPickerDialog.cpp
+    src/ui/ElaSliderFactory.cpp
     src/ui/ElaThemeBridge.cpp
     src/ui/GroupManagerDialog.cpp
     src/ui/HotkeyRecorder.cpp
@@ -139,6 +145,8 @@ set(HEADERS
     src/paste/PinWindow.h
 
     src/snip/ImageEffects.h
+    src/snip/InfoPanel.h
+    src/snip/MagnifierPanel.h
     src/snip/LongShotBar.h
     src/snip/LongShotStitcher.h
     src/snip/ScreenCapturer.h
@@ -152,6 +160,7 @@ set(HEADERS
     src/platform/win/HotkeyHook.h
     src/platform/win/WinOcr.h
     src/platform/win/VirtualDesktop.h
+    src/platform/win/QrScanner.h
     src/platform/win/WinUtil.h
     src/platform/win/WinCrashHandler.h
     src/platform/win/WinHotkey.h
@@ -164,6 +173,9 @@ set(HEADERS
     src/tools/Whiteboard.h
 
     src/ui/AppMenu.h
+    src/ui/BarcodeResultDialog.h
+    src/ui/ElaColorPickerDialog.h
+    src/ui/ElaSliderFactory.h
     src/ui/ElaThemeBridge.h
     src/ui/GroupManagerDialog.h
     src/ui/HotkeyRecorder.h
@@ -177,6 +189,27 @@ set(HEADERS
 )
 
 # 应用实现静态库：exe 与验证工具共用，测试目标只需链接它 + 自己的 main.cpp
+
+# ---------------------------------------------------------------- ZXing-C++
+# 二维码/条码识别：只用解码器（reader），关掉写码器、示例和 bundled zint，
+# 减小编译产物。zxing 提供 zxing::zxing 目标。
+set(ZXING_READERS ON CACHE BOOL "" FORCE)
+set(ZXING_WRITERS OFF CACHE STRING "" FORCE)
+set(ZXING_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ZXING_BLACKBOX_TESTS OFF CACHE BOOL "" FORCE)
+set(ZXING_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+set(ZXING_PYTHON_MODULE OFF CACHE BOOL "" FORCE)
+set(ZXING_USE_BUNDLED_ZINT OFF CACHE BOOL "" FORCE)
+set(ZXING_C_API OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/zxing-cpp EXCLUDE_FROM_ALL)
+
+# 本工程全局加了 /await（C++/WinRT 需要），而 ZXing 内部用了协程，
+# 两边编译出的 _COROUTINE_ABI 不一致会链接报 LNK2038。
+# 给 ZXing 关掉协程 ABI 差异带来的影响：统一用不带 /await 的标准协程实现。
+if (MSVC AND TARGET ZXing)
+    target_compile_options(ZXing PUBLIC /await)
+endif()
+
 add_library(fcapture_core STATIC ${APP_SOURCES} ${HEADERS})
 
 # 版本号单一来源：project(FCapture VERSION x.y.z)，编译期注入 C++ 侧
@@ -191,6 +224,7 @@ target_link_libraries(fcapture_core PUBLIC
     Qt6::Network
     Qt6::Svg
     ElaWidgetTools
+    ZXing::ZXing
 )
 
 if(MSVC)

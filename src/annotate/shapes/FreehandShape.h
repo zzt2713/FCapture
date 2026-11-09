@@ -2,6 +2,8 @@
 
 #include "annotate/Annotation.h"
 
+#include <QPainterPath>
+
 // 铅笔 / 马克笔：都是自由曲线，差别在笔宽倍数和透明度
 class FreehandShape : public Annotation
 {
@@ -22,7 +24,7 @@ public:
     std::shared_ptr<Annotation> clone() const override;
 
     void appendPoint(const QPointF &pt);
-    void setPoints(const QVector<QPointF> &pts) { m_points = pts; }
+    void setPoints(const QVector<QPointF> &pts) { m_points = pts; m_pathDirty = true; }
     QVector<QPointF> points() const { return m_points; }
 
     void setPenStyle(Qt::PenStyle s) { m_penStyle = s; }
@@ -34,6 +36,8 @@ public:
 
 private:
     QPainterPath buildPath() const;
+    mutable QPainterPath m_pathCache;
+    mutable bool m_pathDirty = true;
 
     Kind m_kind;
     QVector<QPointF> m_points;

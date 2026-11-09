@@ -8,11 +8,19 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTextStream>
 
 namespace {
+
+// 与 installer/FCapture.iss 的 AppId 保持一致：Inno 的卸载注册表键 = AppId + "_is1"。
+// 自动更新只换文件不走安装器，Windows 设置→应用 显示的版本（DisplayVersion）
+// 必须在这里同步，否则永远停留在首次安装时的版本。
+const QString kUninstallKey =
+    QStringLiteral("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
+                   "8E4A2C71-5F3B-4D62-9A18-3C7B6D2E9F04_is1");
 
 QString scriptPath()
 {
@@ -30,29 +38,17 @@ QString logPath()
 
 namespace UpdateInstaller {
 
-bool canInstall(QString *error)
+bool installAndRestart(const QString &zipPath, const QString &version, QString *error)
 {
-    const QDir dir(AppPaths::exeDir());
-
-    // 1) 安装目录必须可写。临时写一个探针文件验证，比检查属性可靠
-    //    （Program Files 下即使属性看起来可写，实际也会被 UAC 拦）。
-    const QString probe = dir.filePath(QStringLiteral(".update-probe"));
-    QFile file(probe);
-    if (!file.open(QIODevice::WriteOnly)) {
+    // 版本号会拼进提权脚本的 reg 命令，只放行版本号字符，
+    // 防止被投毒的 release tag 注入批处理命令
+    static const QRegularExpression kSafeVersion(
+        QStringLiteral("^[0-9A-Za-z._-]+$"));
+    if (!kSafeVersion.match(version).hasMatch()) {
         if (error)
-            *error = QStringLiteral("安装目录不可写，请把程序放到有写权限的位置，"
-                                    "或以管理员身份运行：%1")
-                         .arg(dir.absolutePath());
+            *error = QStringLiteral("版本号格式异常，已取消更新：%1").arg(version);
         return false;
     }
-    file.close();
-    QFile::remove(probe);
-
-    return true;
-}
-
-bool installAndRestart(const QString &zipPath, QString *error)
-{
     const QString exePath = QDir::toNativeSeparators(
         QCoreApplication::applicationFilePath());
     const QString exeDir = QDir::toNativeSeparators(AppPaths::exeDir());
@@ -108,15 +104,28 @@ bool installAndRestart(const QString &zipPath, QString *error)
         << "\"Expand-Archive -LiteralPath '" << zip << "' -DestinationPath '"
         << exeDir << "' -Force\" >> %LOG% 2>&1\r\n"
         << "if errorlevel 1 goto failed\r\n"
-        // 4) 重新启动
-        << "start \"\" \"" << exePath << "\"\r\n"
+        // 4) 同步卸载注册表条目的版本号。条目存在才写：
+        //    便携版没有条目，不能 reg add 凭空造一个假卸载项出来
+        << "reg query \"HKLM\\" << kUninstallKey << "\" >nul 2>&1 && "
+        << "reg add \"HKLM\\" << kUninstallKey << "\" /v DisplayVersion /d "
+        << version << " /f >nul\r\n"
+        << "reg query \"HKCU\\" << kUninstallKey << "\" >nul 2>&1 && "
+        << "reg add \"HKCU\\" << kUninstallKey << "\" /v DisplayVersion /d "
+        << version << " /f >nul\r\n"
         << "echo [%date% %time%] update done >> %LOG%\r\n"
+        // 5) 重新启动。本脚本是提权运行的，直接 start 会把程序也提起来，
+        //    交给 Shell（explorer，普通权限）拉起，保持程序权限不变
+        << "powershell -NoProfile -Command "
+        << "\"(New-Object -ComObject Shell.Application).ShellExecute('" << exePath
+        << "')\"\r\n"
         << "goto cleanup\r\n"
         << ":failed\r\n"
         << "echo [%date% %time%] extract failed, restoring backup >> %LOG%\r\n"
         << "robocopy \"" << backupDir << "\" \"" << exeDir
         << "\" /E /NFL /NDL /NJH /NJS /NP >> %LOG% 2>&1\r\n"
-        << "start \"\" \"" << exePath << "\"\r\n"
+        << "powershell -NoProfile -Command "
+        << "\"(New-Object -ComObject Shell.Application).ShellExecute('" << exePath
+        << "')\"\r\n"
         << "goto cleanup\r\n"
         << ":giveup\r\n"
         << "echo [%date% %time%] process did not exit, abort >> %LOG%\r\n"
@@ -126,13 +135,24 @@ bool installAndRestart(const QString &zipPath, QString *error)
         << "endlocal\r\n";
     script.close();
 
-    // 以隐藏窗口启动脚本，立即返回
-    const bool started = QProcess::startDetached(
-        QStringLiteral("cmd.exe"),
-        {QStringLiteral("/c"), QDir::toNativeSeparators(scriptPath())});
-    if (!started) {
+    // 提权启动脚本（一次 UAC）：覆盖 Program Files、写 HKLM 注册表都需要管理员。
+    // 阻塞等 UAC 结果但不卡界面——用户拒绝就原样返回，应用不退出、可稍后重试。
+    const QString psCmd =
+        QStringLiteral("Start-Process -FilePath '%1' -Verb RunAs -WindowStyle Minimized")
+            .arg(QDir::toNativeSeparators(scriptPath()));
+    QProcess proc;
+    proc.start(QStringLiteral("powershell.exe"),
+               {QStringLiteral("-NoProfile"), QStringLiteral("-Command"), psCmd});
+    if (!proc.waitForStarted()) {
         if (error)
             *error = QStringLiteral("无法启动更新脚本");
+        return false;
+    }
+    while (!proc.waitForFinished(100))
+        QCoreApplication::processEvents();
+    if (proc.exitCode() != 0) {
+        if (error)
+            *error = QStringLiteral("更新需要管理员权限（UAC 未确认），已取消更新");
         return false;
     }
     return true;

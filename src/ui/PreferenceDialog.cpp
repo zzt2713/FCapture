@@ -1696,13 +1696,6 @@ void PreferenceDialog::checkForUpdates()
 
     connect(m_updateChecker, &UpdateChecker::downloadFinished, this,
             [this](const QString &filePath) {
-                QString error;
-                if (!UpdateInstaller::canInstall(&error)) {
-                    if (m_updateStatus)
-                        m_updateStatus->setText(error);
-                    return;
-                }
-
                 // 二次确认，避免误点导致程序重启
                 ElaContentDialog confirm(this);
                 confirm.setWindowTitle(QStringLiteral("安装更新"));
@@ -1725,7 +1718,9 @@ void PreferenceDialog::checkForUpdates()
                     return;
 
                 QString installError;
-                if (!UpdateInstaller::installAndRestart(filePath, &installError)) {
+                if (!UpdateInstaller::installAndRestart(filePath,
+                                                        m_pendingRelease.version,
+                                                        &installError)) {
                     if (m_updateStatus)
                         m_updateStatus->setText(installError);
                     return;

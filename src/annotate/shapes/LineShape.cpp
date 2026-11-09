@@ -56,13 +56,20 @@ void LineShape::setLastPoint(const QPointF &pt)
         m_points.last() = pt;
 }
 
+// 箭头各部分一律从笔宽等比缩放。以前这里用固定上下限（8~26px），
+// 笔宽超过 8 以后箭头就再也不变了，表现成"选择大小没有用"。
 qreal LineShape::arrowHeadLength(bool thin, bool large) const
 {
-    if (thin)
-        return qBound<qreal>(5.0, m_penWidth * 1.8, 14.0);
-    if (large)
-        return qBound<qreal>(12.0, m_penWidth * 5.0, 40.0);
-    return qBound<qreal>(8.0, m_penWidth * 3.5, 26.0);
+    const qreal factor = large ? 4.2 : (thin ? 2.4 : 3.2);
+    return qMax<qreal>(4.0, m_penWidth * factor);
+}
+
+// 箭头三角的半宽：细长实心三角（长:宽 ≈ 2:1），直接接在笔杆上，
+// 不加粗不鼓包；细头更收、大头稍放
+qreal LineShape::arrowHeadHalfWidth(qreal headLen, bool thin, bool large) const
+{
+    const qreal factor = large ? 0.30 : (thin ? 0.20 : 0.25);
+    return headLen * factor;
 }
 
 void LineShape::drawArrowHead(QPainter *p, const QPointF &from, const QPointF &tip,
@@ -74,7 +81,7 @@ void LineShape::drawArrowHead(QPainter *p, const QPointF &from, const QPointF &t
         return;
 
     const qreal headLen = arrowHeadLength(thin, large);
-    const qreal headHalfWidth = headLen * (thin ? 0.32 : 0.42);
+    const qreal headHalfWidth = arrowHeadHalfWidth(headLen, thin, large);
 
     const qreal angle = std::atan2(-line.dy(), line.dx());
 
@@ -93,72 +100,104 @@ void LineShape::drawArrowHead(QPainter *p, const QPointF &from, const QPointF &t
 }
 
 
-// 锥形笔杆：起点宽 = 极细（约 1px），终点宽 = 笔宽。
-// 双向箭头时起点也要粗，所以按"离最近的箭头端越近越粗"来插值。
-void LineShape::drawTaperedArrowShaft(QPainter *p, const QVector<QPointF> &pts,
-                                      bool thin, bool large) const
+bool LineShape::isTaperedStyle() const
+{
+    return m_arrowStyle == ArrowStyle::Tapered
+           || m_arrowStyle == ArrowStyle::TaperedThin
+           || m_arrowStyle == ArrowStyle::DeepBarb;
+}
+
+// 锥形倒刺箭头：整条箭头是**一个闭合填充路径**，不用等宽 stroke。
+//   起点：半宽≈0.5px 的平头（几乎为 0）
+//   线身：沿方向逐渐变宽（锥形）
+//   箭头区：先向外张开成倒刺尖，再向内收缩到尖端
+// 参数都是笔宽倍数，保证任何笔宽下比例一致、大小随笔宽缩放。
+void LineShape::drawTaperedArrow(QPainter *p, const QVector<QPointF> &pts) const
 {
     if (pts.size() < 2)
         return;
 
-    const bool doubleHeaded = m_arrowStyle == ArrowStyle::Double
-                              || m_arrowStyle == ArrowStyle::DoubleThin;
-    const qreal headLen = arrowHeadLength(thin, large);
-
-    // 笔杆末端半径必须等于箭头三角根部的半宽，否则两者衔接处会有一道台阶
-    // （之前用 penWidth/2，而三角根部是 headLen*0.42，比笔杆宽得多）。
-    // 起点仍是极细，视觉上就是一支笔的收锋。
-    const qreal headHalfWidth = headLen * (thin ? 0.32 : 0.42);
-    const qreal thickR = qMax<qreal>(1.0, headHalfWidth);
-    const qreal thinR = 0.6;
-
-    // 按累计弧长算总长，用于插值
-    QVector<qreal> accLen(pts.size(), 0.0);
-    for (int i = 1; i < pts.size(); ++i)
-        accLen[i] = accLen[i - 1] + QLineF(pts.at(i - 1), pts.at(i)).length();
-    const qreal total = accLen.last();
-    if (total < 0.5)
-        return;
-
-    // 逐个线段生成梯形：起点/终点半径按"靠近哪个箭头端"取
-    p->save();
-    p->setPen(Qt::NoPen);
-    p->setBrush(m_color);
-    p->setRenderHint(QPainter::Antialiasing, true);
-
-    for (int i = 1; i < pts.size(); ++i) {
-        const QPointF a = pts.at(i - 1);
-        const QPointF b = pts.at(i);
-        const qreal segLen = QLineF(a, b).length();
-        if (segLen < 0.01)
-            continue;
-
-        // s ∈ [0,1]：沿整条线进度
-        const qreal s0 = accLen.at(i - 1) / total;
-        const qreal s1 = accLen.at(i) / total;
-
-        const auto radiusAt = [&](qreal s) {
-            if (!doubleHeaded)
-                return thinR + (thickR - thinR) * s;   // 尾→头 渐粗
-            // 双向：两端都粗，中间细
-            return thinR + (thickR - thinR) * qAbs(2.0 * s - 1.0);
-        };
-
-        const qreal r0 = radiusAt(s0);
-        const qreal r1 = radiusAt(s1);
-
-        const QPointF dir = (b - a) / segLen;
-        const QPointF n(-dir.y(), dir.x());
-
-        QPolygonF quad;
-        quad << a + n * r0 << b + n * r1 << b - n * r1 << a - n * r0;
-        p->drawPolygon(quad);
+    // 三档的差异只在比例上
+    qreal headLenF, barbHalfF, shaftHalfF, barbBackF;
+    if (m_arrowStyle == ArrowStyle::TaperedThin) {
+        headLenF = 4.0;  barbHalfF = 1.45; shaftHalfF = 0.62; barbBackF = 0.75;
+    } else if (m_arrowStyle == ArrowStyle::DeepBarb) {
+        headLenF = 3.4;  barbHalfF = 1.80; shaftHalfF = 0.70; barbBackF = 0.55;
+    } else {   // Tapered 标准
+        headLenF = 3.2;  barbHalfF = 1.70; shaftHalfF = 0.75; barbBackF = 0.90;
     }
 
-    // 根部和箭头三角之间不要额外画圆去"补缝"：
-    // 那个圆半径是 thickR，比三角根部还宽，会在箭头后面鼓出一个包。
-    // 三角本身和笔杆在 base 处宽度一致，交叠绘制已经足够闭合。
+    const qreal w = qMax<qreal>(1.0, m_penWidth);
 
+    // ---- 箭头区（从最后一个点往前量）：三点定位 ----
+    const QPointF tip = pts.last();
+    QPointF back = pts.at(pts.size() - 2);          // 指向 tip 的方向
+    QLineF axis(back, tip);
+    qreal axisLen = axis.length();
+    if (axisLen < 0.5)
+        return;
+
+    const qreal headLen = headLenF * w;
+    const qreal barbHalf = barbHalfF * w;
+    const qreal shaftHalf = shaftHalfF * w;
+    const qreal barbBack = barbBackF * w;
+
+    // 线太短时整体按比例缩小，避免箭头比线还长
+    const qreal shrink = qMin<qreal>(1.0, axisLen / (headLen + 1.0));
+    const qreal hLen = headLen * shrink;
+    const qreal bh = barbHalf * shrink;
+    const qreal sh = shaftHalf * shrink;
+    const qreal bb = barbBack * shrink;
+
+    const QPointF dir = (tip - back) / axisLen;
+    const QPointF normal(-dir.y(), dir.x());
+
+    const QPointF barbTip = tip - dir * hLen;        // 倒刺尖的 x 位置
+    const QPointF shaftEnd = barbTip + dir * bb;     // 笔杆结束（倒刺后伸）
+    const QPointF start = pts.first();
+
+    // 起点：半宽≈0.5px 的平头
+    const qreal startHalf = 0.5;
+
+    // ---- 线身：起点→笔杆结束 用二次曲线渐变宽度 ----
+    // 用采样点沿轴插值宽度，保证是"锥形"而不是两段直线
+    constexpr int kSamples = 24;
+    QVector<QPointF> upper, lower;
+    upper.reserve(kSamples + 4);
+    lower.reserve(kSamples + 4);
+
+    for (int i = 0; i <= kSamples; ++i) {
+        const qreal t = qreal(i) / kSamples;
+        const QPointF center = start + (shaftEnd - start) * t;
+
+        // 宽度曲线：ease-in，越到箭头越粗（锥形收锋感）
+        const qreal k = t * t * (3.0 - 2.0 * t);   // smoothstep
+        const qreal half = startHalf + (sh - startHalf) * k;
+
+        upper.append(center + normal * half);
+        lower.append(center - normal * half);
+    }
+
+    // ---- 组装闭合路径 ----
+    QPainterPath path;
+    path.moveTo(upper.first());
+    for (int i = 1; i < upper.size(); ++i)
+        path.lineTo(upper.at(i));
+
+    path.lineTo(barbTip + normal * bh);   // 上侧倒刺尖
+    path.lineTo(tip);                     // 尖端
+    path.lineTo(barbTip - normal * bh);   // 下侧倒刺尖
+
+    for (int i = lower.size() - 1; i >= 0; --i)
+        path.lineTo(lower.at(i));
+
+    path.closeSubpath();
+
+    p->save();
+    p->setRenderHint(QPainter::Antialiasing, true);
+    p->setPen(Qt::NoPen);
+    p->setBrush(m_color);
+    p->drawPath(path);
     p->restore();
 }
 
@@ -168,11 +207,16 @@ void LineShape::paintContent(QPainter *p) const
         return;
 
     const bool isArrow = (m_kind == Kind::Arrow);
-    const bool thin = m_arrowStyle == ArrowStyle::SingleThin
-                      || m_arrowStyle == ArrowStyle::DoubleThin;
-    const bool large = m_arrowStyle == ArrowStyle::SingleLarge;
-    const bool doubleHeaded = m_arrowStyle == ArrowStyle::Double
-                              || m_arrowStyle == ArrowStyle::DoubleThin;
+    const bool doubleHeaded = m_arrowStyle == ArrowStyle::Double;
+
+    // 锥形倒刺档位：整条箭头就是一个闭合填充路径，不走"笔杆+三角"两段绘制
+    if (isArrow && isTaperedStyle()) {
+        drawTaperedArrow(p, m_points);
+        return;
+    }
+
+    const bool thin = false;    // 旧档位（单头/双头）只有常规比例
+    const bool large = false;
 
     // 需要画箭头的两端：0 = 起点，末尾 = 终点
     QVector<QPointF> pts = m_points;
@@ -202,23 +246,17 @@ void LineShape::paintContent(QPainter *p) const
         }
     }
 
-    if (isArrow) {
-        // 箭头笔杆画成"从起点极细 → 箭头处最粗"的锥形，
-        // 这是 Snipaste 箭头的观感：整支箭头像一支笔的收锋。
-        // 实心多边形比可变宽度的 QPen 更干净，也不会出现接缝。
-        drawTaperedArrowShaft(p, pts, thin, large);
-    } else {
-        p->setBrush(Qt::NoBrush);
-        p->setPen(QPen(m_color, m_penWidth, m_penStyle, Qt::RoundCap, Qt::RoundJoin));
+    // 等宽笔杆（普通直线/折线，以及单头/双头箭头的线身）
+    p->setBrush(Qt::NoBrush);
+    p->setPen(QPen(m_color, m_penWidth, m_penStyle, Qt::RoundCap, Qt::RoundJoin));
 
-        if (pts.size() == 2) {
-            p->drawLine(pts.first(), pts.last());
-        } else {
-            QPainterPath path(pts.first());
-            for (int i = 1; i < pts.size(); ++i)
-                path.lineTo(pts.at(i));
-            p->drawPath(path);
-        }
+    if (pts.size() == 2) {
+        p->drawLine(pts.first(), pts.last());
+    } else {
+        QPainterPath path(pts.first());
+        for (int i = 1; i < pts.size(); ++i)
+            path.lineTo(pts.at(i));
+        p->drawPath(path);
     }
 
     if (!isArrow)

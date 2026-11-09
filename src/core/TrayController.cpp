@@ -96,13 +96,23 @@ void TrayController::setHotkeyHint(const QString &captureHotkey)
     if (!m_tray)
         return;
 
-    // 托盘悬停提示：第一行 名称 + 版本，第二行 截图快捷键。
-    // 版本号从 QCoreApplication 取，避免手写两处不一致。
+    // 托盘悬停提示：名称 + 版本，然后逐行列出常用热键。
+    // 热键都从配置动态读取，用户改过绑定后这里跟着变。
     const QString version = QCoreApplication::applicationVersion();
-    const QString hotkeyText = captureHotkey.isEmpty() ? QStringLiteral("（被占用）")
-                                                       : captureHotkey;
-    m_tray->setToolTip(QStringLiteral("F-Capture %1\n截图快捷键：%2")
-                           .arg(version, hotkeyText));
+    const QString captureText = captureHotkey.isEmpty() ? QStringLiteral("（被占用）")
+                                                        : captureHotkey;
+
+    const auto keyText = [this](const QString &action) {
+        return m_hotkeyConflicts.contains(action)
+                   ? QStringLiteral("（被占用）")
+                   : ConfigManager::instance()->hotkey(action);
+    };
+
+    m_tray->setToolTip(
+        QStringLiteral("F-Capture %1\n截图快捷键：%2\n长截图快捷键：%3\n贴图：%4")
+            .arg(version, captureText,
+                 keyText(QStringLiteral("long-screenshot")),
+                 keyText(QStringLiteral("paste"))));
 }
 
 void TrayController::setHotkeyConflicts(const QSet<QString> &actions)

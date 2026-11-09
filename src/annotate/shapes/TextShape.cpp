@@ -42,11 +42,6 @@ void TextShape::setFontSize(int px)
     m_fontSize = qBound(6, px, 400);
 }
 
-void TextShape::setBoxWidth(qreal w)
-{
-    m_boxWidth = qMax<qreal>(0, w);
-}
-
 // 唯一的排版来源：所有测量和绘制都走这一个 document，保证边界框与实际绘制一致
 QTextDocument *TextShape::createDocument() const
 {
@@ -229,23 +224,37 @@ QVector<QPointF> TextShape::rawHandles() const
     };
 }
 
+void TextShape::beginHandleDrag()
+{
+    // 快照当前状态作为本次拖拽的固定基准。
+    // 关键：不要用"相对当前值再乘比例"，那样每移动 1px 就再乘一次，
+    // 拖几下字号就爆到几百、反向也缩不回去。
+    m_dragBaseFontSize = m_fontSize;
+    m_dragBaseBoxWidth = m_boxWidth;
+    m_dragBaseRect = layoutRect();
+    m_hasDragBaseline = true;
+}
+
 void TextShape::moveHandleRaw(int index, const QPointF &pos)
 {
-    const QRectF r = layoutRect();
+    if (!m_hasDragBaseline)
+        beginHandleDrag();
+
+    const QRectF r = m_dragBaseRect;
     if (r.width() <= 0 || r.height() <= 0)
         return;
 
     switch (index) {
-    // 左右边：只改宽度，字号不变（宽了就自动换行）
+    // 左右边：改文本框宽度（超出宽度后自动换行），字号不变。
+    // 左拉宽 / 右拉窄都支持；最小 40px，避免缩成一条线。
     case 3:
     case 7: {
         const qreal w = (index == 3) ? pos.x() - m_pos.x() : m_pos.x() - pos.x();
-        if (w > 20)
-            m_boxWidth = w;
+        m_boxWidth = qMax<qreal>(40, w);
         return;
     }
 
-    // 角 + 上下边：按对角/对边的等比距离缩字号
+    // 角 + 上下边：相对固定锚点做等比缩字号，比例可大于也可小于 1
     default: {
         const QPointF anchor = [&]() -> QPointF {
             switch (index) {
@@ -259,15 +268,18 @@ void TextShape::moveHandleRaw(int index, const QPointF &pos)
             }
         }();
 
+        // 用"离锚点多远"的比值：往外拖 >1 放大，往里拖 <1 缩小。
+        // 基准固定为拖拽开始时的矩形，因此过程线性、可反向。
         const qreal before = QLineF(anchor, r.center()).length();
         const qreal after = QLineF(anchor, pos).length();
         if (before < 1.0 || after < 1.0)
             return;
 
         const qreal factor = after / before;
-        m_fontSize = qBound(6, qRound(m_fontSize * factor), 400);
-        if (m_boxWidth > 0)
-            m_boxWidth = qMax<qreal>(20, m_boxWidth * factor);
+        const int size = qBound(6, qRound(m_dragBaseFontSize * factor), 400);
+        m_fontSize = size;
+        if (m_dragBaseBoxWidth > 0)
+            m_boxWidth = qMax<qreal>(20, m_dragBaseBoxWidth * factor);
         return;
     }
     }

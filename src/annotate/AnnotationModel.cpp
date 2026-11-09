@@ -161,8 +161,8 @@ void AnnotationModel::render(QPainter *p, const QRectF &clip) const
 
     if (!hasEraser) {
         for (const auto &shape : m_shapes) {
-            if (!shape)
-                continue;
+            if (!shape || shape->isEditing())
+                continue;   // 正在原地编辑的文字：由输入框显示，避免重叠
             p->save();
             shape->paint(p);
             p->restore();
@@ -191,8 +191,8 @@ void AnnotationModel::render(QPainter *p, const QRectF &clip) const
         lp.translate(-layerRect.topLeft());
 
         for (const auto &shape : m_shapes) {
-            if (!shape)
-                continue;
+            if (!shape || shape->isEditing())
+                continue;   // 正在原地编辑的文字：由输入框显示，避免重叠
             lp.save();
             shape->paint(&lp);
             lp.restore();

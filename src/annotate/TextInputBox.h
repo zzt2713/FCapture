@@ -27,9 +27,8 @@ public:
     QString text() const;
     QPoint  anchorPos() const { return m_anchor; }
     int     fontSize() const { return m_fontSize; }
-    // 输入框实际排版宽度（0 = 未换行）。落定成标注时要带上，
-    // 否则多行文本会按"不换行"重新排一次，宽度和输入时不一致。
-    qreal   layoutWidth() const { return m_lastEditWidth; }
+    // 外部改字号（工具栏调粗细时同步输入框），与滚轮等效
+    void    setFontSize(int px);
 
 signals:
     void committed(const QString &text);
@@ -64,7 +63,7 @@ private:
     int        m_lastBoxH = -1;
     bool       m_relayoutPending = false;   // 合并同一轮事件循环里的重排请求
 
-    QColor     m_color = QColor(0xFF, 0x4A, 0x4A);
+    QColor     m_color = QColor(0xED, 0x1C, 0x24);
     bool       m_done = false;
     bool       m_hasFocusOnce = false;
 };

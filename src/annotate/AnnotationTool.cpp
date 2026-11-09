@@ -1,5 +1,7 @@
 #include "annotate/AnnotationTool.h"
 
+#include <algorithm>
+
 #include "core/ConfigManager.h"
 
 #include <QStringList>
@@ -42,7 +44,7 @@ ToolStyleStore *ToolStyleStore::instance()
 
 ToolStyleStore::ToolStyleStore()
 {
-    const QColor red(0xFF, 0x4A, 0x4A);
+    const QColor red(0xED, 0x1C, 0x24);
     const QColor yellow(0xFF, 0xD6, 0x0A);
 
     auto make = [&](const QColor &c, int w, int level = 2) {
@@ -53,24 +55,25 @@ ToolStyleStore::ToolStyleStore()
         return s;
     };
 
+    // 默认笔宽统一 4px（档位 1 = penSizes[1] = 4），文字工具默认 16px（档位 4）
     m_styles[int(Tool::Rectangle)] = make(red, 4, 1);
     m_styles[int(Tool::Ellipse)]   = make(red, 4, 1);
     m_styles[int(Tool::Line)]      = make(red, 4, 1);
     m_styles[int(Tool::Arrow)]     = make(red, 4, 1);
     m_styles[int(Tool::Polyline)]  = make(red, 4, 1);
-    m_styles[int(Tool::Pencil)]    = make(red, 6, 2);
-    m_styles[int(Tool::Marker)]    = make(QColor(yellow.red(), yellow.green(), yellow.blue(), 100), 12, 4);
+    m_styles[int(Tool::Pencil)]    = make(red, 4, 1);
+    m_styles[int(Tool::Marker)]    = make(QColor(yellow.red(), yellow.green(), yellow.blue(), 100), 4, 1);
     m_styles[int(Tool::Text)]      = make(red, 16, 4);
-    m_styles[int(Tool::Mosaic)]    = make(QColor(0x3D, 0x8B, 0xFD), 12, 4);
-    m_styles[int(Tool::Blur)]      = make(QColor(0x3D, 0x8B, 0xFD), 12, 4);
-    m_styles[int(Tool::Eraser)]    = make(QColor(0xFF, 0xFF, 0xFF), 20, 4);
+    m_styles[int(Tool::Mosaic)]    = make(QColor(0x3D, 0x8B, 0xFD), 4, 1);
+    m_styles[int(Tool::Blur)]      = make(QColor(0x3D, 0x8B, 0xFD), 4, 1);
+    m_styles[int(Tool::Eraser)]    = make(QColor(0xFF, 0xFF, 0xFF), 4, 1);
     m_styles[int(Tool::Number)]    = make(red, 4, 1);
-    m_styles[int(Tool::Magnify)]   = make(red, 2, 0);
+    m_styles[int(Tool::Magnify)]   = make(red, 4, 1);
 }
 
 ToolStyle ToolStyleStore::style(Tool tool) const
 {
-    return m_styles.value(int(tool), ToolStyle{QColor(0xFF, 0x4A, 0x4A), 4});
+    return m_styles.value(int(tool), ToolStyle{QColor(0xED, 0x1C, 0x24), 4});
 }
 
 void ToolStyleStore::setStyle(Tool tool, const ToolStyle &s)
@@ -202,7 +205,11 @@ void ToolStyleStore::load()
             continue;
 
         ToolStyle s = m_styles[int(tool)];
-        const QColor c(parts.at(0));
+        QColor c(parts.at(0));
+        // 迁移：旧默认红 #FF4A4A → 新默认红 #ED1C24。
+        // 只改这一种颜色，用户自己选过的其他颜色原样保留。
+        if (c.isValid() && c.rgb() == QColor(0xFF, 0x4A, 0x4A).rgb() && c.alpha() == 255)
+            c = QColor(0xED, 0x1C, 0x24);
         if (c.isValid())
             s.color = c;
         s.penWidth = qMax(1, parts.at(1).toInt());
@@ -213,6 +220,26 @@ void ToolStyleStore::load()
             const QStringList sizes = parts.at(3).split(QLatin1Char('|'));
             for (int i = 0; i < kPenLevels && i < sizes.size(); ++i)
                 s.penSizes.at(i) = qBound(1, sizes.at(i).toInt(), 400);
+
+            // 档位必须从小到大排列（滚轮微调只改某一档的像素值，
+            // 长期使用后会出现 2|4|17|10|16 这种乱序）。
+            // 排序后把当前档位重定向到它原来的像素值，避免选中的粗细跳变。
+            const int activeValue = s.penSizes.at(qBound(0, s.penLevel, kPenLevels - 1));
+            auto sorted = s.penSizes;
+            std::sort(sorted.begin(), sorted.end());
+            if (sorted != s.penSizes) {
+                s.penSizes = sorted;
+                int nearest = 0;
+                int best = qAbs(sorted.at(0) - activeValue);
+                for (int i = 1; i < kPenLevels; ++i) {
+                    const int d = qAbs(sorted.at(i) - activeValue);
+                    if (d < best) {
+                        best = d;
+                        nearest = i;
+                    }
+                }
+                s.penLevel = nearest;
+            }
         }
         if (parts.size() > 4)
             s.penStyle = Qt::PenStyle(parts.at(4).toInt());

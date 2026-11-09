@@ -2,37 +2,54 @@
 
 #include "annotate/Palette.h"
 #include "ui/AppMenu.h"
+#include "ui/ElaColorPickerDialog.h"
+#include "ui/ElaSliderFactory.h"
 #include "ui/Theme.h"
 #include "ui/ToolIcons.h"
 
-#include <QColorDialog>
 #include <QContextMenuEvent>
+#include <QCursor>
 #include <QFileDialog>
 #include <QGuiApplication>
 #include <QInputDialog>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QScreen>
+#include <QSlider>
 #include <QTimer>
 #include <QToolTip>
 #include <QWheelEvent>
 
 namespace {
 
-const Tool kTools[] = {
-    Tool::Rectangle, Tool::Ellipse, Tool::Line, Tool::Arrow, Tool::Polyline, Tool::Pencil,
-    Tool::Marker, Tool::Text, Tool::Mosaic, Tool::Blur, Tool::Eraser, Tool::Number,
-    Tool::Magnify, Tool::Lasso
+// 工具组：多个工具共用一个按钮（长按 / 右键展开），减少工具栏宽度。
+// 每组第一个是默认成员。
+struct ToolGroup
+{
+    Tool members[3];
+    int  count;
 };
+
+const ToolGroup kToolGroups[] = {
+    {{Tool::Rectangle, Tool::Ellipse,     Tool::None}, 2},   // 形状
+    {{Tool::Line,      Tool::Arrow,       Tool::Polyline}, 3}, // 直线/箭头/折线
+    {{Tool::Pencil,    Tool::Marker,      Tool::None}, 2},   // 手绘
+    {{Tool::Text,      Tool::None,        Tool::None}, 1},
+    {{Tool::Mosaic,    Tool::Blur,        Tool::None}, 2},   // 像素处理
+    {{Tool::Eraser,    Tool::None,        Tool::None}, 1},   // 橡皮擦（独立）
+    {{Tool::Number,    Tool::Magnify,     Tool::Lasso}, 3},  // 序号/放大镜/套索
+};
+constexpr int kToolGroupCount = int(sizeof(kToolGroups) / sizeof(kToolGroups[0]));
 
 // 虚线样式按钮对应的 PenStyle，顺序与按钮组一致
 constexpr Qt::PenStyle kPenStyles[] = {
     Qt::SolidLine, Qt::DashLine, Qt::DotLine, Qt::DashDotLine
 };
 
-// 箭头样式按钮的提示文字
+// 箭头样式按钮的提示文字（与 LineShape::ArrowStyle 一一对应）
 const char *kArrowStyleNames[] = {
-    "单头", "双头", "细单头", "细双头", "大单头"
+    "单头", "双头", "锥形倒刺", "细长锥形倒刺", "深倒刺"
 };
 
 enum ActionId {
@@ -43,8 +60,7 @@ enum ActionId {
     ActSave,
     ActPin,
     ActSendTo,
-    ActOcr,
-    ActBarcode,
+    ActRecognize,   // 识别：OCR + 二维码/条码，二选一菜单
     ActClose,
     ActModeToggle = 100,
     ActColorCustom = 200
@@ -64,6 +80,10 @@ PaintBar::PaintBar(QWidget *parent)
     ToolStyleStore::instance()->load();
 
     m_tool = Tool::None;
+    // 每组默认成员
+    for (int g = 0; g < kToolGroupCount; ++g)
+        m_groupActive[g] = kToolGroups[g].members[0];
+
     rebuildLayout();
     resize(sizeHint());
 
@@ -184,16 +204,21 @@ void PaintBar::rebuildLayout()
     const int rowY = kPadding;
     int x = kPadding;
 
-    for (int i = 0; i < kToolCount; ++i) {
+    // 每组只占一个按钮：显示该组当前选中的工具
+    for (int g = 0; g < kToolGroupCount; ++g) {
         Button b;
         b.kind = Button::Kind::Tool;
-        b.tool = kTools[i];
+        b.group = g;
+        b.tool = m_groupActive[g];
         b.rect = QRect(x, rowY, kButtonSize, kButtonSize);
         m_buttons.append(b);
         x += kButtonSize + kGap;
     }
 
     const int toolsRowWidth = x - kGap + kPadding;
+
+    m_expandedGroup = activeToolGroup();
+    m_memberRowHeight = 0;   // 成员条已并入第二行，不再单独占一行
 
     struct Act { int id; bool enabled; };
     // 最右一组固定为 关闭 / 钉子 / 保存 / 复制（从左到右，复制贴右缘）
@@ -202,8 +227,7 @@ void PaintBar::rebuildLayout()
         {ActRedo, m_canRedo},
         {ActClear, true},
         {ActSendTo, true},
-        {ActOcr, true},
-        {ActBarcode, true},
+        {ActRecognize, true},
         {ActClose, true},
         {ActPin, true},
         {ActSave, true},
@@ -231,6 +255,17 @@ void PaintBar::rebuildLayout()
 
     int propWidth = kPadding;
     if (hasProps) {
+        // 成员条宽度（与下面布局保持一致）
+        int memberW = 0;
+        const int eg = activeToolGroup();
+        if (eg >= 0 && groupHasMembers(eg)) {
+            int cnt = 0;
+            for (int i = 0; i < kToolGroups[eg].count; ++i)
+                if (kToolGroups[eg].members[i] != Tool::None)
+                    ++cnt;
+            memberW = cnt * (kMemberSize + kGap) + (kSeparatorGap - kGap);
+        }
+        propWidth += memberW;
         if (showColors && colorCount > 0)
             propWidth += colorCount * (kColorDotSize + kGap) + 18 + kGap + kSeparatorGap;
         if (m_penStyleVisible)
@@ -238,7 +273,7 @@ void PaintBar::rebuildLayout()
         if (m_arrowStyleVisible)
             propWidth += kArrowStyleCount * (kStyleBtnSize + kGap) + (kSeparatorGap - kGap);
         if (m_sliderVisible)
-            propWidth += kSliderWidth + 24 + kGap;
+            propWidth += kSliderWidth + kSliderValueWidth + kGap + kSeparatorGap;
         if (m_modeButtonVisible)
             propWidth += kButtonSize + kGap + (kSeparatorGap - kGap);
         propWidth += kPadding - kGap;
@@ -268,6 +303,26 @@ void PaintBar::rebuildLayout()
     if (hasProps) {
         int px = kPadding;
         const int propY = kPadding + kButtonSize + kRowGap;
+
+        // 组成员条放在第二行最左侧（不再单独占一行）
+        int memberBlockWidth = 0;
+        if (m_expandedGroup >= 0 && groupHasMembers(m_expandedGroup)) {
+            const ToolGroup &g = kToolGroups[m_expandedGroup];
+            const int memberY = propY + (kButtonSize - kMemberSize) / 2;
+            for (int i = 0; i < g.count; ++i) {
+                if (g.members[i] == Tool::None)
+                    continue;
+                Button mb;
+                mb.kind = Button::Kind::ToolMember;
+                mb.group = m_expandedGroup;
+                mb.tool = g.members[i];
+                mb.rect = QRect(px, memberY, kMemberSize, kMemberSize);
+                m_buttons.append(mb);
+                px += kMemberSize + kGap;
+            }
+            memberBlockWidth = px - kPadding;
+            px += kSeparatorGap - kGap;   // 成员条与颜色区之间留间隔
+        }
 
         if (showColors && colorCount > 0) {
             const QVector<QColor> &colors = Palette::instance()->colors();
@@ -319,11 +374,12 @@ void PaintBar::rebuildLayout()
         }
 
         if (m_sliderVisible) {
+            px += kSeparatorGap - kGap;   // 与前面颜色/线型区拉开距离
             Button b;
             b.kind = Button::Kind::PenSlider;
             b.rect = QRect(px, propY + (kButtonSize - 16) / 2, kSliderWidth, 16);
             m_buttons.append(b);
-            px += kSliderWidth + 24 + kGap;
+            px += kSliderWidth + kSliderValueWidth + kGap;
         }
 
         if (m_modeButtonVisible) {
@@ -340,7 +396,7 @@ void PaintBar::rebuildLayout()
     // ---- 第三行：5 档笔宽 ----
     if (m_penLevelRowVisible) {
         int px = kPadding;
-        const int levelY = kPadding + kButtonSize + kRowGap
+        const int levelY = kPadding + kButtonSize + kRowGap + m_memberRowHeight
                            + (m_propRowVisible ? kButtonSize + kRowGap : 0);
         for (int i = 0; i < kPenLevels; ++i) {
             Button b;
@@ -354,11 +410,12 @@ void PaintBar::rebuildLayout()
     }
 
     const int rows = (m_propRowVisible ? 1 : 0) + (m_penLevelRowVisible ? 1 : 0);
-    const int totalHeight = kPadding * 2 + kButtonSize
+    const int totalHeight = kPadding * 2 + kButtonSize + m_memberRowHeight
                             + rows * (kRowGap + kButtonSize)
                             + kTooltipArea;
 
     setFixedSize(totalWidth, totalHeight);
+    syncPenSliderGeometry();
 }
 
 void PaintBar::positionNear(const QRect &selectionLocalRect)
@@ -417,9 +474,7 @@ void PaintBar::mousePressEvent(QMouseEvent *e)
     const Button &b = m_buttons.at(idx);
 
     if (b.kind == Button::Kind::PenSlider) {
-        m_draggingSlider = true;
-        updatePenSliderDrag(pos.x());
-        update();
+        // 滑块是真实子控件，鼠标事件由它自己处理
         return;
     }
 
@@ -517,7 +572,9 @@ void PaintBar::mouseReleaseEvent(QMouseEvent *e)
     if (idx >= 0 && idx == m_pressedIndex) {
         const Button &b = m_buttons.at(idx);
 
-        if (b.kind == Button::Kind::Tool && b.tool != Tool::None) {
+        if (b.kind == Button::Kind::ToolMember) {
+            setToolFromGroup(b.group, b.tool);
+        } else if (b.kind == Button::Kind::Tool && b.tool != Tool::None) {
             toggleTool(b.tool);
         } else if (b.kind == Button::Kind::ColorDot) {
             if (b.actionId == ActColorCustom) {
@@ -542,11 +599,13 @@ void PaintBar::mouseReleaseEvent(QMouseEvent *e)
             ToolStyle ns = ToolStyleStore::instance()->style(m_tool);
             ns.penStyle = kPenStyles[b.index];
             ToolStyleStore::instance()->setStyle(m_tool, ns);
+            emit styleChanged();
             update();
         } else if (b.kind == Button::Kind::ArrowStyle) {
             ToolStyle ns = ToolStyleStore::instance()->style(Tool::Arrow);
             ns.arrowStyle = b.index;
             ToolStyleStore::instance()->setStyle(Tool::Arrow, ns);
+            emit styleChanged();
             update();
         } else if (b.kind == Button::Kind::Action && b.enabled) {
             switch (b.actionId) {
@@ -557,8 +616,7 @@ void PaintBar::mouseReleaseEvent(QMouseEvent *e)
             case ActSave:  emit saveRequested(); break;
             case ActPin:   emit pinRequested(); break;
             case ActSendTo: emit sendToRequested(); break;
-            case ActOcr:    emit ocrRequested(); break;
-            case ActBarcode: emit barcodeRequested(); break;
+            case ActRecognize: showRecognizeMenu(QCursor::pos()); break;
             case ActClose: emit closeRequested(); break;
             case ActModeToggle: toggleRectMode(); break;
             default: break;
@@ -581,12 +639,17 @@ void PaintBar::mouseDoubleClickEvent(QMouseEvent *e)
 void PaintBar::contextMenuEvent(QContextMenuEvent *e)
 {
     const int idx = hitButton(e->pos());
-    if (idx < 0 || m_tool == Tool::None) {
+    if (idx < 0) {
         e->ignore();
         return;
     }
 
     const Button &b = m_buttons.at(idx);
+
+    if (b.kind == Button::Kind::Tool && m_tool == Tool::None) {
+        e->ignore();
+        return;
+    }
 
     if (b.kind == Button::Kind::Tool
         && (b.tool == Tool::Rectangle || b.tool == Tool::Ellipse))
@@ -605,6 +668,68 @@ void PaintBar::contextMenuEvent(QContextMenuEvent *e)
         showPaletteContextMenu(e->globalPos());
     else
         e->ignore();
+}
+
+// 组内工具切换菜单（Ela 暗色/亮色自动跟随全局主题）
+void PaintBar::showToolGroupMenu(int groupIndex, const QPoint &globalPos)
+{
+    if (groupIndex < 0 || groupIndex >= kToolGroupCount)
+        return;
+
+    const ToolGroup &g = kToolGroups[groupIndex];
+    AppMenu::Menu menu(this);
+
+    for (int i = 0; i < g.count; ++i) {
+        const Tool t = g.members[i];
+        if (t == Tool::None)
+            continue;
+        QAction *a = menu->addAction(ToolStyleStore::toolName(t));
+        a->setCheckable(true);
+        a->setChecked(m_groupActive[groupIndex] == t);
+        connect(a, &QAction::triggered, this,
+                [this, groupIndex, t]() { setToolFromGroup(groupIndex, t); });
+    }
+
+    menu->exec(globalPos);
+}
+
+int PaintBar::activeToolGroup() const
+{
+    if (m_tool == Tool::None)
+        return -1;
+    for (int g = 0; g < kToolGroupCount; ++g) {
+        for (int i = 0; i < kToolGroups[g].count; ++i) {
+            if (kToolGroups[g].members[i] == m_tool)
+                return g;
+        }
+    }
+    return -1;
+}
+
+bool PaintBar::groupHasMembers(int groupIndex) const
+{
+    return groupIndex >= 0 && groupIndex < kToolGroupCount
+           && kToolGroups[groupIndex].count > 1;
+}
+
+void PaintBar::showRecognizeMenu(const QPoint &globalPos)
+{
+    AppMenu::Menu menu(this);
+    QAction *ocr = menu->addAction(QStringLiteral("识别文字（OCR）"));
+    connect(ocr, &QAction::triggered, this, [this]() { emit ocrRequested(); });
+
+    QAction *code = menu->addAction(QStringLiteral("识别二维码 / 条码"));
+    connect(code, &QAction::triggered, this, [this]() { emit barcodeRequested(); });
+
+    menu->exec(globalPos);
+}
+
+void PaintBar::setToolFromGroup(int groupIndex, Tool tool)
+{
+    if (groupIndex < 0 || groupIndex >= kToolGroupCount)
+        return;
+    m_groupActive[groupIndex] = tool;
+    setTool(tool);   // setTool 内部会重建布局并按新工具重画
 }
 
 void PaintBar::leaveEvent(QEvent *e)
@@ -768,9 +893,9 @@ void PaintBar::showArrowStyleMenu(const QPoint &pos)
     const Item items[] = {
         { "单头箭头  →", 0 },
         { "双头箭头  ↔", 1 },
-        { "细单头箭头", 2 },
-        { "细双头箭头", 3 },
-        { "大单头箭头", 4 }
+        { "锥形倒刺箭头", 2 },
+        { "细长锥形倒刺箭头", 3 },
+        { "深倒刺箭头", 4 }
     };
 
     for (const Item &it : items) {
@@ -784,6 +909,7 @@ void PaintBar::showArrowStyleMenu(const QPoint &pos)
             update();
         });
     }
+
     menu->exec(pos);
 }
 
@@ -867,9 +993,8 @@ void PaintBar::showTextStyleMenu(const QPoint &pos)
         if (ns.textBg.alpha() > 0) {
             ns.textBg = Qt::transparent;
         } else {
-            const QColor c = QColorDialog::getColor(QColor(0, 0, 0, 160), this,
-                                                    QStringLiteral("文字背景色"),
-                                                    QColorDialog::ShowAlphaChannel);
+            const QColor c = ElaColorPickerDialog::getColor(QColor(0, 0, 0, 160), this,
+                                                          QStringLiteral("文字背景色"), true);
             if (!c.isValid())
                 return;
             ns.textBg = c;
@@ -886,8 +1011,8 @@ void PaintBar::showTextStyleMenu(const QPoint &pos)
         if (ns.textOutline) {
             ns.textOutline = false;
         } else {
-            const QColor c = QColorDialog::getColor(ns.textOutlineColor, this,
-                                                    QStringLiteral("描边颜色"));
+            const QColor c = ElaColorPickerDialog::getColor(ns.textOutlineColor, this,
+                                                          QStringLiteral("描边颜色"));
             if (!c.isValid())
                 return;
             ns.textOutline = true;
@@ -935,16 +1060,15 @@ void PaintBar::showPaletteContextMenu(const QPoint &pos)
     AppMenu::Menu menu(this);
 
     QAction *edit = menu->addAction(QStringLiteral("编辑当前颜色…"));
-    connect(edit, &QAction::triggered, this, [this]() { openColorDialog(); });
+    connect(edit, &QAction::triggered, this, [this]() { openColorDialog(true); });
 
     // 编辑鼠标指向的那个色点（双击编辑已移除，防误触）
     if (m_activeColorIndex >= 0) {
         QAction *editDot = menu->addAction(QStringLiteral("编辑色点 %1…").arg(m_activeColorIndex + 1));
         connect(editDot, &QAction::triggered, this, [this]() {
             const int idx = m_activeColorIndex;
-            const QColor chosen = QColorDialog::getColor(Palette::instance()->at(idx), this,
-                                                         QStringLiteral("编辑颜色"),
-                                                         QColorDialog::ShowAlphaChannel);
+            const QColor chosen = ElaColorPickerDialog::getColor(Palette::instance()->at(idx), this,
+                                                               QStringLiteral("编辑颜色"), true);
             if (!chosen.isValid())
                 return;
             Palette::instance()->setColorAt(idx, chosen);
@@ -957,8 +1081,7 @@ void PaintBar::showPaletteContextMenu(const QPoint &pos)
 
     QAction *add = menu->addAction(QStringLiteral("添加颜色…"));
     connect(add, &QAction::triggered, this, [this]() {
-        const QColor c = QColorDialog::getColor(Qt::white, this, QStringLiteral("添加颜色"),
-                                                QColorDialog::ShowAlphaChannel);
+        const QColor c = ElaColorPickerDialog::getColor(Qt::white, this, QStringLiteral("添加颜色"), true);
         if (c.isValid()) {
             Palette::instance()->insertColor(Palette::instance()->count(), c);
             rebuildLayout();
@@ -1060,45 +1183,104 @@ void PaintBar::swapPaletteColors(int from, int to)
     update();
 }
 
-void PaintBar::openColorDialog()
+void PaintBar::openColorDialog(bool editPaletteDot)
 {
-    if (m_tool == Tool::None)
-        return;
     const QColor initial = currentColor();
-    const QColor chosen = QColorDialog::getColor(
-        initial, this, QStringLiteral("选择颜色"), QColorDialog::ShowAlphaChannel);
+    const QColor chosen = ElaColorPickerDialog::getColor(
+        initial, this, QStringLiteral("选择颜色"), true);
     if (!chosen.isValid())
         return;
 
-    ToolStyleStore::instance()->setColor(m_tool, chosen);
-    syncColorHighlight();
+    // 没有激活工具时（画完一个图形后会自动复位成 None），
+    // 自定义颜色要写到所有会用到颜色的工具上，否则下一次画仍是旧色
+    if (m_tool == Tool::None) {
+        for (Tool t : {Tool::Rectangle, Tool::Ellipse, Tool::Line, Tool::Arrow,
+                       Tool::Polyline, Tool::Pencil, Tool::Marker, Tool::Text,
+                       Tool::Number}) {
+            ToolStyleStore::instance()->setColor(t, chosen);
+        }
+    } else {
+        ToolStyleStore::instance()->setColor(m_tool, chosen);
+    }
+
+    // 只有「编辑当前颜色」（右键入口）才回写调色板色点。
+    // 点彩虹圆选自定义颜色时不动调色板：那只是给当前工具换个颜色，
+    // 覆盖掉用户调色板里的颜色是错的。
+    if (editPaletteDot && m_activeColorIndex >= 0
+        && m_activeColorIndex < Palette::instance()->count()) {
+        Palette::instance()->setColorAt(m_activeColorIndex, chosen);
+    }
+    if (editPaletteDot) {
+        syncColorHighlight();
+    } else {
+        // 自定义颜色不对应任何色点
+        m_activeColorIndex = -1;
+        rebuildLayout();
+    }
     emit colorChanged(chosen);
     update();
 }
 
 // ---------------------------------------------------------------- 绘制
 
-// 在按钮内画一个迷你箭头，直观区分 5 种箭头样式
+// 在按钮内画一个迷你箭头，直观区分 5 种箭头样式：
+//   0 单头 / 1 双头 = 等宽笔杆 + 实心三角
+//   2 标准 / 3 细长 / 4 深倒刺 = 锥形倒刺闭合路径
 void PaintBar::drawArrowStyleGlyph(QPainter &p, const QRect &r, int styleIndex,
                                    const QColor &color) const
 {
     if (r.width() < 4 || r.height() < 4)
         return;
 
-    const bool thin = (styleIndex == 2 || styleIndex == 3);
-    const bool large = (styleIndex == 4);
-    const bool twoHeads = (styleIndex == 1 || styleIndex == 3);
-
-    const qreal head = large ? r.height() * 0.62 : (thin ? r.height() * 0.30 : r.height() * 0.44);
-    const qreal halfW = head * (thin ? 0.42 : 0.55);
     const qreal y = r.center().y();
     const qreal x1 = r.left();
     const qreal x2 = r.right();
 
     p.save();
     p.setRenderHint(QPainter::Antialiasing);
+    p.setPen(Qt::NoPen);
+    p.setBrush(color);
+
+    if (styleIndex >= 2) {
+        // 锥形倒刺：缩略图里用固定比例画闭合路径（起点细 → 渐粗 → 倒刺 → 尖）
+        qreal headF, barbF, shaftF, backF;
+        if (styleIndex == 3) {        // 细长
+            headF = 0.90; barbF = 0.30; shaftF = 0.10; backF = 0.06;
+        } else if (styleIndex == 4) { // 深倒刺
+            headF = 0.70; barbF = 0.34; shaftF = 0.12; backF = 0.04;
+        } else {                      // 标准
+            headF = 0.72; barbF = 0.32; shaftF = 0.13; backF = 0.07;
+        }
+        const qreal head = r.height() * headF;
+        const qreal barb = r.height() * barbF;
+        const qreal shaft = r.height() * shaftF;
+        const qreal back = r.height() * backF;
+
+        const qreal tipX = x2;
+        const qreal barbX = tipX - head;
+        const qreal shaftEndX = barbX + back;
+
+        QPainterPath path;
+        path.moveTo(x1, y - 0.4);
+        path.lineTo(shaftEndX, y - shaft);
+        path.lineTo(barbX, y - barb);
+        path.lineTo(tipX, y);
+        path.lineTo(barbX, y + barb);
+        path.lineTo(shaftEndX, y + shaft);
+        path.lineTo(x1, y + 0.4);
+        path.closeSubpath();
+        p.drawPath(path);
+        p.restore();
+        return;
+    }
+
+    // 旧档位：等宽笔杆 + 实心三角
+    const bool twoHeads = (styleIndex == 1);
+    const qreal head = r.height() * 0.44;
+    const qreal halfW = head * 0.55;
+
     p.setBrush(Qt::NoBrush);
-    p.setPen(QPen(color, thin ? 1.0 : 1.6, Qt::SolidLine, Qt::FlatCap));
+    p.setPen(QPen(color, 1.6, Qt::SolidLine, Qt::FlatCap));
     p.drawLine(QPointF(x1 + (twoHeads ? head : 0), y), QPointF(x2 - head, y));
 
     p.setPen(Qt::NoPen);
@@ -1120,41 +1302,95 @@ void PaintBar::drawArrowStyleGlyph(QPainter &p, const QRect &r, int styleIndex,
     p.restore();
 }
 
-void PaintBar::drawPenSlider(QPainter &p, const QRect &rect)
+void PaintBar::drawGroupCornerMark(QPainter &p, const QRect &r, bool active) const
 {
+    // 右下角 3px 小三角，颜色与图标一致（激活时白，否则浅灰）
+    const QColor c = active ? QColor(Qt::white) : QColor(0xB0, 0xB0, 0xB0);
+    const int s = 3;
+    const QPointF br(r.right() - 3.5, r.bottom() - 3.5);
+
+    QPolygonF tri;
+    tri << QPointF(br.x() - s, br.y()) << br << QPointF(br.x(), br.y() - s);
+
     p.save();
     p.setRenderHint(QPainter::Antialiasing);
-
-    const bool active = (m_tool != Tool::None);
-    const int w = active ? currentPenWidth() : kPenMin;
-    const qreal t = qreal(w - kPenMin) / qMax(1, kPenMax - kPenMin);
-
-    const int trackY = rect.center().y();
-    const QRectF track(rect.left(), trackY - 1.5, rect.width(), 3);
-    const QRectF filled(rect.left(), trackY - 1.5, rect.width() * t, 3);
-
     p.setPen(Qt::NoPen);
-    p.setBrush(QColor(active ? 0x45 : 0x35, active ? 0x45 : 0x35, active ? 0x45 : 0x35));
-    p.drawRoundedRect(track, 1.5, 1.5);
+    p.setBrush(c);
+    p.drawPolygon(tri);
+    p.restore();
+}
 
-    if (active) {
-        p.setBrush(Theme::kAccent);
-        p.drawRoundedRect(filled, 1.5, 1.5);
+void PaintBar::ensurePenSlider()
+{
+    if (m_penSlider)
+        return;
 
-        const qreal hx = rect.left() + rect.width() * t;
-        p.setPen(QPen(Qt::white, 1.5));
-        p.setBrush(Theme::kAccent);
-        p.drawEllipse(QPointF(hx, trackY), 5.5, 5.5);
+    m_penSlider = ElaSliderFactory::create(Qt::Horizontal, this);
+    m_penSlider->setRange(kPenMin, kPenMax);
+    m_penSlider->setSingleStep(1);
+    m_penSlider->setPageStep(4);
+    m_penSlider->setFocusPolicy(Qt::NoFocus);
+    m_penSlider->setAttribute(Qt::WA_TranslucentBackground);
+
+    connect(m_penSlider, &QSlider::valueChanged, this, [this](int v) {
+        if (!m_penSlider || m_syncingSlider)
+            return;
+        setPenWidthDirect(v);
+    });
+}
+
+// ElaSlider 是子控件，位置/宽度必须跟着布局走；不可见时隐藏
+void PaintBar::syncPenSliderGeometry()
+{
+    if (!m_sliderVisible) {
+        if (m_penSlider)
+            m_penSlider->hide();
+        return;
     }
 
-    QFont f = font();
-    f.setPointSize(7);
-    p.setFont(f);
-    p.setPen(QColor(active ? 0x9A9A9A : 0x5A5A5A));
-    p.drawText(QRect(rect.right() + 2, rect.top(), 22, rect.height()),
-               Qt::AlignLeft | Qt::AlignVCenter,
-               active ? QString::number(w) : QStringLiteral("—"));
+    QRect sliderRect;
+    for (const Button &b : m_buttons) {
+        if (b.kind == Button::Kind::PenSlider) {
+            sliderRect = b.rect;
+            break;
+        }
+    }
+    if (sliderRect.isEmpty()) {
+        if (m_penSlider)
+            m_penSlider->hide();
+        return;
+    }
 
+    ensurePenSlider();
+    // 严格使用布局矩形，不再向外扩展（之前 -kPadding 会压到左侧竖分隔线）。
+    // 高度给足，Ela 滑块自绘轨道需要垂直空间。
+    m_penSlider->setGeometry(sliderRect.adjusted(0, -5, 0, 5));
+
+    if (m_penSlider->value() != currentPenWidth()) {
+        m_syncingSlider = true;
+        m_penSlider->setValue(currentPenWidth());
+        m_syncingSlider = false;
+    }
+    m_penSlider->setEnabled(m_tool != Tool::None);
+    m_penSlider->show();
+    m_penSlider->raise();
+}
+
+void PaintBar::drawPenSlider(QPainter &p, const QRect &rect)
+{
+    // 滑块本体是 ElaSlider 子控件（见 syncPenSliderGeometry），
+    // 这里只画右侧的数值文字，并和「3px」字号保持一致（pointSize 9）
+    const bool active = (m_tool != Tool::None);
+
+    QFont f = font();
+    f.setPointSize(9);
+    p.save();
+    p.setFont(f);
+    p.setPen(QColor(active ? 0x3A3A3A : 0xA0A0A0));
+    p.drawText(QRect(rect.right() + 10, rect.top(), kSliderValueWidth - 10, rect.height()),
+               Qt::AlignLeft | Qt::AlignVCenter,
+               active ? QStringLiteral("%1 px").arg(currentPenWidth())
+                      : QStringLiteral("—"));
     p.restore();
 }
 
@@ -1183,14 +1419,14 @@ void PaintBar::drawPenLevels(QPainter &p)
                    && m_buttons.at(m_hoverIndex).kind == Button::Kind::PenLevel
                    && m_buttons.at(m_hoverIndex).index == b.index) {
             p.setPen(Qt::NoPen);
-            p.setBrush(Theme::kHover);
+            p.setBrush(QColor(kHoverLight));
             p.drawRoundedRect(b.rect.adjusted(-2, -2, 2, 2), 4, 4);
         }
 
         // 圆点大小按档位像素值缩放（1~40 → 2~14）
         const qreal dotR = qBound<qreal>(2.0, 1.5 + px * 0.3, 7.0);
         p.setPen(Qt::NoPen);
-        p.setBrush(active ? QColor(Qt::white) : QColor(0xE8, 0xE8, 0xE8));
+        p.setBrush(active ? QColor(Qt::white) : QColor(kIcon));
         p.drawEllipse(QPointF(b.rect.center()), dotR, dotR);
     }
 
@@ -1199,10 +1435,12 @@ void PaintBar::drawPenLevels(QPainter &p)
     QFont f = font();
     f.setPointSize(7);
     p.setFont(f);
-    p.setPen(QColor(0x9A9A9A));
-    p.drawText(QRect(valueX, kPadding + kButtonSize + kRowGap
+    p.setPen(QColor(0x3A3A3A));
+    f.setPointSize(9);
+    p.setFont(f);
+    p.drawText(QRect(valueX, kPadding + kButtonSize + kRowGap + m_memberRowHeight
                                 + (m_propRowVisible ? kButtonSize + kRowGap : 0),
-                     40, kButtonSize),
+                     44, kButtonSize),
                Qt::AlignLeft | Qt::AlignVCenter,
                QStringLiteral("%1 px").arg(s.penWidth));
 
@@ -1215,6 +1453,9 @@ QString PaintBar::hoverText() const
         return {};
 
     const Button &b = m_buttons.at(m_hoverIndex);
+
+    if (b.kind == Button::Kind::ToolMember)
+        return ToolStyleStore::toolName(b.tool);
 
     if (b.kind == Button::Kind::Tool && b.tool != Tool::None) {
         const ToolStyle s = ToolStyleStore::instance()->style(b.tool);
@@ -1258,8 +1499,7 @@ QString PaintBar::hoverText() const
     case ActSave: return QStringLiteral("保存到文件  Ctrl+S");
     case ActPin: return QStringLiteral("贴到屏幕  Ctrl+T");
     case ActSendTo: return QStringLiteral("发送到其他应用");
-    case ActOcr: return QStringLiteral("识别文字（OCR）");
-    case ActBarcode: return QStringLiteral("识别二维码 / 条码");
+    case ActRecognize: return QStringLiteral("识别文字 / 二维码");
     case ActClose: return QStringLiteral("关闭  Esc");
     case ActModeToggle: return QStringLiteral("切换涂抹 / 矩形选区");
     default: break;
@@ -1286,17 +1526,18 @@ void PaintBar::drawHoverTooltip(QPainter &p)
     x = qBound(2, x, width() - w - 2);
 
     const int rows = (m_propRowVisible ? 1 : 0) + (m_penLevelRowVisible ? 1 : 0);
-    const int y = kPadding * 2 + kButtonSize + rows * (kRowGap + kButtonSize) + 2;
+    const int y = kPadding * 2 + kButtonSize + m_memberRowHeight
+                  + rows * (kRowGap + kButtonSize) + 2;
     const QRect box(x, y, w, h);
 
     p.save();
     p.setRenderHint(QPainter::Antialiasing);
 
-    p.setPen(QPen(QColor(0x4A, 0x4A, 0x4A), 1));
-    p.setBrush(QColor(0x1A, 0x1A, 0x1A, 240));
+    p.setPen(QPen(QColor(kBarBorder), 1));
+    p.setBrush(QColor(kBarBg));
     p.drawRoundedRect(QRectF(box).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
 
-    p.setPen(QColor(0xE8, 0xE8, 0xE8));
+    p.setPen(QColor(kIcon));
     p.drawText(box, Qt::AlignCenter, text);
 
     p.restore();
@@ -1311,21 +1552,22 @@ void PaintBar::paintEvent(QPaintEvent *e)
 
     // 背景高度随可见行数变化（底部留白给悬停提示）
     const int rows = (m_propRowVisible ? 1 : 0) + (m_penLevelRowVisible ? 1 : 0);
-    const int contentH = kPadding * 2 + kButtonSize + rows * (kRowGap + kButtonSize);
+    const int contentH = kPadding * 2 + kButtonSize + m_memberRowHeight
+                         + rows * (kRowGap + kButtonSize);
     const QRectF bg = QRectF(0.5, 0.5, width() - 1.0, contentH - 1.0);
-    p.setPen(QPen(QColor(0x3D, 0x3D, 0x3D), 1));
-    p.setBrush(QColor(0x2B, 0x2B, 0x2B));
+    p.setPen(QPen(QColor(kBarBorder), 1));
+    p.setBrush(QColor(kBarBg));
     p.drawRoundedRect(bg, 6, 6);
 
     // 行分隔线
     auto drawRowSep = [&](int y) {
-        p.setPen(QPen(QColor(0x36, 0x36, 0x36), 1));
+        p.setPen(QPen(QColor(kBarSep), 1));
         p.drawLine(QPoint(kPadding + 2, y), QPoint(width() - kPadding - 2, y));
     };
     if (m_propRowVisible)
-        drawRowSep(kPadding + kButtonSize + kRowGap / 2);
+        drawRowSep(kPadding + kButtonSize + kRowGap / 2 + m_memberRowHeight);
     if (m_penLevelRowVisible && m_propRowVisible)
-        drawRowSep(kPadding + kButtonSize * 2 + kRowGap + kRowGap / 2);
+        drawRowSep(kPadding + kButtonSize * 2 + kRowGap + kRowGap / 2 + m_memberRowHeight);
 
     // 第二行：颜色区与滑块之间的竖分隔线
     if (colorAreaVisible() && m_sliderVisible) {
@@ -1337,9 +1579,9 @@ void PaintBar::paintEvent(QPaintEvent *e)
             }
         }
         if (sliderX > 0) {
-            p.setPen(QPen(QColor(0x40, 0x40, 0x40), 1));
+            p.setPen(QPen(QColor(kBarSepStrong), 1));
             const int sx = sliderX - kSeparatorGap / 2;
-            const int top = kPadding + kButtonSize + kRowGap;
+            const int top = kPadding + kButtonSize + kRowGap + m_memberRowHeight;
             p.drawLine(QPoint(sx, top + 4), QPoint(sx, top + kButtonSize - 4));
         }
     }
@@ -1357,7 +1599,7 @@ void PaintBar::paintEvent(QPaintEvent *e)
             }
         }
         if (firstActionX > 0 || closeX > 0)
-            p.setPen(QPen(QColor(0x40, 0x40, 0x40), 1));
+            p.setPen(QPen(QColor(kBarSepStrong), 1));
         if (firstActionX > 0) {
             const int sx = firstActionX - kSeparatorGap / 2;
             p.drawLine(QPoint(sx, kPadding + 4), QPoint(sx, kPadding + kButtonSize - 4));
@@ -1381,20 +1623,24 @@ void PaintBar::paintEvent(QPaintEvent *e)
                 p.drawRoundedRect(b.rect, 4, 4);
             } else if (pressed) {
                 p.setPen(Qt::NoPen);
-                p.setBrush(QColor(0x33, 0x33, 0x33));
+                p.setBrush(QColor(kPressLight));
                 p.drawRoundedRect(b.rect, 4, 4);
             } else if (hover) {
                 p.setPen(Qt::NoPen);
-                p.setBrush(Theme::kHover);
+                p.setBrush(QColor(kHoverLight));
                 p.drawRoundedRect(b.rect, 4, 4);
             }
 
             const QPixmap icon = ToolIcons::forTool(b.tool, 20,
                                                     m_tool == b.tool ? Qt::white
-                                                                     : QColor(0xE8, 0xE8, 0xE8));
+                                                                     : QColor(kIcon));
             p.drawPixmap(b.rect.center() - QPoint(qRound(icon.width() / icon.devicePixelRatio() / 2),
                                                   qRound(icon.height() / icon.devicePixelRatio() / 2)),
                          icon);
+
+            // 多成员组：右下角小三角，提示可下拉切换
+            if (b.group >= 0 && kToolGroups[b.group].count > 1)
+                drawGroupCornerMark(p, b.rect, m_tool == b.tool);
 
             // 序号按钮角落显示组号
             if (b.tool == Tool::Number) {
@@ -1403,7 +1649,7 @@ void PaintBar::paintEvent(QPaintEvent *e)
                 f.setPointSize(6);
                 f.setBold(true);
                 p.setFont(f);
-                p.setPen(m_tool == b.tool ? QColor(Qt::white) : QColor(0x9A, 0x9A, 0x9A));
+                p.setPen(m_tool == b.tool ? QColor(Qt::white) : QColor(0x50, 0x50, 0x50));
                 p.drawText(b.rect.adjusted(0, 0, -2, -2), Qt::AlignRight | Qt::AlignBottom,
                            QString::number(s.numberGroup));
             }
@@ -1428,17 +1674,21 @@ void PaintBar::paintEvent(QPaintEvent *e)
             const QColor c = Palette::instance()->at(b.index);
             const bool isActive = (m_activeColorIndex == b.index);
 
+            // 选中色点：白底工具栏上画纯白环等于看不见，
+            // 用「深色外环 + 白色内环」双环，浅底深底都清晰
             if (isActive) {
-                p.setPen(QPen(Qt::white, 2));
+                p.setPen(QPen(QColor(0x2B2B2B), 1.5));
                 p.setBrush(Qt::NoBrush);
-                p.drawEllipse(b.rect.adjusted(-2, -2, 2, 2));
+                p.drawEllipse(b.rect.adjusted(-3, -3, 3, 3));
+                p.setPen(QPen(Qt::white, 1.5));
+                p.drawEllipse(b.rect.adjusted(-1, -1, 1, 1));
             }
 
             // 拖拽中的源色点收缩以提示
             QRect dotRect = b.rect.adjusted(1, 1, -1, -1);
             if (m_draggingColor && m_colorDragFrom == b.index)
                 dotRect = dotRect.adjusted(3, 3, -3, -3);
-            p.setPen(QPen(QColor(0x55, 0x55, 0x55), 1));
+            p.setPen(QPen(QColor(0xB0B0B0), 1));
             p.setBrush(c);
             p.drawEllipse(dotRect);
 
@@ -1448,7 +1698,7 @@ void PaintBar::paintEvent(QPaintEvent *e)
                 f.setPointSize(7);
                 p.setFont(f);
                 const QString pct = QStringLiteral("%1%").arg(qRound(m_alphaOverlayValue / 255.0 * 100));
-                p.setPen(QColor(0xE8, 0xE8, 0xE8));
+                p.setPen(QColor(kIcon));
                 p.drawText(b.rect.adjusted(-14, -14, 14, 14), Qt::AlignCenter, pct);
             }
             continue;
@@ -1463,12 +1713,12 @@ void PaintBar::paintEvent(QPaintEvent *e)
                 p.drawRoundedRect(b.rect, 4, 4);
             } else if (hover) {
                 p.setPen(Qt::NoPen);
-                p.setBrush(Theme::kHover);
+                p.setBrush(QColor(kHoverLight));
                 p.drawRoundedRect(b.rect, 4, 4);
             }
             const QPixmap sw = ToolIcons::penStyleSwatch(
                 kPenStyles[b.index], b.rect.width() - 8, b.rect.height(),
-                active ? QColor(Qt::white) : QColor(0xE8, 0xE8, 0xE8));
+                active ? QColor(Qt::white) : QColor(kIcon));
             p.drawPixmap(b.rect.center() - QPoint(qRound(sw.width() / sw.devicePixelRatio() / 2),
                                                   qRound(sw.height() / sw.devicePixelRatio() / 2)),
                          sw);
@@ -1484,11 +1734,11 @@ void PaintBar::paintEvent(QPaintEvent *e)
                 p.drawRoundedRect(b.rect, 4, 4);
             } else if (hover) {
                 p.setPen(Qt::NoPen);
-                p.setBrush(Theme::kHover);
+                p.setBrush(QColor(kHoverLight));
                 p.drawRoundedRect(b.rect, 4, 4);
             }
             drawArrowStyleGlyph(p, b.rect.adjusted(4, 7, -4, -7), b.index,
-                                active ? QColor(Qt::white) : QColor(0xE8, 0xE8, 0xE8));
+                                active ? QColor(Qt::white) : QColor(kIcon));
             continue;
         }
 
@@ -1500,13 +1750,33 @@ void PaintBar::paintEvent(QPaintEvent *e)
         if (b.kind == Button::Kind::PenLevel)
             continue;   // 第三行统一在 drawPenLevels 里画
 
+        // 组成员条：当前组的各个工具，选中的高亮
+        if (b.kind == Button::Kind::ToolMember) {
+            if (m_tool == b.tool) {
+                p.setPen(Qt::NoPen);
+                p.setBrush(Theme::kAccent);
+                p.drawRoundedRect(b.rect, 4, 4);
+            } else if (hover) {
+                p.setPen(Qt::NoPen);
+                p.setBrush(QColor(kHoverLight));
+                p.drawRoundedRect(b.rect, 4, 4);
+            }
+            const QPixmap mi = ToolIcons::forTool(b.tool, 16,
+                                                  m_tool == b.tool ? QColor(Qt::white)
+                                                                   : QColor(kIcon));
+            p.drawPixmap(b.rect.center() - QPoint(qRound(mi.width() / mi.devicePixelRatio() / 2),
+                                                  qRound(mi.height() / mi.devicePixelRatio() / 2)),
+                         mi);
+            continue;
+        }
+
         // 动作按钮
         if (pressed && b.enabled)
-            p.fillRect(b.rect, QColor(0x33, 0x33, 0x33));
+            p.fillRect(b.rect, QColor(kPressLight));
         else if (hover && b.enabled)
-            p.fillRect(b.rect, Theme::kHover);
+            p.fillRect(b.rect, QColor(kHoverLight));
 
-        const QColor iconColor = b.enabled ? QColor(0xE8, 0xE8, 0xE8) : QColor(0x5A, 0x5A, 0x5A);
+        const QColor iconColor = b.enabled ? QColor(kIcon) : QColor(kIconDisabled);
 
         QPixmap icon;
         switch (b.actionId) {
@@ -1528,8 +1798,7 @@ void PaintBar::paintEvent(QPaintEvent *e)
         case ActSave:  icon = ToolIcons::saveIcon(20, iconColor); break;
         case ActPin:   icon = ToolIcons::pinIcon(20, iconColor); break;
         case ActSendTo: icon = ToolIcons::sendIcon(20, iconColor); break;
-        case ActOcr:   icon = ToolIcons::ocrIcon(20, iconColor); break;
-        case ActBarcode: icon = ToolIcons::barcodeIcon(20, iconColor); break;
+        case ActRecognize: icon = ToolIcons::ocrIcon(20, iconColor); break;
         case ActClose: icon = ToolIcons::closeIcon(20, iconColor); break;
         default: break;
         }
