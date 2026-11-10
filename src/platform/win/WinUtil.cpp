@@ -123,6 +123,31 @@ void applyNoActivateStyle(quintptr wid)
     ::SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
 }
 
+void forceTopmost(quintptr wid)
+{
+    HWND hwnd = reinterpret_cast<HWND>(wid);
+    if (!hwnd)
+        return;
+    ::SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+bool isForeignWindowAbove(quintptr wid)
+{
+    HWND hwnd = reinterpret_cast<HWND>(wid);
+    if (!hwnd)
+        return false;
+    const DWORD selfPid = ::GetCurrentProcessId();
+    for (HWND above = ::GetWindow(hwnd, GW_HWNDPREV); above;
+         above = ::GetWindow(above, GW_HWNDPREV)) {
+        DWORD pid = 0;
+        ::GetWindowThreadProcessId(above, &pid);
+        if (pid != selfPid)
+            return true;
+    }
+    return false;
+}
+
 void setClickThrough(quintptr wid, bool on)
 {
     HWND hwnd = reinterpret_cast<HWND>(wid);

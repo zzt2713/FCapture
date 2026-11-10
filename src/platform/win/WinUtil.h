@@ -22,6 +22,14 @@ QRect windowRectAt(const QPoint &screenPos);
 void applyToolWindowStyle(quintptr wid);
 void applyNoActivateStyle(quintptr wid);
 
+// 推到置顶带最前：任务栏/桌面宠物这类 WS_EX_TOPMOST 窗口和遮罩同在置顶带，
+// Qt 的 raise() 压不住它们，必须显式 SetWindowPos(HWND_TOPMOST)
+void forceTopmost(quintptr wid);
+
+// Z 序上方是否有"外进程"窗口压着（本进程自己的浮窗不算）。
+// 置顶守卫用它决定要不要推一把——无谓的 SetWindowPos 会让 DWM 反复重排
+bool isForeignWindowAbove(quintptr wid);
+
 // 鼠标穿透开关（WS_EX_TRANSPARENT）：开启后滚轮/点击直接落到下层窗口，
 // 长截图滚动时用它把输入"放行"给被截的应用（传入 QWidget::winId()）
 void setClickThrough(quintptr wid, bool on);

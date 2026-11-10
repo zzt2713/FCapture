@@ -169,11 +169,16 @@ Snapshot captureAllScreens(bool includeCursor)
             qRound(u.logicalGeometry.width() * maxDpr),
             qRound(u.logicalGeometry.height() * maxDpr));
 
-        if (qFuzzyCompare(u.dpr, maxDpr)) {
-            p.drawPixmap(dst, u.pixmap);
-        } else {
-            p.drawPixmap(dst, u.pixmap, u.pixmap.rect());
-        }
+        // 关键：grabWindow(0) 返回的 pixmap 自带 devicePixelRatio（高 DPI 下
+        // 是 1.5）。pixmap 的 rect()/尺寸对带 dpr 的 pixmap 是**逻辑**尺寸，
+        // 而 dst 是物理像素矩形——不带 dpr 归一就直接 drawPixmap(dst, pm)，
+        // Qt 会按 逻辑尺寸(1707) 铺进 物理宽度(2560)，整屏画面被放大 1.5 倍。
+        // 这里是纯物理像素拼接，先把 dpr 归 1。
+        QPixmap src = u.pixmap;
+        if (!qFuzzyCompare(src.devicePixelRatio(), 1.0))
+            src.setDevicePixelRatio(1.0);
+
+        p.drawPixmap(dst, src, src.rect());
     }
     p.end();
 

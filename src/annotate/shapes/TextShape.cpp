@@ -1,6 +1,8 @@
 #include "annotate/shapes/TextShape.h"
 
 #include <QAbstractTextDocumentLayout>
+
+#include <algorithm>
 #include <QFontMetricsF>
 #include <QJsonObject>
 #include <QTextBlock>
@@ -42,6 +44,93 @@ void TextShape::setFontSize(int px)
     m_fontSize = qBound(6, px, 400);
 }
 
+// ---------------------------------------------------------------- 局部样式
+
+void TextShape::setRuns(const QVector<Run> &runs)
+{
+    m_runs = runs;
+    // 归一化：排序 + 合并同属性相邻区间（借鉴 Snow Shot 的 normalized()）
+    std::sort(m_runs.begin(), m_runs.end(),
+              [](const Run &a, const Run &b) { return a.start < b.start; });
+    QVector<Run> merged;
+    for (const Run &r : m_runs) {
+        if (r.end <= r.start)
+            continue;
+        if (!merged.isEmpty() && merged.last().end >= r.start
+            && merged.last().highlight == r.highlight
+            && merged.last().hasColor == r.hasColor
+            && merged.last().color == r.color
+            && merged.last().hasBold == r.hasBold
+            && merged.last().bold == r.bold) {
+            merged.last().end = qMax(merged.last().end, r.end);
+        } else {
+            merged.append(r);
+        }
+    }
+    m_runs = merged;
+}
+
+void TextShape::applyHighlight(int start, int end, const QColor &color)
+{
+    start = qBound(0, start, m_text.size());
+    end = qBound(start, end, m_text.size());
+    if (start >= end)
+        return;
+
+    // 先剔除与目标区间重叠的旧 run（简化处理：整段移除后重加）
+    QVector<Run> kept;
+    for (const Run &r : m_runs) {
+        if (r.end <= start || r.start >= end) {
+            kept.append(r);
+        } else {
+            if (r.start < start) { Run left = r; left.end = start; kept.append(left); }
+            if (r.end > end)     { Run right = r; right.start = end; kept.append(right); }
+        }
+    }
+
+    if (color.isValid() && color.alpha() > 0) {
+        Run nr;
+        nr.start = start;
+        nr.end = end;
+        nr.highlight = color;
+        kept.append(nr);
+    }
+    setRuns(kept);
+}
+
+void TextShape::applyTextColor(int start, int end, const QColor &color)
+{
+    start = qBound(0, start, m_text.size());
+    end = qBound(start, end, m_text.size());
+    if (start >= end)
+        return;
+
+    QVector<Run> kept;
+    for (const Run &r : m_runs) {
+        if (r.end <= start || r.start >= end) {
+            kept.append(r);
+        } else {
+            if (r.start < start) { Run left = r; left.end = start; kept.append(left); }
+            if (r.end > end)     { Run right = r; right.start = end; kept.append(right); }
+        }
+    }
+
+    if (color.isValid()) {
+        Run nr;
+        nr.start = start;
+        nr.end = end;
+        nr.color = color;
+        nr.hasColor = true;
+        kept.append(nr);
+    }
+    setRuns(kept);
+}
+
+void TextShape::clearLocalStyles()
+{
+    m_runs.clear();
+}
+
 // 唯一的排版来源：所有测量和绘制都走这一个 document，保证边界框与实际绘制一致
 QTextDocument *TextShape::createDocument() const
 {
@@ -66,6 +155,28 @@ QTextDocument *TextShape::createDocument() const
     QTextCharFormat fmt;
     fmt.setForeground(m_color);
     cursor.mergeCharFormat(fmt);
+
+    // 局部样式：按区间叠加高亮 / 前景色 / 粗体。
+    // QTextDocument 原生支持字符格式，所以不需要自己分段绘制。
+    for (const Run &r : m_runs) {
+        const int start = qBound(0, r.start, m_text.size());
+        const int end = qBound(start, r.end, m_text.size());
+        if (start >= end)
+            continue;
+
+        QTextCharFormat runFmt;
+        if (r.highlight.isValid() && r.highlight.alpha() > 0)
+            runFmt.setBackground(r.highlight);
+        if (r.hasColor && r.color.isValid())
+            runFmt.setForeground(r.color);
+        if (r.hasBold)
+            runFmt.setFontWeight(r.bold ? QFont::Bold : QFont::Normal);
+
+        QTextCursor c(doc);
+        c.setPosition(start);
+        c.setPosition(end, QTextCursor::KeepAnchor);
+        c.mergeCharFormat(runFmt);
+    }
 
     return doc;
 }
@@ -211,17 +322,9 @@ void TextShape::translate(const QPointF &delta)
 
 QVector<QPointF> TextShape::rawHandles() const
 {
-    // 与矩形/椭圆一致的 8 个手柄：
-    //   角（0/2/4/6）      → 等比缩放字号
-    //   左右边（3/7）      → 改文本框宽度（自动换行）
-    //   上下边（1/5）      → 同样按字号缩放入口处理（文本框高度由内容决定）
-    const QRectF r = layoutRect();
-    return {
-        r.topLeft(), QPointF(r.center().x(), r.top()), r.topRight(),
-        QPointF(r.right(), r.center().y()), r.bottomRight(),
-        QPointF(r.center().x(), r.bottom()), r.bottomLeft(),
-        QPointF(r.left(), r.center().y())
-    };
+    // 文字不提供缩放手柄：拖角改字号容易误触，且文字大小用浮动样式栏的
+    // A+ / A− 调整更精确。只保留选中框（可拖动移动）和旋转点。
+    return {};
 }
 
 void TextShape::beginHandleDrag()

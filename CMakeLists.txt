@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FCapture VERSION 1.2.0 LANGUAGES CXX)
+project(FCapture VERSION 1.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,6 +51,7 @@ set(APP_SOURCES
     src/annotate/AnnotationTool.cpp
     src/annotate/Palette.cpp
     src/annotate/PaintBar.cpp
+    src/annotate/TextStyleBar.cpp
     src/annotate/TextInputBox.cpp
     src/annotate/shapes/FreehandShape.cpp
     src/annotate/shapes/LineShape.cpp
@@ -68,8 +69,11 @@ set(APP_SOURCES
     src/snip/InfoPanel.cpp
     src/snip/MagnifierPanel.cpp
     src/snip/LongShotBar.cpp
+    src/snip/LongShotPreview.cpp
+    src/snip/LongShotPreviewBar.cpp
     src/snip/LongShotStitcher.cpp
     src/snip/ScreenCapturer.cpp
+    src/snip/ShortcutTipsWidget.cpp
     src/snip/SizeInputBox.cpp
     src/snip/SnipHistory.cpp
     src/snip/SnipOverlay.cpp
@@ -131,6 +135,7 @@ set(HEADERS
     src/annotate/AnnotationTool.h
     src/annotate/Palette.h
     src/annotate/PaintBar.h
+    src/annotate/TextStyleBar.h
     src/annotate/TextInputBox.h
     src/annotate/shapes/FreehandShape.h
     src/annotate/shapes/LineShape.h
@@ -148,6 +153,8 @@ set(HEADERS
     src/snip/InfoPanel.h
     src/snip/MagnifierPanel.h
     src/snip/LongShotBar.h
+    src/snip/LongShotPreview.h
+    src/snip/LongShotPreviewBar.h
     src/snip/LongShotStitcher.h
     src/snip/ScreenCapturer.h
     src/snip/SizeInputBox.h

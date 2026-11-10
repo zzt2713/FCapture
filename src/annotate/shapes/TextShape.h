@@ -4,6 +4,7 @@
 
 #include <QFont>
 #include <QPainterPath>
+#include <QVector>
 #include <QString>
 
 class QTextDocument;
@@ -13,6 +14,19 @@ class TextShape : public Annotation
 {
 public:
     TextShape();
+
+    // 一段局部样式（按字符区间）。借鉴 Snow Shot 的 TextAnnotationRun：
+    // 文字整体样式仍由成员变量控制，这里只存"局部覆盖"。
+    struct Run
+    {
+        int    start = 0;                      // 起始字符下标（含）
+        int    end = 0;                        // 结束字符下标（不含）
+        QColor highlight = Qt::transparent;    // 高亮背景（alpha>0 才生效）
+        QColor color;                          // 前景色（无效则用整体色）
+        bool   bold = false;
+        bool   hasColor = false;
+        bool   hasBold = false;
+    };
 
     Type type() const override;
     QRectF rawBoundingRect() const override;
@@ -55,6 +69,15 @@ public:
     QFont font() const;
     QRectF layoutRect() const;
 
+    // ---- 局部样式 ----
+    QVector<Run> runs() const { return m_runs; }
+    void setRuns(const QVector<Run> &runs);
+    // 给 [start, end) 区间叠加高亮背景（color 无效 = 清除该区间高亮）
+    void applyHighlight(int start, int end, const QColor &color);
+    // 给 [start, end) 区间叠加前景色
+    void applyTextColor(int start, int end, const QColor &color);
+    void clearLocalStyles();
+
     // 拖角等比缩放：直接按比例改字号（文本框高度自适应内容，所以只有字号有意义）
     void scaleFontBy(qreal factor);
 
@@ -76,6 +99,7 @@ private:
     qreal   m_dragBaseBoxWidth = 0;
     QRectF  m_dragBaseRect;
     QPointF m_dragAnchor;
+    QVector<Run> m_runs;   // 局部样式区间（按 start 升序、互不重叠）
     QColor  m_bgColor = Qt::transparent;
     bool    m_outline = false;
     QColor  m_outlineColor = QColor(Qt::black);

@@ -68,3 +68,13 @@ void OperationToast::imageSaved()
 {
     showToast(QStringLiteral("图片已保存"));
 }
+
+void OperationToast::longShotStarted()
+{
+    showToast(QStringLiteral("开始滚动拼接，按 Esc 或「暂停」结束"));
+}
+
+void OperationToast::longShotStopped(int frames, int height)
+{
+    showToast(QStringLiteral("长截图完成：%1 帧，高 %2 px").arg(frames).arg(height));
+}

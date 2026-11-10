@@ -1,6 +1,8 @@
 #pragma once
 
 #include <QColor>
+#include <QTextCharFormat>
+#include <QVector>
 #include <QString>
 #include <QWidget>
 
@@ -25,6 +27,17 @@ public:
                       const QString &initial = QString());
 
     QString text() const;
+    // 当前选区（无选中时 start == end）
+    int selectionStart() const;
+    int selectionEnd() const;
+    bool hasSelection() const;
+    // 导出当前文档里的局部样式区间（供提交时写回 TextShape）
+    QVector<QTextCharFormat> exportedRuns(QVector<int> *starts, QVector<int> *ends) const;
+    // 对当前选区应用/清除高亮背景
+    void applyHighlightToSelection(const QColor &color);
+    void applyColorToSelection(const QColor &color);
+    // 载入已有文字的局部样式（编辑已存在的文字时）
+    void setInitialRuns(const QVector<QTextCharFormat> &formats, const QString &text);
     QPoint  anchorPos() const { return m_anchor; }
     int     fontSize() const { return m_fontSize; }
     // 外部改字号（工具栏调粗细时同步输入框），与滚轮等效
@@ -34,6 +47,10 @@ signals:
     void committed(const QString &text);
     void cancelled();
     void fontResized(int newSize);
+    // 选区变化（用于浮动样式栏判断是否可应用局部样式）
+    void selectionChanged(bool hasSelection, int start, int end);
+    // 编辑结束时要带回的局部样式（按字符区间）
+    void runsChanged();
 
 public slots:
     void commit();

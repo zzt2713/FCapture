@@ -21,12 +21,17 @@
 class AnnotationModel;
 class Annotation;
 class PaintBar;
+class TextStyleBar;
 class TextInputBox;
 class SizeInputBox;
 class OcrEngine;
 class OcrResultDialog;
 class LongShotBar;
+class LongShotPreview;
+class LongShotPreviewBar;
+class ShortcutTipsWidget;
 class InfoPanel;
+class KeyboardHook;
 class MagnifierPanel;
 
 // 截图层：全屏遮罩 + 选区 + 放大镜 + 取色 + 窗口检测 + 标注
@@ -93,6 +98,9 @@ private:
 
     // --- 绘制 ---
     void drawMask(QPainter &p);
+    // 选区轮廓变化时只重绘旧/新轮廓附近（拖拽热路径，别用整屏 update）
+    void repaintSelectionOutline();
+    QRect m_outlinePaintRect;   // 上一帧绘制过的选区（脏区计算基准）
     // 会话结束后立刻释放全屏快照（几十 MB），不等窗口析构
     void releaseSessionImages();
     void drawCapturedCursor(QPainter &p);
@@ -105,18 +113,27 @@ private:
     // 放大镜面板的矩形（逻辑坐标）。取色信息面板用它避让，避免被放大镜盖住。
     QRect magnifierRect() const;
     void drawHint(QPainter &p);
-    // 左下角快捷键帮助浮层：鼠标移动或开始选区后自动消失
-    void drawShortcutTips(QPainter &p);
+    // 左下角快捷键帮助浮层：独立子控件，SyncShortcutTips 负责内容/位置/显隐
+    void syncShortcutTips();
+    QRect shortcutTipsRect() const;
+    ShortcutTipsWidget *m_shortcutTips = nullptr;
+    bool  m_hoveringTips = false;
+
     // 居中提示条（在截图层内部绘制，保证一定可见）
     void showCenterNotice(const QString &text, int msec = 2600);
     void drawCenterNotice(QPainter &p);
-    bool shortcutTipsVisible() const;
-    QRect shortcutTipsRect() const;
-    bool  m_hoveringTips = false;
-
     QString m_centerNotice;
     QElapsedTimer m_centerNoticeTimer;
     void drawWindowHighlight(QPainter &p);
+    // 悬停高亮的过渡动画（借鉴 Snow Shot 的 SmartSelectionTransition）：
+    // 矩形从旧位置缓动到新位置，101ms 二次缓出，鼠标在元素间移动不再"啪"地跳
+    void tickHoverAnim();
+    QRect hoverAnimRect() const;
+    // 只重绘"鼠标移动时会变"的部分（高亮框/参考线/光标），
+    // 不整屏重绘 —— 快速滑动卡顿的根治手段
+    void hoverRepaint();
+    // 带缓存的窗口矩形查询：同一窗口内连续移动不再反复 EnumWindows
+    QRect windowRectAtCached(const QPoint &globalPos);
     void drawLassoPreview(QPainter &p);
     QRect sizeLabelRect() const;
     void  drawShadowPreview(QPainter &p);
@@ -197,8 +214,22 @@ private:
     QRect m_longShotRect;              // 捕获视口（全局逻辑坐标），进入时定死
     QString m_longShotStatus;          // 外框上的状态提示（空 = 默认引导语）
     QTimer *m_longShotTimer = nullptr;
+    // 自动滚动：点「开始」后定时把滚轮事件发给下层页面，
+    // 用户按「暂停」/「钉」/「保存」/「关闭」/Esc 时停止
+    QTimer *m_autoScrollTimer = nullptr;
+    // 长截图期间焦点在下层页面，截图层收不到按键，Esc 靠全局钩子兜底
+    KeyboardHook *m_longShotEscHook = nullptr;
     LongShotStitcher m_stitcher;
     LongShotBar *m_longShotBar = nullptr;
+    // 右侧常驻预览栏（贴在选区右侧，实时显示拼接结果）
+    LongShotPreviewBar *m_longShotPreviewBar = nullptr;
+    // 悬停预览窗：盖在选区天窗上显示长图对应区段（悬停即预览）
+    LongShotPreview *m_longShotHoverPreview = nullptr;
+    // 悬停预览期间暂停了抓帧（移开后要恢复）
+    bool  m_longShotHoverPaused = false;
+    void  hideLongShotHoverPreview();
+    int  m_longShotTrimTop = 0;      // 预览栏手柄：头/尾裁掉的行数（画布坐标）
+    int  m_longShotTrimBottom = 0;
 
     void loadHistory(int offset);
     void resetToFullScreen();
@@ -322,6 +353,16 @@ private:
     // 窗口检测
     bool    m_windowDetectionOn = false;
     QRect   m_hoverWindow;
+    // 高亮矩形动画（显示值向 m_hoverWindow 缓动）
+    QRectF  m_hoverAnimRect;
+    QRectF  m_animFrom;
+    QRectF  m_animTarget;
+    QElapsedTimer m_hoverAnimClock;
+    QTimer *m_hoverAnimTimer = nullptr;
+    QRect  m_lastHoverPaintRect;     // 上一帧高亮框（脏区计算用）
+    QPoint m_lastMousePaintPos;      // 上一帧鼠标位置（参考线脏区用）
+    QRect  m_winRectCache;           // 窗口矩形缓存（避免每次 EnumWindows）
+    QElapsedTimer m_winRectCacheTimer;
     // 按下左键那一刻的高亮目标（用于松手时落选区）。
     // 按下会 clearDetection() 停掉识别，这里必须先把它存下来，
     // 否则松手时只能退回到"光标下最顶层窗口"，表现为点了元素却截出整屏。
@@ -338,8 +379,24 @@ private:
     QVector<ElementInfo> m_elementHierarchy;
     int      m_elementLevel = 0;
     quint64  m_elementRequestId = 0;
+    // 元素快照（进入截图时抓一次，鼠标移动纯本地命中，避免 UIA 跨进程延迟）
+    QVector<ElementInfo> m_snapshotElements;
+    // 命中链缓存：同一位置的结果只允许"向内收"，防止快照分批到达时来回跳
+    QPoint m_lastChainPos;
+    QVector<ElementInfo> m_lastChain;
+    // 已经补抓过命中链的窗口（光标移到新窗口时按需补抓一次）
+    quintptr m_snapshotHitHwnd = 0;
+    // 从快照里查光标下的元素链（父→子），返回由深到浅的层级。
+    // 只在最上层窗口的元素里找 + 结果单调收敛（防止扫描批次到达时高亮乱跳）
+    QVector<ElementInfo> hitTestSnapshot(const QPoint &globalPos);
     QPoint   m_elementRequestPos;
     QElapsedTimer m_elementThrottle;
+    // 精化门控（snow 同款）：指针停稳 80ms 后，用更大预算再查一次，
+    // 让懒加载树把命中路径展开得更深。移动即取消。
+    QTimer  *m_refineGate = nullptr;
+    QPoint   m_refineAt;
+    quintptr m_refineHwnd = 0;
+    bool     m_refining = false;
     // 最新鼠标位置（流水线用：结果回来时据此补发）
     QPoint m_pendingCursor;
     bool     m_elementPending = false;
@@ -365,6 +422,9 @@ private:
     bool    m_refreshing = false;
     bool    m_refreshHintVisible = false;
 
+    // 会话期置顶守卫：周期性把遮罩推回置顶带最前（任务栏会抢 z 序）
+    QTimer *m_topmostGuardTimer = nullptr;
+
     // 右键已被 mousePressEvent 消费（取消工具/取消选中）时，
     // 不再弹选区菜单，避免一次右键做两件事
     bool    m_suppressContextMenu = false;
@@ -387,6 +447,9 @@ private:
     // --- 标注状态 ---
     AnnotationModel *m_model = nullptr;
     PaintBar        *m_paintBar = nullptr;
+    // 文字标注的浮动样式工具栏（选中单个文字时出现）
+    TextStyleBar    *m_textStyleBar = nullptr;
+    void syncTextStyleBar();
     QPointer<TextInputBox> m_textBox;
     int              m_textBoxFontSize = 0;   // 输入框当前字号（滚轮可调），落定后直接采用
     bool             m_paintBarVisible = false;

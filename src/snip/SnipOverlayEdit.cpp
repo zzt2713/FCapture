@@ -120,6 +120,7 @@ void SnipOverlay::selectShapeAt(const QPoint &localPos, bool additive)
             m_selectedShapes.push_back(hit);
         hit->setSelected(true);
     }
+    syncTextStyleBar();
     update();
 }
 
@@ -128,6 +129,7 @@ void SnipOverlay::clearSelection()
     if (m_selectedShapes.empty())
         return;
     clearSelectionSilently();
+    syncTextStyleBar();
     update();
 }
 
@@ -140,6 +142,7 @@ void SnipOverlay::deleteSelected()
     m_selectedShapes.clear();
     for (const auto &s : shapes)
         m_model->removeShape(s);
+    syncTextStyleBar();
     update();
 }
 

@@ -251,8 +251,13 @@ private:
     void fitWidget()
     {
         if (QWidget *w = widget()) {
+            // 始终预留滚动条的宽度：如果按"当前视口宽度"定内容宽，
+            // 滚动条一出现视口就变窄 → 内容重排变高 → 更需要滚动条，
+            // 形成"滚动条永远在"的自激循环。
+            constexpr int kScrollBarReserve = 12;
+            const int avail = qMax(120, viewport()->width() - kScrollBarReserve);
             w->setMinimumWidth(0);
-            w->setMaximumWidth(viewport()->width());
+            w->setMaximumWidth(avail);
         }
     }
 
@@ -265,9 +270,28 @@ private:
                 if (w->layout())
                     w->layout()->activate();
             }
-            QResizeEvent ev(size(), size());
-            QScrollArea::resizeEvent(&ev);
+            // 先按"不需要滚动条"的满宽重算，再交给基类判定，
+            // 避免上一次残留的滚动条宽度影响本轮换行与高度
+            updateScrollBarVisibility();
+            update();
         });
+    }
+
+    // 按内容实际高度决定要不要滚动条（而不是靠基类的尺寸推断）
+    void updateScrollBarVisibility()
+    {
+        QWidget *w = widget();
+        if (!w)
+            return;
+
+        // 用实际布局高度而不是 sizeHint：sizeHint 对含 Ela 控件的页面会偏大，
+        // 切换页面瞬间还可能残留上一页的值，导致"有时候有滚动条"。
+        const int contentH = w->layout() ? w->layout()->sizeHint().height()
+                                         : w->height();
+        // 2px 容差：亚像素布局差异不该触发滚动条
+        const bool need = contentH > viewport()->height() + 2;
+        setVerticalScrollBarPolicy(need ? Qt::ScrollBarAsNeeded
+                                        : Qt::ScrollBarAlwaysOff);
     }
 
     void applyTheme()
@@ -1392,27 +1416,33 @@ QWidget *PreferenceDialog::buildHelpPage()
     QVBoxLayout *hotkeyLayout = nullptr;
     QWidget *hotkeyBox = groupBox(w, QStringLiteral("常用快捷键"), &hotkeyLayout);
 
-    struct Row { const char *key; const char *desc; };
-    static const Row kRows[] = {
-        { "F1",             "开始截图" },
-        { "F3",             "把剪贴板内容贴成图片窗口" },
-        { "Shift+F3",       "隐藏 / 显示所有贴图" },
-        { "Ctrl+Shift+A",   "截取当前活动窗口" },
-        { "Tab",            "切换 自由 / 窗口 / 元素 检测" },
-        { "滚轮",           "元素检测时切换父 / 子元素块" },
-        { "` / ~",          "截图时显示或隐藏鼠标指针" },
-        { "C",              "取色（Shift 切换 HEX / RGB）" },
-        { "Enter",          "复制并结束截图" },
-        { "Esc",            "中止截图" },
-        { ", / .",          "历史截图回放" },
-        { "F5",             "刷新截图内容（保留标注）" },
+    // 前三项是全局热键，随时可在首选项里改，这里必须读实时配置，
+    // 不能写死字符串（否则改完热键帮助页还显示旧的）。
+    const auto cfgHotkey = [](const char *action) {
+        return ConfigManager::instance()->hotkey(QString::fromUtf8(action));
+    };
+
+    struct Row { QString key; const char *desc; };
+    const QVector<Row> kRows = {
+        { cfgHotkey("capture"),             "开始截图" },
+        { cfgHotkey("paste"),               "把剪贴板内容贴成图片窗口" },
+        { cfgHotkey("toggle-images"),       "隐藏 / 显示所有贴图" },
+        { cfgHotkey("capture-active-window"), "截取当前活动窗口" },
+        { cfgHotkey("long-screenshot"),     "滚动长截图" },
+        { QStringLiteral("Tab"),            "切换 自由 / 窗口 / 元素 检测" },
+        { QStringLiteral("滚轮"),            "元素检测时切换父 / 子元素块" },
+        { QStringLiteral("` / ~"),          "截图时显示或隐藏鼠标指针" },
+        { QStringLiteral("C"),              "取色（Shift 切换 HEX / RGB）" },
+        { QStringLiteral("Enter"),          "复制并结束截图" },
+        { QStringLiteral("Esc"),            "中止截图" },
+        { QStringLiteral(", / ."),          "历史截图回放" },
+        { QStringLiteral("F5"),             "刷新截图内容（保留标注）" },
     };
 
     auto *form = new QFormLayout;
     form->setSpacing(6);
     for (const Row &r : kRows) {
-        // key 里可能含中文（如「滚轮」），必须按 UTF-8 解码
-        auto *key = new ElaText(QString::fromUtf8(r.key), hotkeyBox);
+        auto *key = new ElaText(r.key, hotkeyBox);
         key->setTextStyle(ElaTextType::Body);
         auto *desc = new ElaText(QString::fromUtf8(r.desc), hotkeyBox);
         desc->setTextStyle(ElaTextType::Caption);

@@ -94,3 +94,58 @@ long long __stdcall MouseHook::hookProc(int code, unsigned long long wParam, lon
 
     return ::CallNextHookEx(nullptr, code, WPARAM(wParam), LPARAM(lParam));
 }
+
+// ---------------------------------------------------------------- KeyboardHook
+
+KeyboardHook *KeyboardHook::s_instance = nullptr;
+
+KeyboardHook::KeyboardHook(QObject *parent)
+    : QObject(parent)
+{
+}
+
+KeyboardHook::~KeyboardHook()
+{
+    uninstall();
+}
+
+bool KeyboardHook::install()
+{
+    if (m_installed)
+        return true;
+
+    s_instance = this;
+    m_hook = ::SetWindowsHookExW(WH_KEYBOARD_LL,
+                                 reinterpret_cast<HOOKPROC>(&KeyboardHook::hookProc),
+                                 nullptr, 0);
+    m_installed = (m_hook != nullptr);
+    if (!m_installed) {
+        qWarning() << "KeyboardHook: SetWindowsHookExW failed:" << ::GetLastError();
+        s_instance = nullptr;
+    }
+    return m_installed;
+}
+
+void KeyboardHook::uninstall()
+{
+    if (m_hook) {
+        ::UnhookWindowsHookEx(reinterpret_cast<HHOOK>(m_hook));
+        m_hook = nullptr;
+    }
+    m_installed = false;
+    if (s_instance == this)
+        s_instance = nullptr;
+}
+
+long long __stdcall KeyboardHook::hookProc(int code, unsigned long long wParam,
+                                           long long lParam)
+{
+    // 回调里不做任何重活（< 30ms 返回），只发信号排队到主线程
+    if (code >= 0 && wParam == WM_KEYDOWN && s_instance) {
+        const auto *kb = reinterpret_cast<const KBDLLHOOKSTRUCT *>(lParam);
+        if (kb && kb->vkCode == VK_ESCAPE)
+            emit s_instance->escapePressed();
+    }
+    return ::CallNextHookEx(nullptr, code, static_cast<WPARAM>(wParam),
+                            static_cast<LPARAM>(lParam));
+}

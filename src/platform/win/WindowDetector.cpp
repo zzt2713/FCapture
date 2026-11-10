@@ -112,6 +112,25 @@ bool isShellWindow(const QString &className)
     return kShellClasses.contains(className);
 }
 
+// 全屏游戏/录制叠加层：NVIDIA GeForce Overlay、Discord/Steam/Medal 等。
+// 它们全屏覆盖桌面、没有 WS_EX_TRANSPARENT（靠逐像素 alpha 穿透），
+// 能通过 acceptWindow 的全部检查，于是永远霸占光标命中——
+// 表现为"有窗口打开时任务栏/任何东西都识别不了"（实测 NVIDIA Overlay
+// 的 CEF-OSC-WIDGET 排在 Shell_TrayWnd 前面）。
+bool isScreenOverlay(const QString &className, const QString &title)
+{
+    static const QStringList kOverlayClasses = {
+        QStringLiteral("CEF-OSC-WIDGET"),          // NVIDIA GeForce Overlay
+        QStringLiteral("DiscordOverlay"),
+        QStringLiteral("GameOverlayUI"),
+        QStringLiteral("MedalOverlay"),
+    };
+    if (kOverlayClasses.contains(className))
+        return true;
+    return title.contains(QStringLiteral("Overlay"), Qt::CaseInsensitive)
+           || title.contains(QStringLiteral("GeForce Overlay"), Qt::CaseInsensitive);
+}
+
 // 过滤规则（对齐 Snipaste）：
 //   1 可见 / 2 未最小化 / 3 不排除 WS_EX_TOOLWINDOW
 //   4 排除 WS_EX_LAYERED 但允许点击穿透之外的层（输入法候选框等）
@@ -121,6 +140,16 @@ bool acceptWindow(HWND hwnd, const QString &className)
 {
     if (!::IsWindowVisible(hwnd) || ::IsIconic(hwnd))
         return false;
+    // UWP 隐藏窗 / 虚拟桌面切换留下的幽灵窗口：DWM 标记 cloaked，
+    // 窗口"可见"但屏幕上没有内容（snow 的 is_window_cloaked 同款过滤）
+    {
+        constexpr DWORD kCloaked = 15;   // DWMWA_CLOAKED
+        DWORD cloaked = 0;
+        if (SUCCEEDED(::DwmGetWindowAttribute(hwnd, kCloaked, &cloaked,
+                                              sizeof(cloaked)))
+            && cloaked != 0)
+            return false;
+    }
     // 只排除截图遮罩自己。以前排除"整个本进程"，导致首选项/分组管理/
     // 白板这些自家窗口完全无法被识别。
     if (isIgnoredWindow(hwnd))
@@ -172,6 +201,8 @@ bool acceptWindow(HWND hwnd, const QString &className)
         return false;
 
     if (isShellWindow(className))
+        return false;
+    if (isScreenOverlay(className, titleOf(hwnd)))
         return false;
 
     // 不再要求窗口必须有标题。
@@ -263,18 +294,81 @@ QVector<WindowInfo> cachedTopLevelWindows()
     return cache;
 }
 
-// 按 Z 序自上而下取光标下的窗口。
+// 光标下"真·能点到"的顶层窗口：交给系统判定（WindowFromPoint 的窗口区域 /
+// 逐像素透明语义和真实鼠标一致——NVIDIA Overlay 这类 alpha 悬浮窗靠透明像素
+// 穿透，任何几何/样式模拟都会把它错当成实心全屏窗，抢走任务栏和底下窗口的命中）。
+// 遮罩自己是全屏置顶窗，查询期间临时加 WS_EX_TRANSPARENT 让系统跳过它。
+quintptr realRootWindowAt(const QPoint &screenPos)
+{
+    const POINT pt = toPhysical(screenPos);
+    HWND overlay = reinterpret_cast<HWND>(g_overlayHwnd);
+    LONG_PTR ex = 0;
+    if (overlay) {
+        ex = ::GetWindowLongPtrW(overlay, GWL_EXSTYLE);
+        ::SetWindowLongPtrW(overlay, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
+    }
+    const HWND hit = ::WindowFromPoint(pt);
+    if (overlay)
+        ::SetWindowLongPtrW(overlay, GWL_EXSTYLE, ex);
+    return hit ? quintptr(::GetAncestor(hit, GA_ROOT)) : 0;
+}
+
+// 光标下的窗口栈。
 //
-// 不能用 WindowFromPoint：截图遮罩层本身是全屏置顶窗口，那一步命中的
-// 永远是遮罩层自己，再按"排除本进程"过滤后就是空——表现为窗口检测完全失灵。
-// 只能走 EnumWindows（Z 序由上到下），逐层跳过本进程窗口，取第一个包含光标的。
+// 排序规则（实测校准，日志数据见下）：
+//   1. 以 WindowFromPoint 的真命中为准 —— 它尊重窗口区域与**逐像素 alpha**，
+//      系统认为"光标此刻实际点到的是谁"，就是它。
+//   2. 真命中窗口若在可选列表里 → 排栈首，其余按 z 序补在后面（滚轮换层用）。
+//   3. 真命中窗口**不在可选列表里**（例如 NVIDIA Overlay 的 CEF 悬浮子窗、
+//      被 acceptWindow 过滤掉的窗口）→ 不能简单忽略：这恰恰说明该位置被
+//      一个透明浮层覆盖。此时把它上面的候选全部丢掉，从它之后的 z 序继续，
+//      否则会把浮层本身当成合法窗口（实测就是这样：光标在任务栏上时
+//      stack[0] 是 CEF-OSC-WIDGET，任务栏被顶到第二位）。
+//
+// 实测日志（修复前）：
+//   [stack] pos=(431,1054) all=11 stack=2 "[0]CEF-OSC-WIDGET [1]Shell_TrayWnd"
+//   hit=657208   ← hit 是 NVIDIA Overlay 的子窗口，不在缓存里
 QVector<WindowInfo> stackedWindowsAt(const QPoint &screenPos)
 {
+    const quintptr hitRoot = realRootWindowAt(screenPos);
+    const QVector<WindowInfo> all = cachedTopLevelWindows();
+
+    // 真命中是桌面/壁纸：没有合法检测目标（不让全屏壳窗口顶上来）
+    if (hitRoot != 0 && isShellWindow(classNameOf(reinterpret_cast<HWND>(hitRoot)))) {
+        bool selectable = false;
+        for (const WindowInfo &w : all) {
+            if (w.hwnd == hitRoot) {
+                selectable = true;
+                break;
+            }
+        }
+        if (!selectable)
+            return {};
+    }
+
+    // 按 z 序收集所有覆盖该点的窗口（all 本身即 EnumWindows 顺序）
     QVector<WindowInfo> stack;
-    for (const WindowInfo &w : cachedTopLevelWindows()) {
+    for (const WindowInfo &w : all) {
         if (w.logicalRect.contains(screenPos))
             stack.append(w);
     }
+
+    // 真命中窗口在可选列表里：提到栈首
+    if (hitRoot != 0) {
+        for (int i = 0; i < stack.size(); ++i) {
+            if (stack.at(i).hwnd == hitRoot) {
+                if (i > 0)
+                    stack.move(i, 0);
+                return stack;
+            }
+        }
+    }
+
+    // 真命中不在可选列表里（透明浮层 / 被过滤窗口）：
+    // 找光标点下"系统真正穿透到的那个窗口"——用最上层**可选**窗口兜底。
+    // 但不能停在浮层本身：先确认该位置最上层的合法窗口是谁。
+    // 这里的 stack 已经按 z 序，且浮层通常不在 all 里，所以 stack[0]
+    // 就是穿透后的第一个真实窗口。直接返回即可。
     return stack;
 }
 

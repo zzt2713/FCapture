@@ -17,10 +17,19 @@ struct Word
     QRectF  box;      // 逻辑坐标，相对源图左上角
 };
 
+// 一行文字（词框的并集）
+struct Line
+{
+    QString text;
+    QRectF  box;      // 逻辑坐标，相对源图左上角
+    QVector<Word> words;
+};
+
 struct Result
 {
-    QString     text;         // 整段文本（保留换行）
+    QString     text;         // 整段文本（保留换行，= lines 逐行 join）
     QVector<Word> words;      // 每个词的包围盒
+    QVector<Line> lines;      // 每行的文本 + 包围盒（结果窗口画文字框用）
     QString     language;     // 实际使用的 BCP-47 语言
     bool        ok = false;
     QString     error;

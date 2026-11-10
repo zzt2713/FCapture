@@ -2,6 +2,7 @@
 
 #include "annotate/AnnotationModel.h"
 #include "annotate/PaintBar.h"
+#include "annotate/TextStyleBar.h"
 #include "annotate/TextInputBox.h"
 #include "annotate/shapes/FreehandShape.h"
 #include "annotate/shapes/LineShape.h"
@@ -61,6 +62,36 @@ void SnipOverlay::togglePaintBar()
         hidePaintBar();
     else
         showPaintBar();
+}
+
+// 选中单个文字标注时，在其上方显示浮动样式栏
+void SnipOverlay::syncTextStyleBar()
+{
+    if (!m_textStyleBar)
+        return;
+
+    TextShape *target = nullptr;
+    if (m_selectedShapes.size() == 1) {
+        if (auto *txt = dynamic_cast<TextShape *>(m_selectedShapes.front().get()))
+            target = txt;
+    }
+
+    // 正在原地编辑时隐藏（输入框接管）
+    if (target && target->isEditing())
+        target = nullptr;
+
+    if (!target) {
+        m_textStyleBar->hide();
+        return;
+    }
+
+    m_textStyleBar->setTarget(target);
+
+    // 位置：文字包围盒上方（本地坐标）
+    QRectF box = target->boundingRect();
+    if (!qFuzzyIsNull(target->rotation()))
+        box = target->rotationTransform().mapRect(box);   // 旋转后取轴对齐包围盒
+    m_textStyleBar->positionAbove(box.toRect());
 }
 
 void SnipOverlay::syncPaintBarPosition()
@@ -229,6 +260,8 @@ void SnipOverlay::insertCreatedShape(const std::shared_ptr<Annotation> &shape)
 
     if (m_paintBar)
         m_paintBar->setCanUndoRedo(m_model->canUndo(), m_model->canRedo());
+
+    syncTextStyleBar();
 }
 
 // ---------------------------------------------------------------- 序号
@@ -601,7 +634,7 @@ void SnipOverlay::beginTextInput(const QPoint &localPos)
         existing->setEditing(true);
 
     connect(box, &TextInputBox::committed, this,
-            [this, editPos, existing, fontSize](const QString &text) {
+            [this, editPos, existing, fontSize, box](const QString &text) {
                 m_textBox = nullptr;
                 if (existing)
                     existing->setEditing(false);
@@ -637,6 +670,24 @@ void SnipOverlay::beginTextInput(const QPoint &localPos)
                     shape->setOutlineWidth(style.textOutlineWidth);
                     insertCreatedShape(shape);
                 }
+
+                // 把输入框里的局部样式（高亮/局部前景色）写回文字标注
+                if (box) {
+                    QVector<int> starts, ends;
+                    const QVector<QTextCharFormat> fmts =
+                        box->exportedRuns(&starts, &ends);
+                    if (existing) {
+                        existing->clearLocalStyles();
+                        for (int i = 0; i < fmts.size() && i < starts.size(); ++i) {
+                            if (fmts.at(i).background().style() != Qt::NoBrush)
+                                existing->applyHighlight(starts.at(i), ends.at(i),
+                                                         fmts.at(i).background().color());
+                            if (fmts.at(i).hasProperty(QTextFormat::ForegroundBrush))
+                                existing->applyTextColor(starts.at(i), ends.at(i),
+                                                         fmts.at(i).foreground().color());
+                        }
+                    }
+                }
                 update();
             });
 
@@ -653,6 +704,40 @@ void SnipOverlay::beginTextInput(const QPoint &localPos)
         m_textBoxFontSize = newSize;
         ToolStyleStore::instance()->setPenWidth(Tool::Text, newSize);
     });
+
+    // 选区变化 → 浮动样式栏切换为"只作用于选中文字"模式
+    connect(box, &TextInputBox::selectionChanged, this,
+            [this, box, existing](bool hasSel, int start, int end) {
+                if (!m_textStyleBar)
+                    return;
+
+                // 编辑中的文字也可能是新建的（existing == nullptr），
+                // 用一个临时 TextShape 承载预览样式不方便，这里只在
+                // existing 存在时启用局部样式；新建文字时按钮仍作用于整段。
+                if (existing) {
+                    m_textStyleBar->setTarget(existing);
+                    m_textStyleBar->setEditingSelection(start, end, hasSel);
+                    QRectF boxRect = existing->layoutRect();
+                    m_textStyleBar->positionAbove(boxRect.toRect());
+                    m_textStyleBar->show();
+                } else if (hasSel) {
+                    // 新建文字：定位到输入框上方
+                    QRect r(box->mapTo(this, QPoint(0, 0)), box->size());
+                    m_textStyleBar->positionAbove(r);
+                }
+            });
+
+    // 编辑中应用局部样式
+    connect(m_textStyleBar, &TextStyleBar::selectionHighlightRequested, this,
+            [this, box](const QColor &c) {
+                if (m_textBox)
+                    m_textBox->applyHighlightToSelection(c);
+            });
+    connect(m_textStyleBar, &TextStyleBar::selectionColorRequested, this,
+            [this, box](const QColor &c) {
+                if (m_textBox)
+                    m_textBox->applyColorToSelection(c);
+            });
     m_textBoxFontSize = fontSize;
 
     // 编辑已有文字时输入框必须落在**文字原位置**，而不是双击点。

@@ -37,3 +37,34 @@ private:
     bool   m_dragging = false;
     QPoint m_start;
 };
+
+// 全局低级键盘钩子：只用来监听 Esc。
+//
+// 长截图时必须把焦点让给下层页面（滚轮才能滚动），
+// 结果截图层自己收不到任何按键，Esc 退出就失效了。
+// 这里用 WH_KEYBOARD_LL 捕获 Esc，再排队回主线程处理。
+class KeyboardHook : public QObject
+{
+    Q_OBJECT
+
+public:
+    explicit KeyboardHook(QObject *parent = nullptr);
+    ~KeyboardHook() override;
+
+    bool install();
+    void uninstall();
+    bool isInstalled() const { return m_installed; }
+
+signals:
+    void escapePressed();
+
+private:
+    static long long __stdcall hookProc(int code, unsigned long long wParam,
+                                        long long lParam);
+
+    static KeyboardHook *s_instance;
+
+    void *m_hook = nullptr;
+    bool  m_installed = false;
+};
+

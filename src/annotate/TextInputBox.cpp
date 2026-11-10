@@ -42,6 +42,13 @@ TextInputBox::TextInputBox(QWidget *parent)
     m_edit->installEventFilter(this);
     layout->addWidget(m_edit);
 
+    // 选区变化 → 通知外部（浮动样式栏据此切换"整段/选区"模式）
+    connect(m_edit, &QTextEdit::selectionChanged, this, [this]() {
+        const QTextCursor cur = m_edit->textCursor();
+        emit selectionChanged(cur.hasSelection(),
+                              cur.selectionStart(), cur.selectionEnd());
+    });
+
     // 完全透明：你看到的就是最终效果
     // 字号必须写进 QSS：截图层挂的 QSS 里有 QWidget{font-size:9pt}，
     // 样式表字体会压过 setFont()，导致输入时永远是 9pt、和落定后的字号不一致。
@@ -223,6 +230,108 @@ void TextInputBox::relayout()
     }
 }
 
+int TextInputBox::selectionStart() const
+{
+    if (!m_edit)
+        return 0;
+    return m_edit->textCursor().selectionStart();
+}
+
+int TextInputBox::selectionEnd() const
+{
+    if (!m_edit)
+        return 0;
+    return m_edit->textCursor().selectionEnd();
+}
+
+bool TextInputBox::hasSelection() const
+{
+    if (!m_edit)
+        return false;
+    return m_edit->textCursor().hasSelection();
+}
+
+void TextInputBox::applyHighlightToSelection(const QColor &color)
+{
+    if (!m_edit)
+        return;
+    QTextCursor cur = m_edit->textCursor();
+    if (!cur.hasSelection())
+        return;
+
+    QTextCharFormat fmt;
+    fmt.setBackground(color);   // 无效色 = 清除
+    cur.mergeCharFormat(fmt);
+    m_edit->mergeCurrentCharFormat(fmt);
+    emit runsChanged();
+}
+
+void TextInputBox::applyColorToSelection(const QColor &color)
+{
+    if (!m_edit || !color.isValid())
+        return;
+    QTextCursor cur = m_edit->textCursor();
+    if (!cur.hasSelection())
+        return;
+
+    QTextCharFormat fmt;
+    fmt.setForeground(color);
+    cur.mergeCharFormat(fmt);
+    m_edit->mergeCurrentCharFormat(fmt);
+    emit runsChanged();
+}
+
+void TextInputBox::setInitialRuns(const QVector<QTextCharFormat> &formats, const QString &text)
+{
+    Q_UNUSED(formats);
+    Q_UNUSED(text);
+    // 局部样式的持久化由 TextShape 负责；输入框只做即时预览，
+    // 所以这里不需要回填（避免和 applyFont 的整段格式冲突）。
+}
+
+// 导出文档里的局部样式：遍历所有带非默认格式的片段。
+// 只导出"高亮背景"和"非整体色前景"，其余视为默认。
+QVector<QTextCharFormat> TextInputBox::exportedRuns(QVector<int> *starts,
+                                                    QVector<int> *ends) const
+{
+    QVector<QTextCharFormat> out;
+    if (starts)
+        starts->clear();
+    if (ends)
+        ends->clear();
+    if (!m_edit)
+        return out;
+
+    const QTextDocument *doc = m_edit->document();
+    for (QTextBlock block = doc->begin(); block.isValid(); block = block.next()) {
+        for (auto it = block.begin(); !it.atEnd(); ++it) {
+            const QTextFragment frag = it.fragment();
+            if (!frag.isValid())
+                continue;
+            const QTextCharFormat fmt = frag.charFormat();
+            const bool hasBg = fmt.background().style() != Qt::NoBrush
+                               && fmt.background().color().alpha() > 0;
+            const bool hasFg = fmt.hasProperty(QTextFormat::ForegroundBrush)
+                               && fmt.foreground().color() != m_color;
+            if (!hasBg && !hasFg)
+                continue;
+
+            QTextCharFormat minimal;
+            if (hasBg)
+                minimal.setBackground(fmt.background());
+            if (hasFg)
+                minimal.setForeground(fmt.foreground());
+
+            out.append(minimal);
+            if (starts)
+                starts->append(frag.position());
+            if (ends)
+                ends->append(frag.position() + frag.length());
+        }
+    }
+    return out;
+}
+
 QString TextInputBox::text() const
 {
     return m_edit ? m_edit->toPlainText() : QString();
@@ -329,14 +438,8 @@ bool TextInputBox::eventFilter(QObject *watched, QEvent *event)
 
 void TextInputBox::paintEvent(QPaintEvent *e)
 {
+    // 不画任何边框：输入框与最终文字完全一致（所见即所得）。
+    // 早期画过蓝色虚线框提示"可编辑"，但双击进入编辑时它会和文字叠在一起，
+    // 看起来像多了一个框。
     Q_UNUSED(e);
-
-    QPainter p(this);
-    p.setRenderHint(QPainter::Antialiasing);
-
-    QPen pen(QColor(0x3D, 0x8B, 0xFD, 200), 1, Qt::DashLine);
-    pen.setDashPattern({3, 3});
-    p.setPen(pen);
-    p.setBrush(Qt::NoBrush);
-    p.drawRect(rect().adjusted(0, 0, -1, -1));
 }

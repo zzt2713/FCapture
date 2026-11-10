@@ -262,12 +262,13 @@ QString languageDisplayName(const QString &languageTag)
 
 namespace {
 
-// 对一张已准备好的图跑一次 OCR，返回文本 + 词数 + 词表。
+// 对一张已准备好的图跑一次 OCR，返回文本 + 词数 + 词表 + 行表。
 struct PassResult
 {
     bool ok = false;
     QString text;
     QVector<WinOcr::Word> words;
+    QVector<WinOcr::Line> lines;
     QString language;
 };
 
@@ -284,29 +285,33 @@ PassResult runOnce(winrt::Windows::Media::Ocr::OcrEngine engine, const QImage &i
     const winrt::Windows::Media::Ocr::OcrResult ocr = engine.RecognizeAsync(bitmap).get();
 
     const double dpr = image.devicePixelRatio() > 0.0 ? image.devicePixelRatio() : 1.0;
-    QStringList lines;
+    QStringList lineTexts;
     for (const auto &line : ocr.Lines()) {
-        QString lineText;
+        WinOcr::Line info;
         for (const auto &word : line.Words()) {
             const QString w = fixSymbolMisreads(
                 QString::fromWCharArray(word.Text().c_str()));
             if (!w.isEmpty()) {
-                if (!lineText.isEmpty())
-                    lineText += QLatin1Char(' ');
-                lineText += w;
+                if (!info.text.isEmpty())
+                    info.text += QLatin1Char(' ');
+                info.text += w;
             }
 
             const auto r = word.BoundingRect();
-            WinOcr::Word info;
-            info.text = w;
-            info.box = QRectF(r.X / dpr, r.Y / dpr, r.Width / dpr, r.Height / dpr);
-            pass.words.append(info);
+            WinOcr::Word wordInfo;
+            wordInfo.text = w;
+            wordInfo.box = QRectF(r.X / dpr, r.Y / dpr, r.Width / dpr, r.Height / dpr);
+            pass.words.append(wordInfo);
+            info.words.append(wordInfo);
+            info.box = info.box.united(wordInfo.box);
         }
-        if (!lineText.isEmpty())
-            lines.append(lineText);
+        if (!info.text.isEmpty()) {
+            pass.lines.append(info);
+            lineTexts.append(info.text);
+        }
     }
 
-    pass.text = lines.join(QLatin1Char('\n'));
+    pass.text = lineTexts.join(QLatin1Char('\n'));
     pass.ok = true;
     return pass;
 }
@@ -345,56 +350,38 @@ Result recognize(const QImage &image, const QString &language, const Options &op
             return result;
         }
 
-        // 候选 A：对比度增强 + 放大（默认路径）
-        // 候选 B：只放大、不增强（增强过度时反而更差，用作兜底比较）
+        // 只跑一次主路径（snow 的做法：一次识别，不反复试候选）。
+        // 以前默认会跑 2 个候选 + 可疑时再跑 2 个 = 最多 4 次识别，
+        // 大图下就是 4 倍耗时 —— 这是"OCR 慢死了"的根因。
+        // 增强作为**失败兜底**：主路径没识别到文字时才换增强图再试一次。
         QImage base = upscaleForOcr(image, 800, 4.0);
 
-        QVector<QImage> candidates;
-        if (options.enhanceContrast) {
+        PassResult best = runOnce(engine, base);
+        if ((!best.ok || best.text.trimmed().isEmpty()) && options.enhanceContrast) {
             QImage enhanced = enhanceForOcr(base);
-            // enhanceForOcr 内部会把图转成 RGB32，这里重新放一次以保留 dpr
             enhanced.setDevicePixelRatio(base.devicePixelRatio());
-            candidates.append(enhanced);
-            candidates.append(base);
-        } else {
-            candidates.append(base);
+            const PassResult retry = runOnce(engine, enhanced);
+            if (retry.ok && !retry.text.trimmed().isEmpty())
+                best = retry;
         }
 
-        // 逐候选识别，保留"看起来更可信"的那份：
-        // 判定顺序 = 有结果 > 文本更长 > 平均词长更长
-        PassResult best;
-        int bestScore = -1;
-        for (const QImage &candidate : candidates) {
-            PassResult pass = runOnce(engine, candidate);
-            if (!pass.ok)
-                continue;
-            const int score = pass.words.isEmpty()
-                                  ? 0
-                                  : pass.text.trimmed().size() * 100
-                                        + pass.words.size();
-            if (score > bestScore) {
-                bestScore = score;
-                best = pass;
-            }
-        }
+        int bestScore = best.words.isEmpty()
+                            ? 0
+                            : best.text.trimmed().size() * 100 + best.words.size();
 
         if (!best.ok || best.text.trimmed().isEmpty()) {
             result.error = QStringLiteral("未识别到文字");
             return result;
         }
 
-        // 二次识别：结果可疑时，把图再放大到短边 1400 重跑一次，取更好的
+        // 二次识别：仅当结果"可疑"（且用户开了该选项）才放大重跑一次。
+        // 这是最后的补偿手段，默认不再无条件触发。
         if (options.retryWhenUncertain
             && looksUncertain(best.text, best.words.size())) {
             const QImage retryBase = upscaleForOcr(image, 1400, 6.0);
             if (retryBase.size() != base.size()) {
-                QVector<QImage> retryCandidates{retryBase};
-                if (options.enhanceContrast) {
-                    QImage enhanced = enhanceForOcr(retryBase);
-                    enhanced.setDevicePixelRatio(retryBase.devicePixelRatio());
-                    retryCandidates.prepend(enhanced);
-                }
-                for (const QImage &candidate : retryCandidates) {
+                for (const QImage &candidate :
+                     QVector<QImage>{ retryBase, enhanceForOcr(retryBase) }) {
                     PassResult pass = runOnce(engine, candidate);
                     if (!pass.ok || pass.words.isEmpty())
                         continue;
@@ -410,6 +397,7 @@ Result recognize(const QImage &image, const QString &language, const Options &op
 
         result.text = best.text;
         result.words = best.words;
+        result.lines = best.lines;
         result.ok = true;
         result.language = QString::fromWCharArray(
             engine.RecognizerLanguage().LanguageTag().c_str());

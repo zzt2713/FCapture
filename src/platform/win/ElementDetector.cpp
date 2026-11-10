@@ -1,8 +1,12 @@
 #include "platform/win/ElementDetector.h"
 
 #include "core/ConfigManager.h"
+#include "platform/win/WindowDetector.h"
 
+#include <QCursor>
+#include <QElapsedTimer>
 #include <QGuiApplication>
+#include <QHash>
 #include <QScreen>
 #include <QThread>
 #include <QTimer>
@@ -12,6 +16,7 @@
 #include <UIAutomation.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <atomic>
 
 using Microsoft::WRL::ComPtr;
@@ -254,6 +259,286 @@ qreal hitArea(const QVector<ElementInfo> &hierarchy)
 // 移动鼠标时旧精化直接作废，流水线不被 300ms 的 UIA 拖慢（识别框一顿一顿的根因）
 std::atomic<quint64> g_latestDetectId{0};
 
+// 快照元素总量上限：大应用（浏览器/IDE）一棵树几万个节点，
+// 全抓既慢又没意义（命中测试只需要矩形）。超出就停。
+constexpr int kMaxSnapshotElements = 20000;
+
+// ---------------------------------------------------------------- 懒加载树
+//
+// 对照 snow 的 WindowTree（snow-ui-selector/src/windows/uia/cache.rs）。
+//
+// 核心思想：每个窗口一棵树，节点按需展开；**展开过的子级永久缓存**，
+// 后续查询同一分支零跨进程 UIA 调用。这是 snow 悬停流畅的根本原因
+// （它的测试：同位置命中 10 次只产生 2 次 provider 调用）。
+//
+// 我们之前的做法是每次请求从窗口根重新下钻，等于每次都付全款；
+// 全量抓树则相反——一次抓太多，ControlView 又裁掉具体控件。
+constexpr int kTreeMaxSteps = 80;      // 单次查询最多下降层数
+constexpr int kTreeMaxRects = 100;     // 单次查询最多返回矩形数
+constexpr int kTreeLinearLimit = 16;   // 子节点 ≤16 用线性扫，否则建索引
+
+// 子节点命中项：矩形 + 节点下标
+struct TreeChild
+{
+    RECT  bounds{};
+    int   node = -1;
+};
+
+struct TreeNode
+{
+    RECT  bounds{};
+    int   parent = -1;
+    // Unloaded = 还没取过子级；Loaded = 子级已缓存（可为空）；
+    // Failed = 该节点展开失败，不再重试
+    enum class State { Unloaded, Loaded, Failed } state = State::Unloaded;
+    QVector<TreeChild> children;
+    ComPtr<IUIAutomationElement> element;   // Unloaded 时用于 BuildUpdatedCache
+    bool timeoutRetried = false;
+};
+
+// 单个窗口的懒加载 UIA 树。只在 UIA 工作线程内使用，不跨线程。
+class UiaLazyTree
+{
+public:
+    void setRoot(quintptr hwnd, const RECT &bounds)
+    {
+        m_hwnd = hwnd;
+        m_nodes.clear();
+        TreeNode root;
+        root.bounds = bounds;
+        m_nodes.append(root);
+    }
+
+    bool isValid() const { return !m_nodes.isEmpty(); }
+    bool hasLoaded() const { return m_loadedAny; }
+
+    // 命中查询：从根逐层下降，返回 元素(深) → … → 窗口(浅) 的矩形链。
+    // 只有未展开的节点才会触发一次 BuildUpdatedCache，其余全读缓存。
+    QVector<RECT> hitTest(IUIAutomation2 *automation,
+                          IUIAutomationCacheRequest *request,
+                          const POINT &pt,
+                          int budgetMs,
+                          const QRect &screenLogical,
+                          qreal dpr)
+    {
+        Q_UNUSED(screenLogical);
+        Q_UNUSED(dpr);
+        QVector<RECT> path;
+        if (m_nodes.isEmpty() || !containsPoint(m_nodes[0].bounds, pt))
+            return path;
+
+        QElapsedTimer clock;
+        clock.start();
+        int current = 0;
+        int depth = 0;
+
+        for (; depth < kTreeMaxSteps; ++depth) {
+            if (clock.elapsed() >= budgetMs)
+                break;
+            if (!expand(automation, request, current, budgetMs - int(clock.elapsed())))
+                break;
+
+            const int child = hitChild(current, pt);
+            if (child < 0)
+                break;
+            current = child;
+        }
+
+        // 从叶子往上收集（跳过与根同尺寸的）
+        int node = current;
+        const RECT rootBounds = m_nodes[0].bounds;
+        while (node > 0 && path.size() < kTreeMaxRects - 1) {
+            const RECT &b = m_nodes[node].bounds;
+            const bool dup = std::any_of(path.cbegin(), path.cend(),
+                                         [&b](const RECT &r) { return sameRect(r, b); });
+            if (!sameRect(b, rootBounds) && !dup)
+                path.append(b);
+            node = m_nodes[node].parent;
+        }
+        path.append(rootBounds);
+        return path;
+    }
+
+    // 清空缓存（窗口结构变化时由上层调用）
+    void invalidate() { m_nodes.clear(); }
+
+private:
+    static bool containsPoint(const RECT &r, const POINT &p)
+    {
+        return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
+    }
+
+    static bool sameRect(const RECT &a, const RECT &b)
+    {
+        return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+    }
+
+    // 命中本节点的哪个子级：取"最后一个"包含光标的（后绘制=上层，snow 同款）
+    int hitChild(int node, const POINT &pt) const
+    {
+        const QVector<TreeChild> &kids = m_nodes.at(node).children;
+        for (int i = kids.size() - 1; i >= 0; --i) {
+            if (containsPoint(kids.at(i).bounds, pt))
+                return kids.at(i).node;
+        }
+        return -1;
+    }
+
+    // 展开一个节点。只有 State::Unloaded 才跨进程，Loaded 直接返回 true。
+    //
+    // 注意：**不能持有 `TreeNode &` 引用**。本函数中途会 m_nodes.append
+    // 新节点导致 QVector 重分配，旧引用立刻悬空——之前就是这么崩的
+    // （0xC0000005）。所有节点访问一律按下标。
+    bool expand(IUIAutomation2 *automation, IUIAutomationCacheRequest *request,
+                int node, int remainingMs)
+    {
+        const TreeNode::State state = m_nodes.at(node).state;
+        if (state == TreeNode::State::Loaded)
+            return true;
+        if (state == TreeNode::State::Failed)
+            return false;
+
+        // 需要在重分配后仍然可用的数据：先拷出来
+        ComPtr<IUIAutomationElement> nodeElement = m_nodes.at(node).element;
+        bool timeoutRetried = m_nodes.at(node).timeoutRetried;
+
+        // 动态调整超时：取剩余预算（snow 的 set_timeouts 同款）
+        const int ms = qBound(1, remainingMs, 500);
+        automation->put_ConnectionTimeout(ms);
+        automation->put_TransactionTimeout(ms);
+
+        // 根节点：用 ElementFromHandleBuildCache 直接拿带缓存的窗口根
+        ComPtr<IUIAutomationElement> cached;
+        HRESULT hr = E_FAIL;
+        if (node == 0) {
+            hr = automation->ElementFromHandleBuildCache(
+                reinterpret_cast<UIA_HWND>(m_hwnd), request, cached.GetAddressOf());
+        } else if (nodeElement) {
+            hr = nodeElement->BuildUpdatedCache(request, cached.GetAddressOf());
+        }
+        // 失败且是首次超时：重试一次（snow 的 retry_timeout 同款）
+        if (FAILED(hr) && !timeoutRetried) {
+            timeoutRetried = true;
+            m_nodes[node].timeoutRetried = true;
+            if (node == 0) {
+                hr = automation->ElementFromHandleBuildCache(
+                    reinterpret_cast<UIA_HWND>(m_hwnd), request, cached.GetAddressOf());
+            } else if (nodeElement) {
+                hr = nodeElement->BuildUpdatedCache(request, cached.GetAddressOf());
+            }
+        }
+        if (FAILED(hr) || !cached) {
+            m_nodes[node].state = TreeNode::State::Failed;
+            static int __fail = 0;
+            if ((__fail++ % 20) == 0)
+                qInfo().nospace() << "[expand-fail] node=" << node
+                                  << " hr=0x" << QString::number(quint32(hr), 16)
+                                  << " hwnd=" << quintptr(m_hwnd);
+            return false;
+        }
+
+        int count = 0;
+        const RECT rootBounds = m_nodes.at(0).bounds;
+        QVector<TreeChild> entries;
+        ComPtr<IUIAutomationElementArray> kids;
+        if (SUCCEEDED(cached->GetCachedChildren(kids.GetAddressOf())) && kids) {
+            kids->get_Length(&count);
+            entries.reserve(count);
+            for (int i = 0; i < count; ++i) {
+                ComPtr<IUIAutomationElement> kid;
+                if (FAILED(kids->GetElement(i, kid.GetAddressOf())) || !kid)
+                    continue;
+
+                BOOL offscreen = FALSE;
+                kid->get_CachedIsOffscreen(&offscreen);
+                if (offscreen)
+                    continue;
+
+                RECT r{};
+                if (FAILED(kid->get_CachedBoundingRectangle(&r))
+                    || r.right <= r.left || r.bottom <= r.top)
+                    continue;
+                // 与窗口矩形求交（UIA 偶尔报越界矩形）
+                RECT clipped{};
+                if (!::IntersectRect(&clipped, &r, &rootBounds)
+                    || clipped.right <= clipped.left || clipped.bottom <= clipped.top)
+                    continue;
+
+                const int index = m_nodes.size();
+                TreeNode child;
+                child.bounds = clipped;
+                child.parent = node;
+                child.element = kid;
+                m_nodes.append(child);
+                entries.append({ clipped, index });
+            }
+        }
+
+        // UIA 拿不到子级时退回 HWND 子窗口（snow 的 visible_child_window_rects 同款）。
+        //
+        // 典型场景：Windows 任务栏的应用图标区（MSTaskSwWClass）是 owner-drawn，
+        // UIA 的 ControlView/RawView 都返回空，但它的子窗口 HWND 是存在的
+        // （实测 EnumChildWindows 能拿到 17 个，其中 hwnd 66036 正是图标区）。
+        // 没有这一步就只能选到"正在运行的应用"整块，选不到具体图标。
+        if (entries.isEmpty()) {
+            HWND selfHwnd = nullptr;
+            if (node == 0) {
+                selfHwnd = reinterpret_cast<HWND>(m_hwnd);
+            } else if (nodeElement) {
+                UIA_HWND nw = nullptr;
+                if (SUCCEEDED(nodeElement->get_CurrentNativeWindowHandle(&nw)))
+                    selfHwnd = reinterpret_cast<HWND>(nw);
+            }
+            // 只取**直接子窗口**（GetWindow(GW_CHILD) + GW_HWNDNEXT）。
+            // EnumChildWindows 会递归枚举全部后代，矩形互相嵌套，命中测试会乱。
+            for (HWND hw = selfHwnd ? ::GetWindow(selfHwnd, GW_CHILD) : nullptr; hw;
+                 hw = ::GetWindow(hw, GW_HWNDNEXT)) {
+                if (!::IsWindowVisible(hw))
+                    continue;
+                RECT r{};
+                if (!::GetWindowRect(hw, &r) || r.right <= r.left || r.bottom <= r.top)
+                    continue;
+                RECT clipped{};
+                if (!::IntersectRect(&clipped, &r, &rootBounds)
+                    || clipped.right - clipped.left <= 1
+                    || clipped.bottom - clipped.top <= 1)
+                    continue;
+                TreeNode child;
+                child.bounds = clipped;
+                child.parent = node;
+                child.state = TreeNode::State::Loaded;   // 叶子，不再展开
+                const int index = m_nodes.size();
+                m_nodes.append(child);
+                entries.append({ clipped, index });
+            }
+        }
+
+        m_nodes[node].children = entries;
+        m_nodes[node].state = TreeNode::State::Loaded;
+        m_nodes[node].element.Reset();   // 子级已展开，父元素引用不再需要
+        m_loadedAny = true;
+
+        static int __n = 0;
+        if ((__n++ % 20) == 0) {
+            qInfo().nospace() << "[expand] node=" << node << " uiaKids=" << count
+                              << " entries=" << entries.size() << " hwnd=" << quintptr(m_hwnd)
+                              << (entries.isEmpty()
+                                      ? QString()
+                                      : QStringLiteral(" first=")
+                                            + QString::number(entries.first().bounds.right
+                                                              - entries.first().bounds.left)
+                                            + "x"
+                                            + QString::number(entries.first().bounds.bottom
+                                                              - entries.first().bounds.top));
+        }
+        return true;
+    }
+
+    quintptr m_hwnd = 0;
+    QVector<TreeNode> m_nodes;
+    bool m_loadedAny = false;
+};
+
 class ElementDetector::Worker : public QObject
 {
     Q_OBJECT
@@ -265,116 +550,456 @@ public:
 public slots:
     void initialize()
     {
+        // 必须用 CUIAutomation8：只有它支持 IUIAutomation2（ConnectionTimeout /
+        // TransactionTimeout）。用 CUIAutomation 时 uia.As(&uia2) 会失败，
+        // 导致超时设置全部无效、懒加载树分支也进不去（实测 auto2=false）。
         ComPtr<IUIAutomation> uia;
-        if (SUCCEEDED(::CoCreateInstance(__uuidof(CUIAutomation), nullptr,
-                                         CLSCTX_INPROC_SERVER,
-                                         IID_PPV_ARGS(uia.GetAddressOf())))) {
-            // 缩短 UIA 自身的跨进程等待（IUIAutomation2 才有这两个属性），
-            // 外层还有 500ms 看门狗兜底
+        HRESULT hr = ::CoCreateInstance(CLSID_CUIAutomation8, nullptr,
+                                        CLSCTX_INPROC_SERVER,
+                                        IID_PPV_ARGS(uia.GetAddressOf()));
+        if (FAILED(hr) || !uia) {
+            // 系统太老（Win7）时退回 CUIAutomation
+            hr = ::CoCreateInstance(__uuidof(CUIAutomation), nullptr,
+                                    CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(uia.GetAddressOf()));
+        }
+        if (SUCCEEDED(hr) && uia) {
             ComPtr<IUIAutomation2> uia2;
             if (SUCCEEDED(uia.As(&uia2)) && uia2) {
                 uia2->put_ConnectionTimeout(80);
                 uia2->put_TransactionTimeout(80);
+            } else {
+                qWarning() << "ElementDetector: IUIAutomation2 unavailable, timeouts not set";
             }
             m_uia = std::move(uia);
         }
     }
 
+    // 清空懒加载树缓存（窗口结构变化 / 新一次截图会话时调用）
+    void clearTreeCache() { m_trees.clear(); }
+
+    // 快照：遍历所有可见顶层窗口的 UIA 树，收集全部元素矩形。
+    // 只在进入截图时调用一次（Snow Shot 同款思路），之后鼠标移动
+    // 全部走本地矩形命中测试，不再跨进程调 UIA。
+    void snapshot(quint64 token, QVector<quintptr> exclude)
+    {
+        QVector<ElementInfo> all;
+        if (!m_uia) {
+            emit snapshotReady(token, all, true);
+            return;
+        }
+
+        m_activeToken = token;
+
+        // CacheRequest 批量缓存（snow-ui-selector 的 NativeProvider 同款）：
+        // 一次跨进程调用缓存整棵子树的 矩形/离屏/类型/名称，之后零往返读取。
+        ComPtr<IUIAutomationCacheRequest> req;
+        if (FAILED(m_uia->CreateCacheRequest(req.GetAddressOf())) || !req) {
+            emit snapshotReady(token, all, true);
+            return;
+        }
+        req->AddProperty(UIA_BoundingRectanglePropertyId);
+        req->AddProperty(UIA_IsOffscreenPropertyId);
+        req->AddProperty(UIA_ControlTypePropertyId);
+        req->AddProperty(UIA_NamePropertyId);
+        req->put_TreeScope(TreeScope_Subtree);
+        m_cacheReq = req;
+
+        // 控件视图条件（uia.rs 的 SetTreeFilter(ControlViewCondition) 同款）：
+        // 只收控件，滤掉文本碎片/纯布局面板 —— 它们常与按钮同矩形，
+        // 混进来会让命中测试"差一点"。
+        ComPtr<IUIAutomationCondition> viewCond;
+        if (FAILED(m_uia->get_ControlViewCondition(viewCond.GetAddressOf())) || !viewCond) {
+            if (FAILED(m_uia->CreateTrueCondition(viewCond.GetAddressOf())) || !viewCond) {
+                emit snapshotReady(token, all, true);
+                return;
+            }
+        }
+        m_trueCond = viewCond;
+
+        // 抓快照期间放宽 UIA 超时（交互查询仍是 80ms）
+        ComPtr<IUIAutomation2> uia2;
+        if (SUCCEEDED(m_uia.As(&uia2)) && uia2) {
+            uia2->put_ConnectionTimeout(2000);
+            uia2->put_TransactionTimeout(2000);
+        }
+
+        // ---- 阶段 1：收集候选窗口（廉价，只取 HWND/位置）----
+        //
+        // 候选窗口统一走 WindowDetector：IsIconic / DWM cloaked / 壳窗口 /
+        // 点击穿透 / 配置排除 / 遮罩排除都在里面。以前这里自己写过滤、
+        // 只查了 IsWindowVisible——最小化窗口的 UIA 元素以"还原矩形"混进
+        // 快照，就是"最小化的窗口也能识别到元素"的根因。
+        struct WinEntry { HWND hwnd; qreal dpr; QRectF logicalRect; };
+        QVector<WinEntry> wins;
+
+        for (const WindowInfo &w : WindowDetector::enumTopLevelWindows()) {
+            if (exclude.contains(w.hwnd))
+                continue;
+            qreal dpr = 1.0;
+            for (QScreen *screen : QGuiApplication::screens()) {
+                if (screen->geometry().contains(w.logicalRect.center())) {
+                    dpr = screen->devicePixelRatio();
+                    break;
+                }
+            }
+            wins.append({ reinterpret_cast<HWND>(w.hwnd), dpr, w.logicalRect });
+        }
+
+        // 快速种子先发"光标真命中"的窗口（WindowFromPoint 语义）：
+        // 几何包含会把 NVIDIA Overlay 这类全屏悬浮层排到真窗口前面
+        const quintptr hitHwnd = WindowDetector::windowFromPoint(QCursor::pos()).hwnd;
+        for (int i = 0; i < wins.size(); ++i) {
+            if (quintptr(wins.at(i).hwnd) == hitHwnd) {
+                const WinEntry w = wins.takeAt(i);
+                wins.prepend(w);
+                break;
+            }
+        }
+        POINT curPhys{ 0, 0 };
+        ::GetCursorPos(&curPhys);
+
+        // ---- 快速种子：先把光标下的命中链发出去 ----
+        //
+        // snow 同款：光标在哪个窗口就只下钻那棵树的命中路径，
+        // 得到"元素 → 父 → 窗"的结构化链。不等整棵扫描。
+        if (!wins.isEmpty()) {
+            ComPtr<IUIAutomationElement> root;
+            if (SUCCEEDED(m_uia->ElementFromHandle(
+                    reinterpret_cast<UIA_HWND>(wins.first().hwnd), root.GetAddressOf()))
+                && root) {
+                QVector<ElementInfo> chain = hitPathAt(root.Get(), curPhys, wins.first().dpr);
+                for (ElementInfo &info : chain) {
+                    info.nativeHandle = quintptr(wins.first().hwnd);
+                    info.logicalRect = info.logicalRect.intersected(wins.first().logicalRect);
+                }
+                chain.erase(std::remove_if(chain.begin(), chain.end(),
+                                           [](const ElementInfo &e) {
+                                               return e.logicalRect.isEmpty();
+                                           }),
+                            chain.end());
+                if (!chain.isEmpty()) {
+                    m_snapshotBuffer += chain;
+                    emit snapshotReady(token, m_snapshotBuffer, false);
+                }
+            }
+        }
+
+        // ---- 阶段 2：逐窗口排队扫描 ----
+        //
+        // 每个窗口一个独立的排队任务，而不是一个任务从头跑到尾：
+        // 之前整棵树扫描独占 worker 几秒，实时查询全被堵在队列里。
+        // 拆开后实时请求能插队，鼠标移到未扫完的窗口也有响应。
+        for (const WinEntry &w : wins) {
+            QMetaObject::invokeMethod(this,
+                                      [this, token, w]() {
+                                          scanOneWindow(token, w.hwnd, w.dpr, w.logicalRect);
+                                      },
+                                      Qt::QueuedConnection);
+        }
+        QMetaObject::invokeMethod(this, [this, token]() { finishSnapshot(token); },
+                                  Qt::QueuedConnection);
+    }
+
+    // 单窗口扫描：全量抓这棵 UIA 树（FindAllBuildCache 一次往返拿全部属性）。
+    //
+    // 为什么必须全量：鼠标会在窗口内任意位置移动，快照必须覆盖全部元素，
+    // 否则"识别不出来"。层级正确性不靠这里保证——命中时再按真实 UIA 树
+    // 逐层下钻（见 hitPathAt / q），矩形只用于快速筛选。
+    void scanOneWindow(quint64 token, HWND hwnd, qreal dpr, const QRectF &windowRect)
+    {
+        if (token != m_activeToken || !m_uia)
+            return;   // 已被新快照取代
+        if (m_snapshotBuffer.size() >= kMaxSnapshotElements)
+            return;
+
+        ComPtr<IUIAutomationElement> root;
+        if (FAILED(m_uia->ElementFromHandle(
+                reinterpret_cast<UIA_HWND>(hwnd), root.GetAddressOf()))
+            || !root) {
+            return;
+        }
+
+        ComPtr<IUIAutomationElementArray> arr;
+        const HRESULT hr = root->FindAllBuildCache(
+            TreeScope_Subtree, m_trueCond.Get(), m_cacheReq.Get(), arr.GetAddressOf());
+        if (FAILED(hr) || !arr) {
+            snapshotWindowTree(root.Get(), dpr, 12, &m_snapshotBuffer,
+                               quintptr(hwnd), windowRect);
+            emit snapshotReady(token, m_snapshotBuffer, false);
+            return;
+        }
+
+        int count = 0;
+        arr->get_Length(&count);
+        for (int i = 0; i < count; ++i) {
+            if (m_snapshotBuffer.size() >= kMaxSnapshotElements)
+                break;
+
+            ComPtr<IUIAutomationElement> el;
+            if (FAILED(arr->GetElement(i, el.GetAddressOf())) || !el)
+                continue;
+
+            BOOL offscreen = FALSE;
+            el->get_CachedIsOffscreen(&offscreen);
+            if (offscreen)
+                continue;
+
+            RECT r{};
+            if (FAILED(el->get_CachedBoundingRectangle(&r))
+                || r.right <= r.left || r.bottom <= r.top)
+                continue;
+
+            ElementInfo info;
+            info.logicalRect = rectToLogical(r, dpr);
+            if (info.logicalRect.isEmpty())
+                continue;
+            // 只做"完全不越界"的软裁剪：元素中心必须在窗口内。
+            // 不能直接 intersected(windowRect)——Chrome 这类把元素矩形
+            // 报得比窗口略大（滚动条/装饰），一裁就变空被丢掉，
+            // 表现为"只识别到大框，识别不到具体元素"。
+            if (!windowRect.contains(info.logicalRect.center()))
+                continue;
+            info.nativeHandle = quintptr(hwnd);
+
+            BSTR name = nullptr;
+            if (SUCCEEDED(el->get_CachedName(&name)) && name) {
+                info.name = QString::fromWCharArray(name);
+                ::SysFreeString(name);
+            }
+            CONTROLTYPEID ct = 0;
+            if (SUCCEEDED(el->get_CachedControlType(&ct)))
+                info.controlType = controlTypeName(ct);
+
+            m_snapshotBuffer.append(info);
+        }
+
+        emit snapshotReady(token, m_snapshotBuffer, false);
+    }
+
+    // 按需补抓某个窗口的命中链（光标移到新窗口时用）
+    void finishSnapshot(quint64 token)
+    {
+        if (token != m_activeToken)
+            return;
+
+        // 恢复交互查询的短超时
+        ComPtr<IUIAutomation2> uia2;
+        if (SUCCEEDED(m_uia.As(&uia2)) && uia2) {
+            uia2->put_ConnectionTimeout(80);
+            uia2->put_TransactionTimeout(80);
+        }
+
+        qInfo() << "Element snapshot:" << m_snapshotBuffer.size() << "elements";
+        emit snapshotReady(token, m_snapshotBuffer, true);
+        m_snapshotBuffer.clear();
+    }
+
+    // 元素检测主入口：MSAA 优先（毫秒级），粗命中时让 UIA 精化。
     void detect(quint64 requestId, QPoint screenPos, quintptr targetHwnd, bool useMsaa)
     {
         const POINT probe{ screenPos.x(), screenPos.y() };
         const qreal dpr = dprAtPhysical(probe);
         const POINT pt{ qRound(screenPos.x() * dpr), qRound(screenPos.y() * dpr) };
 
-        // 顺序很重要：**MSAA 优先，UIA 兜底**。
-        //
-        // MSAA 的 accHitTest 是"点查询"，一次调用几毫秒；UIA 要遍历控件树、
-        // 跨进程取每个节点的 BoundingRectangle，动辄几十到几百毫秒 ——
-        // 这正是之前卡顿的原因。Snipaste 之所以跟手，就是主用 MSAA。
-        //
-        // 例外：MSAA 只给出"窗口壳"级粗命中时不能直接返回，必须让 UIA
-        // 有机会给出更具体的控件（Qt / WPF / Electron 的 MSAA 桥就是这种情况）。
-        const QVector<ElementInfo> msaaResult = detectWithMsaa(pt, targetHwnd);
-
-        if (!useMsaa && !msaaResult.isEmpty() && !isCoarseHit(msaaResult, targetHwnd)) {
-            emit resultReady(requestId, msaaResult, false);
-            return;
+        {
+            static int __d = 0;
+            if ((__d++ % 10) == 0)
+                qInfo().nospace() << "[detect] pos=" << screenPos << " hwnd=" << targetHwnd
+                                  << " useMsaa=" << useMsaa << " uia=" << bool(m_uia);
         }
 
+        // UIA 是主路径（snow 同款：它默认后台就是 UIA，MSAA 只作为可选降级）。
+        // 以前这里"MSAA 结果不粗就直接返回"，导致 Chrome 这类
+        // MSAA 桥只暴露窗口/标签栏的程序**永远进不了 UIA**，
+        // 高亮停在大块上、具体控件识别不出来。
+        //
+        // MSAA 现在只用于：显式配置降级（useMsaa）、或者 UIA 完全不可用。
         if (useMsaa || !m_uia) {
-            emit resultReady(requestId, msaaResult, false);
+            emit resultReady(requestId, detectWithMsaa(pt, targetHwnd), false);
             return;
         }
 
-        // 粗命中：先把窗口级结果发出去保证跟手（interim），
-        // UIA 精化拆到下一个任务步骤——本步骤必须立刻返回，
-        // 否则新请求会在队列里干等 300ms 的 UIA，识别框一顿一顿的就是这么来的。
-        if (!msaaResult.isEmpty())
+        // 先用 MSAA 的快速结果垫一帧（如果它比窗口更具体），保证跟手
+        const QVector<ElementInfo> msaaResult = detectWithMsaa(pt, targetHwnd);
+        if (!msaaResult.isEmpty() && !isCoarseHit(msaaResult, targetHwnd))
             emit resultReady(requestId, msaaResult, true);
 
-        QMetaObject::invokeMethod(this,
-                                  [this, requestId, pt, targetHwnd, dpr, msaaResult]() {
-                                      refineWithUia(requestId, pt, targetHwnd, dpr,
-                                                    msaaResult);
-                                  },
-                                  Qt::QueuedConnection);
+        // 必须**同步**调用精化：detect() 本身就运行在 worker 线程里，
+        // 再 invokeMethod(QueuedConnection) 只是把任务挪到本线程的事件队列尾部。
+        // 而主线程那边 m_elementPending 已经清掉，鼠标一动就会发新请求，
+        // 排队中的旧精化执行时 requestId != g_latestDetectId → 直接丢弃。
+        // 结果是"鼠标在动就一直不做 UIA 查询"，树永远长不出来（实测日志：
+        // [detect] 有输出、[expand] 一次都没有）。
+        // 懒加载树本身有缓存，重复命中零跨进程调用，同步执行不会拖慢。
+        refineWithUia(requestId, pt, targetHwnd, dpr, msaaResult);
     }
 
 signals:
     void resultReady(quint64 requestId, const QVector<ElementInfo> &hierarchy,
                      bool interim);
+    void snapshotReady(quint64 token, const QVector<ElementInfo> &elements,
+                       bool final);
 
 private:
-    // UIA 精化：把粗命中细化到具体控件。排队执行且开头先查"是否已被新请求取代"，
-    // 移动鼠标时旧精化直接作废，只在鼠标停下的最后一单上真正花 300ms。
+    // ---- 快照：遍历一个窗口的 UIA 树，收集所有元素矩形 ----
+    // 深度限制避免在大型应用（Office、IDE）上爆炸；
+    // 宽度/高度为 0 的容器跳过（对命中测试无意义）。
+    void snapshotWindowTree(IUIAutomationElement *root, qreal dpr, int maxDepth,
+                            QVector<ElementInfo> *out, quintptr ownerHwnd,
+                            const QRectF &windowRect)
+    {
+        if (!root || !out)
+            return;
+
+        struct Item { IUIAutomationElement *el; int depth; };
+        QVector<Item> stack;
+        stack.append({root, 0});
+        root->AddRef();
+
+        while (!stack.isEmpty()) {
+            const Item it = stack.takeLast();
+
+            RECT r{};
+            if (SUCCEEDED(it.el->get_CurrentBoundingRectangle(&r))
+                && r.right > r.left && r.bottom > r.top) {
+                ElementInfo info;
+                info.logicalRect = QRectF(r.left / dpr, r.top / dpr,
+                                          (r.right - r.left) / dpr,
+                                          (r.bottom - r.top) / dpr)
+                                       .intersected(windowRect);
+                if (info.logicalRect.isEmpty()) {
+                    it.el->Release();
+                    continue;
+                }
+                info.nativeHandle = ownerHwnd;
+                BSTR name = nullptr;
+                if (SUCCEEDED(it.el->get_CurrentName(&name)) && name) {
+                    info.name = QString::fromWCharArray(name);
+                    ::SysFreeString(name);
+                }
+                CONTROLTYPEID ct = 0;
+                if (SUCCEEDED(it.el->get_CurrentControlType(&ct)))
+                    info.controlType = QString::number(ct);
+                info.depth = it.depth;
+                out->append(info);
+            }
+
+            if (it.depth < maxDepth) {
+                ComPtr<IUIAutomationTreeWalker> walker;
+                if (m_uia && SUCCEEDED(m_uia->get_ControlViewWalker(walker.GetAddressOf()))) {
+                    ComPtr<IUIAutomationElement> child;
+                    if (SUCCEEDED(walker->GetFirstChildElement(it.el, child.GetAddressOf()))
+                        && child) {
+                        // 必须把兄弟节点全收进来：GetFirstChildElement 只给第一个孩子，
+                        // 不沿 GetNextSiblingElement 走一遍就只收集到每层最左边一条链，
+                        // 快照里只剩窗口级矩形（按钮/输入框全丢）。
+                        // 每层限制 kMaxSiblings 个，防止大列表/表格拖垮快照。
+                        constexpr int kMaxSiblings = 300;
+                        for (int n = 0; child && n < kMaxSiblings; ++n) {
+                            ComPtr<IUIAutomationElement> next;
+                            walker->GetNextSiblingElement(child.Get(), next.GetAddressOf());
+                            stack.append({child.Detach(), it.depth + 1});
+                            child = std::move(next);
+                        }
+                    }
+                }
+            }
+            it.el->Release();
+        }
+    }
+
+    // UIA 精化：走懒加载树查询（snow 同款）。
+    //
+    // 树按窗口缓存并跨请求常驻：第一次进入某窗口会逐层展开命中路径，
+    // 之后在同一分支里移动**零跨进程 UIA 调用**，只读本地矩形。
+    // 这是"snow 悬停流畅"的核心，我们之前每次请求都从根重建，等于每次付全款。
     void refineWithUia(quint64 requestId, POINT pt, quintptr targetHwnd, qreal dpr,
                        const QVector<ElementInfo> &msaaResult)
     {
-        if (requestId != g_latestDetectId.load())
+        {
+            static int __r = 0;
+            if ((__r++ % 10) == 0)
+                qInfo().nospace() << "[refine] id=" << requestId
+                                  << " latest=" << g_latestDetectId.load()
+                                  << " hwnd=" << targetHwnd;
+        }
+        if (requestId != g_latestDetectId.load()) {
+            static int __s = 0;
+            if ((__s++ % 10) == 0)
+                qInfo().nospace() << "[refine-skip] id=" << requestId
+                                  << " latest=" << g_latestDetectId.load();
             return;
+        }
 
         QVector<ElementInfo> hierarchy;
 
-        // 截图时我们自己的全屏遮罩盖在所有窗口之上。ElementFromPoint
-        // 会原样返回这个遮罩（整屏），所以它永远只能拿到"整屏"。
-        //
-        // 正确做法：主线程按 Z 序算出遮罩下面那个真实窗口，用
-        // ElementFromHandle 取它的 UIA 根，再从根一路向下找光标命中的
-        // 最具体控件。这样既绕开遮罩，又能拿到按钮/输入框/列表项。
-        ComPtr<IUIAutomationElement> hit;
-        if (targetHwnd) {
-            ComPtr<IUIAutomationElement> root;
-            if (SUCCEEDED(m_uia->ElementFromHandle(
-                    reinterpret_cast<UIA_HWND>(targetHwnd), root.GetAddressOf()))
-                && root) {
-                deepestElementAt(root.Get(), pt, hit);
+        if (targetHwnd && m_uia) {
+            if (!m_cacheRequest) {
+                ComPtr<IUIAutomationCacheRequest> req;
+                if (SUCCEEDED(m_uia->CreateCacheRequest(req.GetAddressOf())) && req) {
+                    // 只取"自己 + 直接子级"一层（snow 的 TreeScope_Element|Children）
+                    req->AddProperty(UIA_BoundingRectanglePropertyId);
+                    req->AddProperty(UIA_IsOffscreenPropertyId);
+                    req->AddProperty(UIA_ControlTypePropertyId);
+                    req->AddProperty(UIA_NamePropertyId);
+                    // NativeWindowHandle：UIA 子级为空时要用它回退到 HWND 子窗口
+                    //（任务栏应用图标区就是这种情况，必须缓存，否则
+                    // get_CurrentNativeWindowHandle 会触发实时跨进程查询）
+                    req->AddProperty(UIA_NativeWindowHandlePropertyId);
+                    req->put_TreeScope(
+                        static_cast<TreeScope>(TreeScope_Element | TreeScope_Children));
+                    ComPtr<IUIAutomationCondition> cond;
+                    if (SUCCEEDED(m_uia->get_ControlViewCondition(cond.GetAddressOf()))
+                        && cond)
+                        req->put_TreeFilter(cond.Get());
+                    m_cacheRequest = req;
+                }
+            }
+
+            ComPtr<IUIAutomation2> automation2;
+            m_uia.As(&automation2);
+            {
+                static int __c = 0;
+                if ((__c++ % 10) == 0)
+                    qInfo().nospace() << "[refine-tree] cacheReq=" << bool(m_cacheRequest)
+                                      << " auto2=" << bool(automation2);
+            }
+            if (m_cacheRequest && automation2) {
+                UiaLazyTree &tree = m_trees[targetHwnd];
+                if (!tree.isValid()) {
+                    RECT wr{};
+                    if (::GetWindowRect(reinterpret_cast<HWND>(targetHwnd), &wr))
+                        tree.setRoot(targetHwnd, wr);
+                }
+                if (tree.isValid()) {
+                    const QVector<RECT> path = tree.hitTest(
+                        automation2.Get(), m_cacheRequest.Get(), pt, 168, QRect(), dpr);
+                    for (const RECT &r : path) {
+                        ElementInfo info;
+                        info.logicalRect = rectToLogical(r, dpr);
+                        info.nativeHandle = targetHwnd;
+                        hierarchy.append(info);
+                    }
+                }
             }
         }
 
-        // 没有目标窗口句柄（或该窗口不提供 UIA 树）时的兜底：
-        // 直接用 ElementFromPoint，命中本进程元素就丢掉，退回 MSAA。
-        if (!hit) {
-            ComPtr<IUIAutomationElement> fromPoint;
-            if (SUCCEEDED(m_uia->ElementFromPoint(pt, fromPoint.GetAddressOf()))
-                && fromPoint && !isOwnProcess(fromPoint.Get())) {
-                hit = fromPoint;
-            }
-        }
-
-        if (hit) {
-            hierarchy = buildHierarchyUp(hit.Get(), dpr);
-        }
-
-        // 三层回退：目标窗口 UIA → 全局 ElementFromPoint → MSAA。
-        // 很多自绘程序（WPF 老版本、Qt 程序、部分 Electron）单靠某一条
-        // 路径都拿不到控件，必须三条都试一遍，这才是 Snipaste 能覆盖
-        // 大部分软件的原因。
         if (hierarchy.isEmpty()) {
-            ComPtr<IUIAutomationElement> fromPoint;
-            if (SUCCEEDED(m_uia->ElementFromPoint(pt, fromPoint.GetAddressOf()))
-                && fromPoint && !isOwnProcess(fromPoint.Get())) {
-                hierarchy = buildHierarchyUp(fromPoint.Get(), dpr);
+            // 兜底：懒加载树不可用（窗口没有 UIA 树等），退回旧的逐层下钻
+            ComPtr<IUIAutomationElement> hit;
+            if (targetHwnd) {
+                ComPtr<IUIAutomationElement> root;
+                if (SUCCEEDED(m_uia->ElementFromHandle(
+                        reinterpret_cast<UIA_HWND>(targetHwnd), root.GetAddressOf()))
+                    && root) {
+                    deepestElementAt(root.Get(), pt, hit);
+                }
             }
+            if (hit && !isOwnProcess(hit.Get()))
+                hierarchy = buildHierarchyUp(hit.Get(), dpr);
+            else if (!msaaResult.isEmpty())
+                hierarchy = msaaResult;
         }
 
         // 精化期间来了新请求就丢弃本次结果（回了也是旧位置的）
@@ -402,61 +1027,176 @@ private:
         return pid != 0 && pid == ::GetCurrentProcessId();
     }
 
-    // 从 root 向下，取包含 pt 的最深子元素，写入 out。
-    // 只走 ControlView：RawView 会带出大量不可见装饰节点，反而拖慢。
+    // snow 式"边下钻边出链"（uia/cache.rs 的 WindowTree::query + path()）：
+    // 从窗口根节点逐层下钻，每层只保留包含光标的那个子节点，把路径上的
+    // 矩形按 深→浅 收集成链。
+    //
+    // 与"全量抓整棵树再按面积猜父子"相比，这是唯一能保证层级正确的方式：
+    // 面积相同/矩形交叉的兄弟、列表项、被遮挡元素，靠事后排序永远会猜错。
+    QVector<ElementInfo> hitPathAt(IUIAutomationElement *root, const POINT &pt, qreal dpr)
+    {
+        QVector<ElementInfo> path;
+        if (!root || !m_uia)
+            return path;
+
+        ComPtr<IUIAutomationTreeWalker> walker;
+        if (FAILED(m_uia->get_ControlViewWalker(walker.GetAddressOf())) || !walker)
+            return path;
+
+        const QRect screenLogical = logicalVirtualScreen();
+        ComPtr<IUIAutomationElement> current(root);
+
+        for (int depth = 0; current && depth < 16; ++depth) {
+            // 本级元素：收进链（整屏根节点跳过，高亮它等于整屏不发暗）
+            RECT r{};
+            if (SUCCEEDED(current->get_CurrentBoundingRectangle(&r))
+                && r.right > r.left && r.bottom > r.top) {
+                BOOL offscreen = FALSE;
+                current->get_CurrentIsOffscreen(&offscreen);
+                ElementInfo info;
+                info.logicalRect = rectToLogical(r, dpr);
+                info.depth = depth;
+                const bool fullScreen =
+                    info.logicalRect.width() >= screenLogical.width() - 2
+                    && info.logicalRect.height() >= screenLogical.height() - 2;
+                if (!offscreen && !fullScreen && !info.logicalRect.isEmpty()) {
+                    BSTR name = nullptr;
+                    if (SUCCEEDED(current->get_CurrentName(&name)) && name) {
+                        info.name = QString::fromWCharArray(name);
+                        ::SysFreeString(name);
+                    }
+                    CONTROLTYPEID ct = 0;
+                    if (SUCCEEDED(current->get_CurrentControlType(&ct)))
+                        info.controlType = controlTypeName(ct);
+                    path.append(info);
+                }
+            }
+
+            // 下一层：取"最后一个"包含光标的子元素（后绘制=在上层，snow 同款）
+            ComPtr<IUIAutomationElement> child;
+            if (FAILED(walker->GetFirstChildElement(current.Get(), child.GetAddressOf()))
+                || !child)
+                break;
+
+            ComPtr<IUIAutomationElement> hitChild;
+            constexpr int kMaxSiblings = 60;
+            int checked = 0;
+            for (ComPtr<IUIAutomationElement> it = child; it && checked < kMaxSiblings;
+                 ++checked) {
+                BOOL offscreen = FALSE;
+                it->get_CurrentIsOffscreen(&offscreen);
+                RECT cr{};
+                if (!offscreen
+                    && SUCCEEDED(it->get_CurrentBoundingRectangle(&cr))
+                    && cr.right > cr.left && cr.bottom > cr.top
+                    && pt.x >= cr.left && pt.x < cr.right
+                    && pt.y >= cr.top && pt.y < cr.bottom) {
+                    hitChild = it;
+                }
+                ComPtr<IUIAutomationElement> sibling;
+                if (FAILED(walker->GetNextSiblingElement(it.Get(), sibling.GetAddressOf()))
+                    || !sibling)
+                    break;
+                it = sibling;
+            }
+            if (!hitChild)
+                break;
+            current = hitChild;
+        }
+        return path;
+    }
+
+    // snow 的核心技巧（uia/cache.rs 的 build_uia_window_cache + query）：
+    // 对**本次请求**建一个 CacheRequest，范围 TreeScope_Element|Children，
+    // 一次性把整棵子树的矩形/离屏/类型/名称缓存下来。之后逐层下钻时
+    // GetCachedChildren() + get_CachedBoundingRectangle() 全是本地读，
+    // 零跨进程往返 —— 这才是"按点下钻"不卡的原因。
+    //
+    // 之前的实现每查一个兄弟就调一次 get_CurrentBoundingRectangle()，
+    // 列表控件几百个兄弟就是几百次跨进程调用，慢到只能放弃下钻。
     void deepestElementAt(IUIAutomationElement *root, const POINT &pt,
                           ComPtr<IUIAutomationElement> &out)
     {
-        ComPtr<IUIAutomationTreeWalker> walker;
-        m_uia->get_ControlViewWalker(walker.GetAddressOf());
-        if (!walker) {
+        if (!root || !m_uia) {
             out = root;
             return;
         }
 
-        ComPtr<IUIAutomationElement> current(root);
+        // 建缓存请求：Element | Children，属性一次取全
+        ComPtr<IUIAutomationCacheRequest> req;
+        if (FAILED(m_uia->CreateCacheRequest(req.GetAddressOf())) || !req) {
+            out = root;
+            return;
+        }
+        req->AddProperty(UIA_BoundingRectanglePropertyId);
+        req->AddProperty(UIA_IsOffscreenPropertyId);
+        req->AddProperty(UIA_ControlTypePropertyId);
+        req->AddProperty(UIA_NamePropertyId);
+        req->put_TreeScope(static_cast<TreeScope>(TreeScope_Element | TreeScope_Children));
+        // 只取控件视图，滤掉纯布局面板（与 snow 的 SetTreeFilter 一致）
+        ComPtr<IUIAutomationCondition> viewCond;
+        if (SUCCEEDED(m_uia->get_ControlViewCondition(viewCond.GetAddressOf()))
+            && viewCond)
+            req->put_TreeFilter(viewCond.Get());
 
-        // 限制层数：控件树可能非常深，超过 24 层基本是自绘容器，没有意义
-        for (int depth = 0; depth < 12; ++depth) {
-            ComPtr<IUIAutomationElement> child;
-            if (FAILED(walker->GetFirstChildElement(current.Get(), child.GetAddressOf()))
-                || !child) {
+        // 用 IUIAutomation::ElementFromHandleBuildCache 拿到"带缓存"的根元素；
+        // 之后它派生出的子元素都共享这份缓存。
+        HWND rootHwnd = nullptr;
+        if (FAILED(root->get_CurrentNativeWindowHandle(
+                reinterpret_cast<UIA_HWND *>(&rootHwnd)))
+            || !rootHwnd) {
+            out = root;
+            return;
+        }
+        ComPtr<IUIAutomationElement> current;
+        if (FAILED(m_uia->ElementFromHandleBuildCache(
+                reinterpret_cast<UIA_HWND>(rootHwnd), req.Get(),
+                current.GetAddressOf()))
+            || !current) {
+            out = root;
+            return;
+        }
+
+        // 逐层下钻：每层只取包含光标的**最后一个**子元素（后绘制=更上层，
+        // snow 的 hit_before 同款）。所有属性都来自缓存，无跨进程调用。
+        for (int depth = 0; depth < 16; ++depth) {
+            ComPtr<IUIAutomationElementArray> children;
+            if (FAILED(current->GetCachedChildren(children.GetAddressOf())) || !children)
                 break;
-            }
 
-            // 遍历兄弟节点找命中的那个。这里是最容易变慢的地方：
-            // 列表/表格类控件的兄弟可能有几百上千个，每个都要跨进程取
-            // BoundingRectangle。限制最多检查 kMaxSiblings 个，
-            // 超出就放弃继续下钻（停在当前层，已经是一个可用的块）。
-            constexpr int kMaxSiblings = 40;
-            ComPtr<IUIAutomationElement> next;
-            int checked = 0;
-            for (ComPtr<IUIAutomationElement> it = child; it && checked < kMaxSiblings;
-                 ++checked) {
+            int n = 0;
+            children->get_Length(&n);
+            ComPtr<IUIAutomationElement> hitChild;
+            for (int i = 0; i < n; ++i) {
+                ComPtr<IUIAutomationElement> child;
+                if (FAILED(children->GetElement(i, child.GetAddressOf())) || !child)
+                    continue;
+
+                BOOL offscreen = FALSE;
+                child->get_CachedIsOffscreen(&offscreen);
+                if (offscreen)
+                    continue;
+
                 RECT r{};
-                if (SUCCEEDED(it->get_CurrentBoundingRectangle(&r))
-                    && r.right > r.left && r.bottom > r.top
-                    && pt.x >= r.left && pt.x < r.right
+                if (FAILED(child->get_CachedBoundingRectangle(&r))
+                    || r.right <= r.left || r.bottom <= r.top)
+                    continue;
+                if (pt.x >= r.left && pt.x < r.right
                     && pt.y >= r.top && pt.y < r.bottom) {
-                    next = it;
-                    break;
+                    hitChild = child;   // 继续找后面的兄弟（后面的在上层）
                 }
-                ComPtr<IUIAutomationElement> sibling;
-                if (FAILED(walker->GetNextSiblingElement(it.Get(), sibling.GetAddressOf()))
-                    || !sibling) {
-                    break;
-                }
-                it = sibling;
             }
-            if (!next)
+            if (!hitChild)
                 break;
-            current = next;
+            current = hitChild;
         }
 
         out = current;
     }
 
-    // 从命中元素往上收集到顶层，hierarchy[0] = 最具体的控件
+    // 从命中元素往上收集到顶层，hierarchy[0] = 最具体的控件。
+    // 下钻时已把整棵子树的属性缓存进元素对象，这层的 Current* 调用
+    // 对已缓存的元素同样由 UIA 本地解析（不会再跨进程）。
     QVector<ElementInfo> buildHierarchyUp(IUIAutomationElement *hit, qreal dpr)
     {
         QVector<ElementInfo> out;
@@ -520,6 +1260,15 @@ private:
     }
 
     ComPtr<IUIAutomation> m_uia;
+    // 懒加载树缓存：每个窗口一棵，跨请求常驻（snow 同款）。
+    // 窗口结构变化/会话结束时由上层清空。
+    QHash<quintptr, UiaLazyTree> m_trees;
+    ComPtr<IUIAutomationCacheRequest> m_cacheRequest;
+    QVector<ElementInfo> m_snapshotBuffer;   // 快照收集缓冲
+    // 快照用的批量缓存请求（一次往返取整棵子树的属性）+ 真条件
+    ComPtr<IUIAutomationCacheRequest> m_cacheReq;
+    ComPtr<IUIAutomationCondition>   m_trueCond;
+    quint64 m_activeToken = 0;   // 当前快照 token（旧任务据此作废）
 };
 
 // ---------------------------------------------------------------- Thread
@@ -609,6 +1358,20 @@ void ElementDetector::ensureWorker()
             },
             Qt::QueuedConnection);
 
+    connect(m_worker, &Worker::snapshotReady, this,
+            [this](quint64 token, const QVector<ElementInfo> &elements, bool final) {
+                if (token != m_snapshotToken)
+                    return;              // 已被新请求取代
+                // 渐进式：每个窗口抓完就发布一次，鼠标下的窗口最先就绪。
+                // busy 只在全部完成时解除 —— 中途放行实时请求会和快照
+                // 抢 worker，触发 800ms 看门狗把检测永久禁用（踩过）。
+                m_snapshotValid = true;
+                if (final)
+                    m_snapshotBusy = false;
+                emit snapshotReady(token, elements);
+            },
+            Qt::QueuedConnection);
+
     m_thread->start();
 
     // 必须排队到工作线程里初始化：run() 里的 CoInitializeEx 要先跑完
@@ -625,6 +1388,11 @@ void ElementDetector::restartWorker()
     }
     ++m_restartCount;
 
+    // 被强杀的线程里可能正跑着快照：状态必须清理，
+    // 否则 m_snapshotBusy 永远卡住、request() 永远被拒
+    m_snapshotBusy = false;
+    m_snapshotValid = false;
+
     if (m_thread) {
         m_thread->terminate();
         m_thread->wait(500);
@@ -636,10 +1404,66 @@ void ElementDetector::restartWorker()
     ensureWorker();
 }
 
+quint64 ElementDetector::requestSnapshot(const QVector<quintptr> &excludeHwnds)
+{
+    if (m_disabled)
+        return 0;
+
+    ensureWorker();
+
+    const quint64 token = ++m_snapshotToken;
+    m_snapshotValid = false;
+    m_snapshotBusy = true;
+
+    // 新会话：懒加载树缓存必须清空（窗口可能已经变了）
+    if (m_worker)
+        QMetaObject::invokeMethod(m_worker, [this]() { m_worker->clearTreeCache(); },
+                                  Qt::QueuedConnection);
+
+    // 兜底：万一某个 UIA provider 真挂死，30 秒后强制恢复
+    //（清 busy 并作废旧快照，让调用方回退到实时检测）
+    QTimer::singleShot(30000, this, [this, token]() {
+        if (m_snapshotToken == token && m_snapshotBusy) {
+            qWarning() << "ElementDetector: snapshot timed out, falling back to live detection";
+            m_snapshotBusy = false;
+        }
+    });
+
+    QMetaObject::invokeMethod(m_worker, [this, token, excludeHwnds]() {
+        m_worker->snapshot(token, excludeHwnds);
+    }, Qt::QueuedConnection);
+    return token;
+}
+
+void ElementDetector::clearCache()
+{
+    if (!m_worker)
+        return;
+    QMetaObject::invokeMethod(m_worker, [this]() { m_worker->clearTreeCache(); },
+                              Qt::QueuedConnection);
+}
+
+quint64 ElementDetector::requestRefinement(const QPoint &screenPos, quintptr targetWindow)
+{
+    if (m_disabled || m_snapshotBusy)
+        return 0;
+    ensureWorker();
+
+    // 精化沿用普通请求通道：懒加载树已经把命中的分支展开了，
+    // 这次查询只会在已缓存节点上多走几层（甚至零跨进程调用），
+    // 所以不需要单独的线程/队列。
+    return request(screenPos, QString(), targetWindow);
+}
+
 quint64 ElementDetector::request(const QPoint &screenPos, const QString &processName,
                                 quintptr targetWindow)
 {
     if (m_disabled)
+        return 0;
+
+    // 快照正在 worker 上跑：排队的实时请求必然超时触发看门狗 →
+    // restartWorker ×3 → 检测被永久禁用。直接拒绝，调用方用窗口级高亮兜底。
+    if (m_snapshotBusy)
         return 0;
 
     ensureWorker();
