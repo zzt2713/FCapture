@@ -56,8 +56,10 @@ int main(int argc, char *argv[])
     AppPaths::migrateLegacyDataIfNeeded();
 
     // 限制全局线程池：本项目只有 OCR 用到它，默认上限会按 CPU 核数
-    // 预建一堆线程（每个 1MB 栈）。1 个就够，识别本来就是串行的。
-    QThreadPool::globalInstance()->setMaxThreadCount(1);
+    // 预建一堆线程（每个 1MB 栈）。2 个够用且安全：
+    // 单线程时一次识别任务卡住（WinRT 偶发挂起），后续所有识别
+    // 永久排队 → 用户看到"点了识别没反应"。2 个线程互不拖累。
+    QThreadPool::globalInstance()->setMaxThreadCount(2);
 
     Logger::init(debugLoggingRequested(argc, argv));
     Logger::installCrashHandler();

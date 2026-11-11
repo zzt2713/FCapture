@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FCapture VERSION 1.3.0 LANGUAGES CXX)
+project(FCapture VERSION 1.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -66,7 +66,6 @@ set(APP_SOURCES
     src/paste/PinWindow.cpp
 
     src/snip/ImageEffects.cpp
-    src/snip/InfoPanel.cpp
     src/snip/MagnifierPanel.cpp
     src/snip/LongShotBar.cpp
     src/snip/LongShotPreview.cpp
@@ -150,7 +149,6 @@ set(HEADERS
     src/paste/PinWindow.h
 
     src/snip/ImageEffects.h
-    src/snip/InfoPanel.h
     src/snip/MagnifierPanel.h
     src/snip/LongShotBar.h
     src/snip/LongShotPreview.h

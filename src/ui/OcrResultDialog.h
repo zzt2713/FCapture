@@ -9,6 +9,7 @@
 
 class ElaComboBox;
 class ElaPlainTextEdit;
+class ElaPushButton;
 class OcrImagePane;
 
 // OCR 结果弹窗（D1 左图右文，snow 识别窗口同款交互）：
@@ -29,6 +30,12 @@ public:
     QString text() const;
     QString selectedLanguage() const;
 
+    // 重新识别的结果回填：刷新图片文字框、文本内容与选中状态。
+    // 没有这个入口时，点「重新识别」只有请求发出去、结果被丢弃，
+    // 对话框一直显示旧文本（用户看到的"重识别没反应"）。
+    void setResult(const WinOcr::Result &result, const QImage &sourceImage);
+    void setRetryBusy(bool busy);
+
 signals:
     void retryRequested(const QString &language);
 
@@ -43,6 +50,7 @@ private:
 
     ElaPlainTextEdit *m_edit = nullptr;
     ElaComboBox *m_languageBox = nullptr;
+    ElaPushButton *m_retryButton = nullptr;
     OcrImagePane *m_imagePane = nullptr;
     QVector<WinOcr::Line> m_lines;
     QSet<int> m_selectedLines;

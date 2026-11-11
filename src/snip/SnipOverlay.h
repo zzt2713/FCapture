@@ -30,7 +30,6 @@ class LongShotBar;
 class LongShotPreview;
 class LongShotPreviewBar;
 class ShortcutTipsWidget;
-class InfoPanel;
 class KeyboardHook;
 class MagnifierPanel;
 
@@ -110,8 +109,6 @@ private:
     void drawAnchors(QPainter &p);
     void drawAuxiliaryLines(QPainter &p);
     void drawMagnifier(QPainter &p);
-    // 放大镜面板的矩形（逻辑坐标）。取色信息面板用它避让，避免被放大镜盖住。
-    QRect magnifierRect() const;
     void drawHint(QPainter &p);
     // 左下角快捷键帮助浮层：独立子控件，SyncShortcutTips 负责内容/位置/显隐
     void syncShortcutTips();
@@ -301,10 +298,8 @@ private:
     OcrEngine *m_ocr = nullptr;
     QPointer<OcrResultDialog> m_ocrDialog;
 
-    // 取色/坐标信息面板：独立置顶小窗，避免被工具栏子控件遮住
-    InfoPanel *m_infoPanel = nullptr;
+    // 放大镜/取色合并面板（Snow 同款单面板）
     MagnifierPanel *m_magnifierPanel = nullptr;
-    QRect m_infoPanelAvoid;   // 信息面板要避开的区域（工具栏 + 放大镜）
 
     // --- 数据 ---
     ScreenCapturer::Snapshot m_snapshot;
@@ -362,6 +357,7 @@ private:
     QRect  m_lastHoverPaintRect;     // 上一帧高亮框（脏区计算用）
     QPoint m_lastMousePaintPos;      // 上一帧鼠标位置（参考线脏区用）
     QRect  m_winRectCache;           // 窗口矩形缓存（避免每次 EnumWindows）
+    QPoint m_winRectCachePos;        // 缓存对应的光标位置（必须按坐标命中）
     QElapsedTimer m_winRectCacheTimer;
     // 按下左键那一刻的高亮目标（用于松手时落选区）。
     // 按下会 clearDetection() 停掉识别，这里必须先把它存下来，
@@ -378,6 +374,9 @@ private:
 
     QVector<ElementInfo> m_elementHierarchy;
     int      m_elementLevel = 0;
+    // 滚轮在"重查期间"累计的待切层数：新链回来后一次性应用。
+    // 没有它的话，光标移动后的第一下滚轮只会触发重查、层级不动（被吞掉）。
+    int      m_pendingLevelDelta = 0;
     quint64  m_elementRequestId = 0;
     // 元素快照（进入截图时抓一次，鼠标移动纯本地命中，避免 UIA 跨进程延迟）
     QVector<ElementInfo> m_snapshotElements;
@@ -424,6 +423,8 @@ private:
 
     // 会话期置顶守卫：周期性把遮罩推回置顶带最前（任务栏会抢 z 序）
     QTimer *m_topmostGuardTimer = nullptr;
+    // 右键菜单打开期间暂停置顶守卫（否则遮罩会被推到菜单之上）
+    bool m_menuOpen = false;
 
     // 右键已被 mousePressEvent 消费（取消工具/取消选中）时，
     // 不再弹选区菜单，避免一次右键做两件事

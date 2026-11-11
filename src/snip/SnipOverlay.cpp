@@ -28,7 +28,6 @@
 
 #include "platform/win/HotkeyHook.h"
 #include "platform/win/QrScanner.h"
-#include "snip/InfoPanel.h"
 #include "snip/MagnifierPanel.h"
 #include "snip/LongShotBar.h"
 #include "snip/LongShotPreview.h"
@@ -64,9 +63,6 @@ namespace {
 
 constexpr int kAnchorSize = 8;
 constexpr int kAnchorHitTolerance = 10;   // 命中范围比视觉尺寸大，方便抓取
-constexpr int kMagnifierSize = 160;
-constexpr int kMagnifierSamplePixels = 20;
-constexpr int kMagnifierOffset = 22;
 constexpr int kMinSelection = 3;
 // 短边小于这个值时算"小元素"，不画锚点（否则锚点比内容还大）
 constexpr int kAnchorMinSide = 48;
@@ -118,6 +114,19 @@ SnipOverlay::SnipOverlay(QWidget *parent)
 
     // 标注工具栏：截图层的子控件，不抢焦点
     m_paintBar = new PaintBar(this);
+    // 鼠标进出工具栏：隐藏/恢复放大镜与取色面板。
+    // 工具栏是子控件，鼠标在上面时 SnipOverlay 收不到 mouseMove，
+    // 不在这里主动关掉的话放大镜会一直挂在最后一次的位置。
+    connect(m_paintBar, &PaintBar::pointerEntered, this, [this]() {
+        m_magnifierOn = false;
+        if (m_magnifierPanel)
+            m_magnifierPanel->hidePanel();
+        update();
+    });
+    connect(m_paintBar, &PaintBar::pointerLeft, this, [this]() {
+        updateMagnifier();
+        update();
+    });
     connect(m_paintBar, &PaintBar::toolChanged, this, &SnipOverlay::onToolChanged);
     connect(m_paintBar, &PaintBar::toolCleared, this, [this]() {
         // 取消工具 → 回到可拖动/调整选区的状态
@@ -201,6 +210,8 @@ SnipOverlay::SnipOverlay(QWidget *parent)
                 m_refining = false;
                 m_elementHierarchy = hierarchy;
                 if (m_elementHierarchy.isEmpty()) {
+                    // 没检测到元素：待切层数作废（否则会带到下一个窗口）
+                    m_pendingLevelDelta = 0;
                     const QRect win = WindowDetector::bestWindowRectAt(m_elementRequestPos);
                     m_hoverWindow = win.isEmpty()
                                         ? QRect()
@@ -208,9 +219,13 @@ SnipOverlay::SnipOverlay(QWidget *parent)
                                               .intersected(rect());
                     update();
                 } else {
-                    // 两种模式都从光标下最深的那个块开始：
-                    // Snipaste 的手感就是"指哪块就框哪块"，滚轮往上才是容器/窗口。
-                    applyElementLevel(0);
+                    // 基础层级：光标下最深的那个块（"指哪块框哪块"）。
+                    // 若滚轮在重查期间累计过待切层数，叠加应用 —— 这样
+                    // "移动鼠标后立刻滚轮"不会丢事件（snow 的重查+切换同时做）。
+                    const int baseLevel = 0;
+                    const int total = baseLevel + m_pendingLevelDelta;
+                    m_pendingLevelDelta = 0;
+                    applyElementLevel(total);
                 }
 
                 // 流水线：结果回来时鼠标可能已经移走了，
@@ -338,8 +353,6 @@ SnipOverlay::~SnipOverlay()
 
     m_textStyleBar = nullptr;   // 子控件，由 Qt 父子关系销毁
 
-    delete m_infoPanel;
-    m_infoPanel = nullptr;
 
     delete m_magnifierPanel;
     m_magnifierPanel = nullptr;
@@ -459,8 +472,28 @@ void SnipOverlay::startSession(const ScreenCapturer::Snapshot &snapshot)
             // SetWindowPos 会让 DWM 反复重排置顶带，反而添周期性微卡
             if (m_longShotState != LongShotState::Off)
                 return;
-            if (WinUtil::isForeignWindowAbove(winId()))
-                WinUtil::forceTopmost(winId());
+            // 有任何弹出菜单/弹窗时别抢置顶：遮罩会盖到菜单上面，
+            // 表现为"菜单一闪而过"或根本看不见。
+            // 用 activePopupWidget 而不是只看 showSnipMenu 的标志位：
+            // 工具栏的「发送到应用」「识别」等菜单也都走 AppMenu::Menu，
+            // 逐个加标志容易漏。
+            if (m_menuOpen || QApplication::activePopupWidget())
+                return;
+            if (!WinUtil::isForeignWindowAbove(winId()))
+                return;
+            WinUtil::forceTopmost(winId());
+            // 遮罩被推到置顶带最前后，本进程自己的浮窗（取色面板/放大镜、
+            // 工具栏、长截图预览栏）会一起被压到它下面——鼠标移动时
+            // showPanel 里的 raise() 能救回来，鼠标一停就没人救，
+            // 表现为"鼠标不动了，取色面板就消失"。这里统一补一次 raise。
+            if (m_magnifierPanel)
+                m_magnifierPanel->raise();
+            if (m_paintBar && m_paintBar->isVisible())
+                m_paintBar->raise();
+            if (m_longShotPreviewBar && m_longShotPreviewBar->isVisible())
+                m_longShotPreviewBar->raise();
+            if (m_longShotBar && m_longShotBar->isVisible())
+                m_longShotBar->raise();
         });
     }
     m_topmostGuardTimer->start();
@@ -1611,8 +1644,14 @@ void SnipOverlay::keyPressEvent(QKeyEvent *e)
         return;
 
     case Qt::Key_Shift:
-        m_hexFormat = !m_hexFormat;
-        update();
+        // 切换复制格式（HEX ↔ RGB）：取色面板的高亮行和下一次复制的格式
+        // 都跟着变。按住不放会因自动重复疯狂切换，所以只认非重复的按下。
+        if (!e->isAutoRepeat()) {
+            m_hexFormat = !m_hexFormat;
+            showCenterNotice(m_hexFormat ? QStringLiteral("复制格式：HEX")
+                                         : QStringLiteral("复制格式：RGB"));
+            update();
+        }
         return;
 
     case Qt::Key_Alt:
@@ -1811,6 +1850,23 @@ void SnipOverlay::requestElementDetection()
     if (!localWin.isEmpty() && localWin.width() >= width() - 2
         && localWin.height() >= height() - 2)
         localWin = QRect();
+    // ---- 窗口模式：纯本地，零 UIA ----
+    //
+    // snow 的 HitTestMode::Window 直接从已缓存的窗口空间索引返回矩形：
+    //     crate::HitTestMode::Window => (vec![window.bounds], StopReason::Complete)
+    // 完全不碰 UIA，所以是毫秒级。我们以前窗口模式也走 requestElementDetection()
+    // → UIA 查询 → 再取整窗，白等一次跨进程往返（100~300ms），
+    // 表现为"窗口识别又慢又不准"。
+    if (m_detectMode == DetectMode::Window) {
+        if (!m_elementPending) {
+            if (localWin != m_hoverWindow) {
+                m_hoverWindow = localWin;
+                hoverRepaint();
+            }
+        }
+        return;
+    }
+
     if (!m_elementPending && m_elementHierarchy.isEmpty() && localWin != m_hoverWindow) {
         m_hoverWindow = localWin;
         hoverRepaint();
@@ -1884,7 +1940,16 @@ void SnipOverlay::applyElementLevel(int level)
         return;
     }
 
-    m_elementLevel = qBound(0, level, m_elementHierarchy.size() - 1);
+    // 窗口模式（snow 的 ScreenshotIntelligentSelectionTarget::Window）：
+    // 永远锁在最外层窗口，滚轮不参与（snow 的 setIndex 里直接强制 maximumIndex）。
+    // 元素模式才允许在 元素 → 父容器 → 窗口 之间滚动切换。
+    // 以前两种模式都走同一套 level 逻辑，表现完全一样 —— 用户感觉
+    // "元素和窗口识别没区别"就是这个原因。
+    const bool windowMode = (m_detectMode == DetectMode::Window);
+    const int requestedLevel = windowMode
+                                   ? int(m_elementHierarchy.size() - 1)
+                                   : qBound(0, level, int(m_elementHierarchy.size() - 1));
+    m_elementLevel = requestedLevel;
 
     // 整屏大小的元素（桌面/根节点）对用户没有意义：高亮它等于整屏不发暗，
     // 表现为"选区外也是亮的"，还会在整屏画一圈虚线。
@@ -1897,7 +1962,7 @@ void SnipOverlay::applyElementLevel(int level)
         return r.width() >= width() - 2 && r.height() >= height() - 2;
     };
 
-    for (int level2 = m_elementLevel; level2 < m_elementHierarchy.size(); ++level2) {
+    for (int level2 = requestedLevel; level2 < m_elementHierarchy.size(); ++level2) {
         QRect candidate = localOf(m_elementHierarchy.at(level2).logicalRect);
         if (candidate.isEmpty() || isFullScreen(candidate))
             continue;
@@ -1910,7 +1975,8 @@ void SnipOverlay::applyElementLevel(int level)
                 && coversMostOf(QRectF(candidate), QRectF(localWin)))
                 candidate = localWin;
         }
-        m_elementLevel = level2;
+        // 注意：这里**不改 m_elementLevel**，它保持用户滚到的位置。
+        // 显示跳过的层只影响这一次渲染，不影响下一次滚轮的起点。
         m_hoverWindow = candidate;
         hoverRepaint();
         return;
@@ -1925,8 +1991,31 @@ void SnipOverlay::applyElementLevel(int level)
 
 void SnipOverlay::changeElementLevel(int delta)
 {
-    if (m_elementHierarchy.isEmpty())
+    // 窗口模式锁死最外层，滚轮不切层级（snow 同款：Window 模式下
+    // setIndex 强制 maximumIndex）。只有元素模式才逐层切换。
+    if (m_detectMode == DetectMode::Window)
         return;
+
+    // snow 的滚轮处理是"重查 + 切换"同时做：先按当前光标位置重新命中，
+    // 紧接着在新链上按 index+steps 切层级。它的命中是同步的，所以能一气呵成。
+    //
+    // 我们是异步 UIA 查询，没法在同一帧拿到新链。做法：
+    //   1. 记下这次滚轮的**待切层数**（m_pendingLevelDelta）
+    //   2. 若光标已移动，发起重查；结果回来重建链时再把待切层数应用上去
+    //   3. 光标没动（链就是当前位置的）→ 直接切
+    // 这样滚轮永远不会被吞掉，且切换总是基于最新位置的链。
+
+    const QPoint cursor = QCursor::pos();
+    const bool moved = (cursor - m_elementRequestPos).manhattanLength() >= 3;
+
+    if (m_elementHierarchy.isEmpty() || moved) {
+        // 累计待切层数：连续滚动多次，结果回来时一次切到位
+        m_pendingLevelDelta += delta;
+        if (!m_elementPending)
+            requestElementDetection();
+        return;
+    }
+
     applyElementLevel(m_elementLevel + delta);
 }
 
@@ -1953,6 +2042,8 @@ void SnipOverlay::cycleDetectionMode()
     else
         updateHoverWindow();
 
+    // 提示框是子控件，内容变化要显式同步一次（Tab 行显示当前模式）
+    syncShortcutTips();
     update();
 }
 
@@ -1968,7 +2059,28 @@ void SnipOverlay::clearDetection()
 
 void SnipOverlay::updateMagnifier()
 {
+    // 有弹出菜单（右键菜单/工具按钮菜单）在跑时，放大镜/取色面板一律收起：
+    // menu->exec() 期间事件循环还在转，任何重绘都会把面板重新拉起来，
+    // 所以必须在**显示入口**判断，而不是只在弹菜单前 hide 一次。
+    // 菜单关闭后下一次重绘自动恢复（用户要求"菜单关了再出现"）。
+    if (QApplication::activePopupWidget()) {
+        m_magnifierOn = false;
+        if (m_magnifierPanel)
+            m_magnifierPanel->hidePanel();
+        return;
+    }
+
     if (m_state == State::Dragging || m_state == State::Resizing || m_state == State::Moving) {
+        m_magnifierOn = false;
+        return;
+    }
+
+    // 鼠标移到工具栏上时隐藏放大镜与取色面板：
+    // 工具栏是子控件，鼠标进入后 SnipOverlay 收不到 mouseMove，
+    // 放大镜会停在最后一次的位置一直挂着（用户看到"图里还显示像素采集"）。
+    if (m_paintBarVisible && m_paintBar
+        && QRect(m_paintBar->mapTo(this, QPoint(0, 0)), m_paintBar->size())
+               .contains(m_mouseLocal)) {
         m_magnifierOn = false;
         return;
     }
@@ -2215,6 +2327,12 @@ void SnipOverlay::releaseSessionImages()
     m_snapshotLayer = QPixmap();
     PixelShape::clearSourceImage();
     invalidateBackgroundCache();
+
+    // 取色面板 / 放大镜是**独立顶层窗口**，不随截图层隐藏或关闭。
+    // 会话一结束必须在这里收掉，否则它们会一直挂在桌面上，
+    // 例如识别文字后仍能看到一个写着 "#000000" 的取色小窗。
+    if (m_magnifierPanel)
+        m_magnifierPanel->hidePanel();
 }
 
 void SnipOverlay::abortSnip()
@@ -2298,7 +2416,6 @@ void SnipOverlay::paintEvent(QPaintEvent *e)
     drawAnchors(p);
     drawSizeLabel(p);
     drawMagnifier(p);
-    drawSelectionInfo(p);
     drawHint(p);
     drawCenterNotice(p);
     syncShortcutTips();
@@ -2511,6 +2628,12 @@ void SnipOverlay::tickHoverAnim()
     if (!m_hoverAnimClock.isValid())
         m_hoverAnimClock.start();
 
+    // 关键：必须启动定时器，否则动画只在"鼠标移动触发重绘"时被推进一帧，
+    // 元素之间切换时框是**跳**过去的（用户感受到的"元素切换不流畅"）。
+    // 之前这里只创建+connect，从未 start()，整个过渡动画等于没生效。
+    if (!m_hoverAnimTimer->isActive())
+        m_hoverAnimTimer->start();
+
     // 二次缓出：progress * (2 - progress)，起快收慢
     constexpr int kDurationMs = 101;
     const qreal progress = qMin<qreal>(1.0, qreal(m_hoverAnimClock.elapsed()) / kDurationMs);
@@ -2566,12 +2689,16 @@ void SnipOverlay::hoverRepaint()
 // EnumWindows + 逐窗口取标题，每次几毫秒，会造成周期性顿挫）。
 QRect SnipOverlay::windowRectAtCached(const QPoint &globalPos)
 {
+    // 缓存 key 必须包含**具体坐标**：以前只用"点是否落在上次的矩形内"判断，
+    // 重叠窗口/大窗口内换位置时会一直复用旧结果，表现为"窗口识别不准"。
+    // 同一像素重复查询（一帧内多处调用）仍然命中缓存，开销可忽略。
     if (!m_winRectCache.isNull() && m_winRectCacheTimer.isValid()
         && m_winRectCacheTimer.elapsed() < 2000
-        && m_winRectCache.contains(globalPos)) {
+        && m_winRectCachePos == globalPos) {
         return m_winRectCache;
     }
     m_winRectCache = WindowDetector::bestWindowRectAt(globalPos);
+    m_winRectCachePos = globalPos;
     m_winRectCacheTimer.restart();
     return m_winRectCache;
 }
@@ -2807,74 +2934,6 @@ void SnipOverlay::drawSizeLabel(QPainter &p)
     p.restore();
 }
 
-void SnipOverlay::drawSelectionInfo(QPainter &p)
-{
-    Q_UNUSED(p);
-
-    // 面板改为独立置顶窗口绘制（见 InfoPanel）：
-    // PaintBar 是截图层子控件，画在父窗口内容之上，信息面板靠近工具栏时会被盖住。
-    const QRect sel = localSelection();
-    // 选择绘制工具时不显示（鼠标用途是落笔，不是取色）
-    const bool toolActive = (m_currentTool != Tool::None && m_paintBarVisible);
-    // 已经框好选区时：只在选区内部显示；
-    // 还没框选区时（Idle/Dragging）：全屏都可以取色，鼠标在哪就显示哪
-    const bool insideSelection = !sel.isEmpty() && sel.contains(m_mouseLocal);
-    const bool pickingWholeScreen = sel.isEmpty()
-                                    && (m_state == State::Idle || m_state == State::Dragging);
-    // 拖拽中不显示：它是独立置顶窗，每帧重定位同样吃掉渲染时间，
-    // 而拖动时用户盯的是选区边界，不是取色值
-    const bool interacting = m_state == State::Dragging || m_state == State::Resizing
-                             || m_state == State::Moving;
-    const bool shouldShow = !toolActive && m_mouseMoved && !m_sizeBox && !interacting
-                            && m_longShotState == LongShotState::Off
-                            && (insideSelection || pickingWholeScreen);
-    if (!shouldShow) {
-        if (m_infoPanel)
-            m_infoPanel->hideInfo();
-        return;
-    }
-
-    const qreal dpr = m_snapshot.devicePixelRatio;
-    const int px = qRound(m_mouseLocal.x() * dpr);
-    const int py = qRound(m_mouseLocal.y() * dpr);
-    if (px < 0 || py < 0 || px >= m_snapshotImage.width()
-        || py >= m_snapshotImage.height()) {
-        if (m_infoPanel)
-            m_infoPanel->hideInfo();
-        return;
-    }
-
-    if (!m_infoPanel)
-        m_infoPanel = new InfoPanel();
-
-    const QColor sampled = m_snapshotImage.pixelColor(px, py);
-    const QPoint globalPos = m_mouseLocal + virtualTopLeft();
-
-    InfoPanel::Data data;
-    data.positionText = QStringLiteral("(%1, %2)").arg(globalPos.x()).arg(globalPos.y());
-    data.colorText = m_hexFormat ? sampled.name(QColor::HexRgb)
-                                 : QStringLiteral("%1, %2, %3")
-                                       .arg(sampled.red())
-                                       .arg(sampled.green())
-                                       .arg(sampled.blue());
-    data.swatch = sampled;
-    data.copyHint = QStringLiteral("按 C 复制颜色值");
-    data.formatHint = QStringLiteral("按 Shift 切换 RGB/HEX");
-
-    // 和放大镜是"一块整体"：放大镜显示时，信息面板贴在它正上方、左右对齐；
-    // 放大镜没开时才退化为跟随鼠标
-    const QRect magRect = m_magnifierPanel ? m_magnifierPanel->globalRect() : QRect();
-    if (!magRect.isEmpty()) {
-        m_infoPanel->showAbove(data, magRect);
-        return;
-    }
-
-    QRect avoid;
-    if (m_paintBarVisible && m_paintBar)
-        avoid = QRect(m_paintBar->mapToGlobal(QPoint(0, 0)), m_paintBar->size());
-    m_infoPanel->showInfo(data, mapToGlobal(m_mouseLocal), avoid);
-}
-
 void SnipOverlay::drawAnchors(QPainter &p)
 {
     const QRect sel = localSelection();
@@ -2906,32 +2965,18 @@ void SnipOverlay::drawAnchors(QPainter &p)
     p.restore();
 }
 
-QRect SnipOverlay::magnifierRect() const
-{
-    if (!m_magnifierOn || m_snapshotImage.isNull())
-        return {};
-
-    // 位置：默认光标右下，靠近边缘翻转
-    int mx = m_mouseLocal.x() + kMagnifierOffset;
-    int my = m_mouseLocal.y() + kMagnifierOffset;
-    if (mx + kMagnifierSize > width())
-        mx = m_mouseLocal.x() - kMagnifierOffset - kMagnifierSize;
-    if (my + kMagnifierSize > height())
-        my = m_mouseLocal.y() - kMagnifierOffset - kMagnifierSize;
-    return QRect(mx, my, kMagnifierSize, kMagnifierSize);
-}
-
 void SnipOverlay::drawMagnifier(QPainter &p)
 {
     Q_UNUSED(p);
 
-    // 放大镜改为独立置顶小窗（MagnifierPanel）：
-    // 原本画在截图层上，会被工具栏子控件盖住。
+    // 放大镜/取色合并面板（Snow 的 ScreenshotCanvasColorSamplerWindow 同款）：
+    // 左侧 7×7 像素网格放大预览 + 右侧 HEX/RGB 文本，单面板跟随光标。
     // 选择了绘制工具时不显示：此时鼠标是用来落笔的，取色/放大是干扰。
-    // 拖拽建选区/改大小/移动选区时也不显示：每帧重建 + 重定位这个置顶窗
-    // 实测占 3~5ms/帧（拖拽卡顿的第二大来源），而且快速拖动时没人看取样点。
+    // 拖拽建选区/改大小/移动选区时也不显示：快速拖动时没人看取样点。
+    // 弹出菜单期间同样收起（exec 的事件循环里重绘会把它拉起来）。
     if (!m_magnifierOn || m_snapshotImage.isNull()
         || m_longShotState != LongShotState::Off
+        || QApplication::activePopupWidget()
         || m_state == State::Dragging || m_state == State::Resizing
         || m_state == State::Moving
         || (m_currentTool != Tool::None && m_paintBarVisible)) {
@@ -2940,55 +2985,46 @@ void SnipOverlay::drawMagnifier(QPainter &p)
         return;
     }
 
+    // 以光标物理像素为中心取 11×11（Snow 的 kPreviewPickerSize=11）。
+    // 必须逐像素拼：靠近边缘时要钳制到图内，直接 copy 会得到空矩形。
     const qreal dpr = m_snapshot.devicePixelRatio;
     const int cx = qRound(m_mouseLocal.x() * dpr);
     const int cy = qRound(m_mouseLocal.y() * dpr);
-
-    const int half = kMagnifierSamplePixels / 2;
-    QRect srcRect(cx - half, cy - half, kMagnifierSamplePixels, kMagnifierSamplePixels);
-    srcRect = srcRect.intersected(m_snapshotImage.rect());
-    if (srcRect.isEmpty()) {
+    if (cx < 0 || cy < 0 || cx >= m_snapshotImage.width() || cy >= m_snapshotImage.height()) {
         if (m_magnifierPanel)
             m_magnifierPanel->hidePanel();
         return;
     }
 
+    constexpr int kPreviewPixels = 11;
+    const int half = kPreviewPixels / 2;
+    const int maxX = m_snapshotImage.width() - 1;
+    const int maxY = m_snapshotImage.height() - 1;
+    QImage preview(kPreviewPixels, kPreviewPixels, QImage::Format_ARGB32_Premultiplied);
+    for (int y = 0; y < kPreviewPixels; ++y) {
+        for (int x = 0; x < kPreviewPixels; ++x) {
+            const int sx = qBound(0, cx + x - half, maxX);
+            const int sy = qBound(0, cy + y - half, maxY);
+            preview.setPixel(x, y, m_snapshotImage.pixel(sx, sy));
+        }
+    }
+
     if (!m_magnifierPanel)
         m_magnifierPanel = new MagnifierPanel();
 
-    MagnifierPanel::Data data;
-    data.sample = m_snapshotImage.copy(srcRect);
-    data.picking = (m_state == State::Idle);
-    data.pixelSize = kMagnifierSize / kMagnifierSamplePixels;
+    MagnifierPanel::Data panelData;
+    panelData.sample = preview;
+    panelData.color = m_snapshotImage.pixelColor(cx, cy).toRgb();
+    // 坐标：与截图层一致的全局逻辑坐标
+    panelData.position = m_mouseLocal + virtualTopLeft();
+    // 当前复制格式：Shift 切换时色块文字跟着变
+    panelData.hexFormat = m_hexFormat;
 
-    QString info = QStringLiteral("%1, %2").arg(m_mouseLocal.x()).arg(m_mouseLocal.y());
-    if (cx >= 0 && cy >= 0 && cx < m_snapshotImage.width() && cy < m_snapshotImage.height()) {
-        const QColor c = m_snapshotImage.pixelColor(cx, cy);
-        data.pixelColor = c;
-        data.pixelValid = true;
-        info += QStringLiteral("  ")
-                + (m_hexFormat ? c.name(QColor::HexRgb)
-                               : QStringLiteral("RGB(%1,%2,%3)")
-                                     .arg(c.red()).arg(c.green()).arg(c.blue()));
-    }
-    data.infoText = info;
-
-    // 避开工具栏；信息面板若已显示也避开它（两者不重叠）
     QRect avoid;
     if (m_paintBarVisible && m_paintBar)
         avoid = QRect(m_paintBar->mapToGlobal(QPoint(0, 0)), m_paintBar->size());
 
-    m_magnifierPanel->showPanel(data, mapToGlobal(m_mouseLocal), avoid);
-
-    // 放大镜先定位，信息面板随后避开它
-    if (m_infoPanel && m_infoPanel->isVisible()) {
-        const QRect magRect = m_magnifierPanel->globalRect();
-        if (!magRect.isEmpty() && avoid.isEmpty())
-            avoid = magRect;
-        else if (!magRect.isEmpty())
-            avoid = avoid.united(magRect);
-    }
-    m_infoPanelAvoid = avoid;
+    m_magnifierPanel->showPanel(panelData, mapToGlobal(m_mouseLocal), avoid);
 }
 
 QRect SnipOverlay::shortcutTipsRect() const
@@ -3024,9 +3060,15 @@ void SnipOverlay::syncShortcutTips()
             { QStringLiteral("Esc"),  QStringLiteral("退出长截图") },
         };
     } else {
+        // Tab 那行带上当前模式：用户按 Tab 后能立刻确认切到了哪个模式
+        const QString modeText = m_detectMode == DetectMode::Element
+                                     ? QStringLiteral("元素识别")
+                                     : m_detectMode == DetectMode::Window
+                                           ? QStringLiteral("窗口识别")
+                                           : QStringLiteral("自由识别");
         rows = {
             { QStringLiteral("W A S D"),   QStringLiteral("将鼠标指针移动 1 像素") },
-            { QStringLiteral("Tab"),       QStringLiteral("切换 检测窗口 / 检测界面元素") },
+            { QStringLiteral("Tab"),       QStringLiteral("切换检测模式（当前：%1）").arg(modeText) },
             { QStringLiteral("Alt+Click"), QStringLiteral("直接选中整个窗口") },
             { QStringLiteral("Ctrl + A"),  QStringLiteral("选区扩展到整个屏幕") },
             { QStringLiteral("R"),         QStringLiteral("使用上一次截图区域") },
@@ -3103,7 +3145,13 @@ void SnipOverlay::drawHint(QPainter &p)
     if (m_shortcutTips && m_shortcutTips->isVisible())
         return;
 
-    QString text = QStringLiteral("拖动鼠标选择截图区域   |   右键或 Esc 取消   |   Tab 切换检测模式");
+    const QString modeText = m_detectMode == DetectMode::Element
+                                 ? QStringLiteral("元素识别")
+                                 : m_detectMode == DetectMode::Window
+                                       ? QStringLiteral("窗口识别")
+                                       : QStringLiteral("自由识别");
+    QString text = QStringLiteral("拖动鼠标选择截图区域   |   右键或 Esc 取消   |   Tab 切换检测模式（当前：%1）")
+                       .arg(modeText);
     if (m_refreshing)
         text = QStringLiteral("刷新中…");
     else if (m_refreshHintVisible)
@@ -3131,6 +3179,12 @@ void SnipOverlay::drawHint(QPainter &p)
 // 选区右键菜单：比例 / 圆角 / 阴影 / 尺寸 / 发送到
 void SnipOverlay::showSnipMenu(const QPoint &globalPos)
 {
+    // 右键菜单弹出前收掉取色面板/放大镜：它们是独立置顶小窗，
+    // 会盖在菜单上、也挡住用户看菜单的视线（用户明确要求）。
+    // 菜单关掉后移动鼠标，updateMagnifier/取色会自然恢复。
+    if (m_magnifierPanel)
+        m_magnifierPanel->hidePanel();
+
     AppMenu::Menu menu(this);
 
     QMenu *aspectMenu = AppMenu::addSubMenu(menu.get(), QStringLiteral("固定比例"));
@@ -3220,7 +3274,13 @@ void SnipOverlay::showSnipMenu(const QPoint &globalPos)
     QAction *refreshAct = menu->addAction(QStringLiteral("刷新截图\tF5"));
     connect(refreshAct, &QAction::triggered, this, &SnipOverlay::refreshSnapshot);
 
-    menu->exec(globalPos);
+    // 菜单打开期间必须暂停置顶守卫：它每 300ms 会把遮罩 SetWindowPos 到
+    // HWND_TOPMOST 最前，而菜单也是置顶窗——遮罩被推到菜单之上，
+    // 菜单就被盖住（用户看到的"一闪而过"）。
+    m_menuOpen = true;
+    const QAction *chosen = menu->exec(globalPos);
+    m_menuOpen = false;
+    Q_UNUSED(chosen);
 }
 
 void SnipOverlay::contextMenuEvent(QContextMenuEvent *e)
@@ -3388,8 +3448,6 @@ void SnipOverlay::enterLongShot()
 
     // 置顶面板是独立窗口，paintEvent 在长截图分支提前 return，
     // 不会再走到隐藏逻辑 —— 必须在这里主动收掉，否则会一直挂在屏幕上
-    if (m_infoPanel)
-        m_infoPanel->hideInfo();
     if (m_magnifierPanel)
         m_magnifierPanel->hidePanel();
 
@@ -4083,15 +4141,27 @@ void SnipOverlay::runOcr()
     const QImage image = selectionImage();
     if (image.isNull()) {
         m_paintBar->setTool(Tool::None);
+        showCenterNotice(QStringLiteral("请先框选要识别的区域"));
         return;
     }
+
+    if (!m_ocr)
+        m_ocr = new OcrEngine(this);
+
+    // 已有识别在飞：给可见反馈并拒绝，不再静默排队
+    //（排队 + 结果过期丢弃 = 识别几次后就"点了没反应"）
+    if (m_ocr->isBusy()) {
+        showCenterNotice(QStringLiteral("正在识别中，请稍候"));
+        return;
+    }
+
+    // 立刻给"识别中"反馈：一次识别要 2~4 次 Windows OCR（几秒），
+    // 没有反馈时用户会以为没点上、连着狂点 → 任务排队 → 更久没反应。
+    showCenterNotice(QStringLiteral("正在识别文字…"), 10000);
 
     // 先隐藏截图层，让用户看到"识别中"而不是一直卡在遮罩上
     if (m_paintBar)
         m_paintBar->hide();
-
-    if (!m_ocr)
-        m_ocr = new OcrEngine(this);
 
     const QStringList langs = OcrEngine::availableLanguages();
     if (langs.isEmpty()) {
@@ -4103,6 +4173,7 @@ void SnipOverlay::runOcr()
             m_paintBar->show();
             m_paintBar->raise();
         }
+        showCenterNotice(QStringLiteral("没有可用的 OCR 语言包"));
         return;
     }
 
@@ -4119,12 +4190,21 @@ void SnipOverlay::runOcr()
                           delete okConn;
                           delete errConn;
 
-                          // 识别成功：整个截图会话结束，只留结果对话框。
-                          // 否则遮罩/选区还压在桌面上，对话框会被挡住或一闪而过。
-                          releaseSessionImages();
+                          // 识别成功（snow 同款）：
+                          //   截图层隐藏但**不结束会话**，识别窗口浮在最前；
+                          //   关掉识别窗口后截图层恢复，用户可继续框选/操作。
+                          //
+                          // 隐藏而不是关闭的原因：截图层是全屏置顶窗，
+                          // 留着它就会把识别窗口盖住（用户看到的"弹窗不显示、
+                          // 关掉选区才出现"）；而且选区高亮压在桌面上也碍事。
+                          hide();
                           if (m_paintBar)
                               m_paintBar->hide();
-                          close();
+                          // 会话仍在，但快照可能很大，先释放；继续操作需要时
+                          // 由 refreshSnapshot 重新抓（这里不主动重抓，避免闪）
+                          releaseSessionImages();
+                          if (m_topmostGuardTimer)
+                              m_topmostGuardTimer->stop();
 
                           // 不能以截图层为父窗口：SnipOverlay 挂着写死暗色的
                           // overlayStyleSheet，会沿父子链把 Ela 的亮/暗配色盖掉。
@@ -4132,13 +4212,65 @@ void SnipOverlay::runOcr()
                                                              result.language, sourceImage,
                                                              nullptr);
                           dialog->setWindowFlag(Qt::WindowStaysOnTopHint, true);
+                          // 重新识别：必须把结果接回对话框。
+                          // 以前这里只发请求不接结果（首次的连接已在回调里主动断开），
+                          // 结果被丢弃 → 对话框一直显示旧文本，用户以为"点了没反应"。
+                          //
+                          // 注意 OcrEngine 的归属：SnipOverlay 在本回调里已经 close()，
+                          // m_ocr 是它的子对象随时可能析构。对话框独立存在（可能比
+                          // 截图层活得久），必须让它自己持有一个引擎，否则重识别
+                          // 会打到已销毁的 m_ocr 上。
+                          auto *dialogOcr = new OcrEngine(dialog);
                           connect(dialog, &OcrResultDialog::retryRequested, dialog,
-                                  [this, sourceImage, dialog](const QString &lang) {
-                                      m_ocr->setLanguage(lang);
-                                      m_ocr->recognize(sourceImage);
+                                  [dialogOcr, sourceImage, dialog](const QString &lang) {
+                                      dialog->setRetryBusy(true);
+                                      dialogOcr->setLanguage(lang);
+
+                                      // 一次重识别一组连接，完成后自行断开。
+                                      // 父对象是 dialog：对话框关闭时 Qt 会清理，
+                                      // 不会泄漏，也不会回调到悬空对象。
+                                      auto *okConn = new QMetaObject::Connection;
+                                      auto *errConn = new QMetaObject::Connection;
+                                      *okConn = connect(
+                                          dialogOcr, &OcrEngine::finished, dialog,
+                                          [dialog, okConn, errConn, sourceImage](
+                                              const WinOcr::Result &r) {
+                                              disconnect(*okConn);
+                                              disconnect(*errConn);
+                                              delete okConn;
+                                              delete errConn;
+                                              dialog->setResult(r, sourceImage);
+                                              QApplication::clipboard()->setText(r.text);
+                                          });
+                                      *errConn = connect(
+                                          dialogOcr, &OcrEngine::failed, dialog,
+                                          [dialog, okConn, errConn](const QString &) {
+                                              disconnect(*okConn);
+                                              disconnect(*errConn);
+                                              delete okConn;
+                                              delete errConn;
+                                              dialog->setRetryBusy(false);
+                                          });
+                                      if (!dialogOcr->recognize(sourceImage)) {
+                                          // 被拒（上一次还没跑完）：立刻恢复按钮，
+                                          // 不能让"识别中"卡死在禁用态
+                                          disconnect(*okConn);
+                                          disconnect(*errConn);
+                                          delete okConn;
+                                          delete errConn;
+                                          dialog->setRetryBusy(false);
+                                      }
                                   });
                           dialog->setAttribute(Qt::WA_DeleteOnClose);
                           dialog->show();
+                          dialog->raise();
+                          dialog->activateWindow();
+
+                          // 识别窗口关闭后结束截图会话（恢复桌面）。
+                          // 用 abortSnip 而不是自己 emit+close：它还会清理
+                          // 文字框/尺寸框/连续刷新定时器等残留状态。
+                          connect(dialog, &QObject::destroyed, this,
+                                  [this]() { abortSnip(); });
 
                           QApplication::clipboard()->setText(result.text);
                       });
@@ -4154,7 +4286,14 @@ void SnipOverlay::runOcr()
                            restorePaintBarAfterAsync();
                        });
 
-    m_ocr->recognize(image);
+    if (!m_ocr->recognize(image)) {
+        // 理论上不会走到（前面刚查过 isBusy）：兜底恢复界面
+        disconnect(*okConn);
+        disconnect(*errConn);
+        delete okConn;
+        delete errConn;
+        restorePaintBarAfterAsync();
+    }
 }
 
 void SnipOverlay::runBarcodeScan()
@@ -4196,12 +4335,22 @@ void SnipOverlay::runBarcodeScan()
     }
     update();
 
+    // 二维码：识别完就结束截图会话，只留结果弹窗。
+    // 截图层是全屏置顶窗，不关掉的话会把弹窗整个盖住（表现为"点了没反应"）。
+    // 和 OCR 成功路径保持一致：释放快照 → 隐藏工具栏 → close()。
+    releaseSessionImages();
+    if (m_paintBar)
+        m_paintBar->hide();
+    close();
+
     // 不能以截图层为父窗口：SnipOverlay 挂着写死暗色的 overlayStyleSheet，
     // 会沿父子链把 Ela 的亮/暗配色盖掉（字看不清）
     auto *dialog = new BarcodeResultDialog(items, nullptr);
     dialog->setWindowFlag(Qt::WindowStaysOnTopHint, true);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
 }
 
 void SnipOverlay::showCenterNotice(const QString &text, int msec)

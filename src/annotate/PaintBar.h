@@ -59,6 +59,11 @@ signals:
     // 线型/箭头样式变更（工具栏改虚线、箭头样式时发出，
     // 让 SnipOverlay 把它同步到已选中的标注上）
     void styleChanged();
+    // 鼠标进入/离开工具栏：SnipOverlay 据此隐藏放大镜与取色面板。
+    // 工具栏是子控件，鼠标进入后父窗口收不到 mouseMove，
+    // 放大镜会一直挂在最后一次的位置（用户看到"图里还显示像素采集"）。
+    void pointerEntered();
+    void pointerLeft();
 
 protected:
     void paintEvent(QPaintEvent *e) override;
@@ -67,6 +72,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent *e) override;
     void mouseDoubleClickEvent(QMouseEvent *e) override;
     void contextMenuEvent(QContextMenuEvent *e) override;
+    void enterEvent(QEnterEvent *e) override;
     void leaveEvent(QEvent *e) override;
     void wheelEvent(QWheelEvent *e) override;
 

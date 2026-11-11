@@ -54,8 +54,11 @@ cp -f "$BUILT_EXE" "$DIST_DIR/"
 echo "[build] 已复制: $BUILT_EXE → $DIST_DIR/"
 
 step "4/4 windeployqt 收集依赖"
-"$WINDEPLOYQT" --release --no-translations --no-system-d3d-compiler \
-    --no-opengl-sw "$PROJECT_ROOT/$DIST_DIR/$EXE_NAME"
+# --compiler-runtime：把 MSVC 运行时（MSVCP140 / VCRUNTIME140 系列）一并复制。
+# 不加这一项时，windeployqt 在 Release 模式下默认不收集它们，程序在
+# 未安装 VC++ 2015-2022 Redistributable 的机器上会报"缺少 MSVCP140.dll"。
+"$WINDEPLOYQT" --release --compiler-runtime --no-translations \
+    --no-system-d3d-compiler --no-opengl-sw "$PROJECT_ROOT/$DIST_DIR/$EXE_NAME"
 if [[ $? -ne 0 ]]; then
     echo "[build] FAIL: windeployqt 失败" >&2
     exit 1
@@ -65,6 +68,46 @@ if [[ ! -f "$DIST_DIR/platforms/qwindows.dll" ]]; then
     echo "[build] FAIL: platforms/qwindows.dll 缺失，程序无法启动" >&2
     exit 1
 fi
+
+# MSVC 运行时：windeployqt 的 --compiler-runtime 在本机实测不生效
+# （Qt 6 从 VS 安装目录找 redist 时路径没命中），直接自己复制。
+# 缺这些 DLL 时，未安装 VC++ 2015-2022 Redistributable 的机器会报
+# "缺少 MSVCP140.dll" 直接起不来。
+CRT_SRC=""
+for candidate in \
+    "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Redist/MSVC" \
+    "C:/Program Files/Microsoft Visual Studio/2022/Professional/VC/Redist/MSVC" \
+    "C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Redist/MSVC"; do
+    if [[ -d "$candidate" ]]; then
+        # 只认纯数字版本目录（如 14.44.35112）：同级的 v143 是符号链接目录，
+        # 里面没有 x64/Microsoft.VC143.CRT，sort -V 会误选它。
+        for ver in $(ls -1 "$candidate" 2>/dev/null | grep -E '^[0-9]+\.' | sort -V -r); do
+            if [[ -d "$candidate/$ver/x64/Microsoft.VC143.CRT" ]]; then
+                CRT_SRC="$candidate/$ver/x64/Microsoft.VC143.CRT"
+                break
+            fi
+        done
+        [[ -n "$CRT_SRC" ]] && break
+    fi
+done
+
+if [[ -n "$CRT_SRC" ]]; then
+    for dll in msvcp140.dll msvcp140_1.dll msvcp140_2.dll msvcp140_atomic_wait.dll \
+               vcruntime140.dll vcruntime140_1.dll concrt140.dll; do
+        cp -f "$CRT_SRC/$dll" "$DIST_DIR/" 2>/dev/null || true
+    done
+    echo "[build] 已复制 MSVC 运行时: $CRT_SRC"
+else
+    echo "[build] WARN: 找不到 VC++ Redist 目录，运行时 DLL 未打包" >&2
+fi
+
+# 兜底校验：这三个是 exe / Qt / Ela 都依赖的核心运行时
+for dll in msvcp140.dll vcruntime140.dll vcruntime140_1.dll; do
+    if [[ ! -f "$DIST_DIR/$dll" ]]; then
+        echo "[build] FAIL: $dll 缺失，未装 VC++ Redist 的机器无法启动" >&2
+        exit 1
+    fi
+done
 
 # ElaWidgetTools.dll 是 IMPORTED 目标，windeployqt 不会自动收集，必须手动复制
 ELA_DLL="D:/cppsoft/MsvcEla/bin/ElaWidgetTools.dll"

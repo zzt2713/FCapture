@@ -732,11 +732,18 @@ void PaintBar::setToolFromGroup(int groupIndex, Tool tool)
     setTool(tool);   // setTool 内部会重建布局并按新工具重画
 }
 
+void PaintBar::enterEvent(QEnterEvent *e)
+{
+    QWidget::enterEvent(e);
+    emit pointerEntered();
+}
+
 void PaintBar::leaveEvent(QEvent *e)
 {
     Q_UNUSED(e);
     m_hoverIndex = -1;
     update();
+    emit pointerLeft();
 }
 
 void PaintBar::wheelEvent(QWheelEvent *e)
