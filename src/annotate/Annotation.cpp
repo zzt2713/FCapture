@@ -18,7 +18,9 @@ QTransform aroundCenter(const QPointF &center, qreal deg)
 
 QPointF Annotation::rotationAnchor() const
 {
-    // 永远取当前中心：几何一变（拖手柄/缩放/平移），支点自动跟上
+    // 支点一旦锁定就保持不变（缩放时 raw 中心会动，但支点不能动）
+    if (m_rotationPivotValid)
+        return m_rotationPivot;
     return rawBoundingRect().center();
 }
 
@@ -31,11 +33,28 @@ QTransform Annotation::rotationTransform() const
 
 void Annotation::setRotation(qreal degrees)
 {
+    // 第一次旋转时把当时未旋转包围盒的中心钉住。
+    // 之后无论怎么拖锚点缩放，raw 中心变了也不影响支点，
+    // 图形不会因为"支点跟着跑"而在屏幕上乱飞。
+    if (!m_rotationPivotValid) {
+        m_rotationPivot = rawBoundingRect().center();
+        m_rotationPivotValid = true;
+    }
 
     // 归一化到 [0, 360)，避免长按累积成很大的数
     m_rotation = std::fmod(degrees, 360.0);
     if (m_rotation < 0)
         m_rotation += 360.0;
+
+    // 转回 0 度时释放支点，下次旋转重新按当时的中心计算
+    if (qFuzzyIsNull(m_rotation))
+        m_rotationPivotValid = false;
+}
+
+void Annotation::syncRotationAnchorAfterTranslate(const QPointF &delta)
+{
+    if (m_rotationPivotValid)
+        m_rotationPivot += delta;
 }
 
 void Annotation::paint(QPainter *p) const

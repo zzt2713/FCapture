@@ -55,7 +55,7 @@ HotkeyManager::RegistrationStatus HotkeyManager::registerHotkey(
 
     // 该动作已经绑了同一个键 → 幂等返回成功
     for (const Binding &existing : bindings) {
-        if (!m_suspended && existing.id > 0 && sameKey(existing.keyString, keyString)) {
+        if (existing.id > 0 && sameKey(existing.keyString, keyString)) {
             m_failedKeys[action].removeAll(keyString);
             return RegistrationStatus::Success;
         }
@@ -78,13 +78,6 @@ HotkeyManager::RegistrationStatus HotkeyManager::registerHotkey(
     }
 
     m_failedKeys[action].removeAll(keyString);
-
-    if (m_suspended) {
-        // Probe while recording, then release the key until resume().
-        WinHotkey::unregisterHotkey(id);
-        bindings.append(b);
-        return RegistrationStatus::Success;
-    }
 
     b.id = id;
     bindings.append(b);
@@ -109,59 +102,6 @@ void HotkeyManager::unregisterAction(const QString &action)
         }
     }
     m_byAction.erase(it);
-}
-
-void HotkeyManager::suspend()
-{
-    if (m_suspended)
-        return;
-
-    unregisterBindings();
-    m_suspended = true;
-}
-
-QStringList HotkeyManager::resume()
-{
-    QStringList failed;
-    if (!m_suspended)
-        return failed;
-
-    m_suspended = false;
-    for (auto it = m_byAction.begin(); it != m_byAction.end(); ++it) {
-        bool anyFailed = false;
-        for (Binding &b : *it) {
-            quint32 mods = 0;
-            quint32 vk = 0;
-            if (!parseKey(b.keyString, &mods, &vk)) {
-                qWarning() << "HotkeyManager: cannot restore invalid hotkey"
-                           << b.keyString << "for action" << b.action;
-                m_failedKeys[b.action].append(b.keyString);
-                anyFailed = true;
-                continue;
-            }
-
-            const int id = m_nextId++;
-            if (WinHotkey::registerHotkey(id, mods, vk)
-                != WinHotkey::RegisterResult::Success) {
-                qWarning() << "HotkeyManager: failed to restore hotkey"
-                           << b.keyString << "for action" << b.action;
-                m_failedKeys[b.action].append(b.keyString);
-                anyFailed = true;
-                continue;
-            }
-
-            b.id = id;
-            m_byId.insert(id, b.action);
-        }
-        if (anyFailed)
-            failed << it.key();
-    }
-    return failed;
-}
-
-bool HotkeyManager::isSuspended() const
-{
-    return m_suspended;
 }
 
 QStringList HotkeyManager::failedKeys(const QString &action) const
@@ -189,7 +129,6 @@ void HotkeyManager::unregisterAll()
     unregisterBindings();
     m_byAction.clear();
     m_failedKeys.clear();
-    m_suspended = false;
 }
 
 void HotkeyManager::unregisterBindings()

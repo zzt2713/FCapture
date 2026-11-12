@@ -26,6 +26,12 @@ public:
     void redo();
     void clear();
 
+    // 层序调整：把形状移到绘制顺序的最前/最后。
+    // 绘制顺序就是 m_shapes 的顺序（越靠后越在上层）。
+    // 不进撤销栈 —— 它改变的是显示层级，不是内容。
+    void bringToFront(const std::shared_ptr<Annotation> &shape);
+    void sendToBack(const std::shared_ptr<Annotation> &shape);
+
     bool canUndo() const;
     bool canRedo() const;
     bool isEmpty() const;

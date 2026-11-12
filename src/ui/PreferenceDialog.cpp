@@ -43,6 +43,7 @@
 #include <QDir>
 #include <QDesktopServices>
 #include <QFileDialog>
+#include <QFontMetrics>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QGuiApplication>
@@ -90,6 +91,7 @@ QString findHotkeyConflict(const QString &candidate, const QString &currentActio
         QStringLiteral("paste"),
         QStringLiteral("toggle-images"),
         QStringLiteral("long-screenshot"),
+        QStringLiteral("whiteboard"),
     };
 
     for (const QString &action : kActions) {
@@ -112,6 +114,7 @@ QString conflictLabel(const QString &action)
         { QStringLiteral("paste"), QStringLiteral("贴图") },
         { QStringLiteral("toggle-images"), QStringLiteral("隐藏/显示所有贴图") },
         { QStringLiteral("long-screenshot"), QStringLiteral("长截图") },
+        { QStringLiteral("whiteboard"), QStringLiteral("白板") },
     };
     return kLabels.value(action, action);
 }
@@ -1003,6 +1006,7 @@ QWidget *PreferenceDialog::buildControlPage()
         { "paste", "贴图" },
         { "toggle-images", "隐藏/显示所有贴图" },
         { "long-screenshot", "长截图" },
+        { "whiteboard", "白板" },
     };
 
     for (const Binding &b : bindings) {
@@ -1477,7 +1481,7 @@ QWidget *PreferenceDialog::buildAboutPage()
                                       ElaIconType::CloudArrowDown);
     updateRow->addWidget(checkUpdateBtn);
 
-    m_updateInstallBtn = iconButton(QStringLiteral("立即更新"), aboutBox,
+    m_updateInstallBtn = iconButton(QStringLiteral("下载更新"), aboutBox,
                                     ElaIconType::Download);
     m_updateInstallBtn->setVisible(false);
     updateRow->addWidget(m_updateInstallBtn);
@@ -1490,8 +1494,14 @@ QWidget *PreferenceDialog::buildAboutPage()
 
     connect(checkUpdateBtn, &ElaPushButton::clicked, this,
             &PreferenceDialog::checkForUpdates);
-    connect(m_updateInstallBtn, &ElaPushButton::clicked, this,
-            &PreferenceDialog::startUpdateDownload);
+    // 同一个按钮两种语义（snow 也是这样）：
+    //   未就绪 → 下载更新；已就绪 → 重启并更新
+    connect(m_updateInstallBtn, &ElaPushButton::clicked, this, [this]() {
+        if (!m_readyUpdatePath.isEmpty())
+            confirmInstallUpdate();
+        else
+            startUpdateDownload();
+    });
 
     aboutLayout->addWidget(headerRow);
 
@@ -1589,8 +1599,15 @@ void PreferenceDialog::checkForUpdates()
         m_updateStatus->setTextFormat(Qt::PlainText);
         m_updateStatus->show();
     }
-    if (m_updateInstallBtn)
+    if (m_updateInstallBtn) {
+        // 重新检查 = 回到 Idle 态：按钮恢复成「下载更新」，之前下好的包作废
         m_updateInstallBtn->setVisible(false);
+        m_updateInstallBtn->setText(QStringLiteral("下载更新"));
+        const QFontMetrics fm(m_updateInstallBtn->font());
+        m_updateInstallBtn->setMinimumWidth(
+            fm.horizontalAdvance(QStringLiteral("下载更新")) + 16 + 12 + 32);
+    }
+    m_readyUpdatePath.clear();
 
     if (!m_updateChecker)
         m_updateChecker = new UpdateChecker(this);
@@ -1627,12 +1644,15 @@ void PreferenceDialog::checkForUpdates()
                     return;
                 }
 
+                // Available 状态（snow 同款）：文字 + 「下载更新」按钮
                 m_updateStatus->setText(
                     QStringLiteral("发现新版本 %1（当前 %2）")
                         .arg(release.version,
                              QCoreApplication::applicationVersion()));
-                if (m_updateInstallBtn)
+                if (m_updateInstallBtn) {
+                    m_updateInstallBtn->setText(QStringLiteral("下载更新"));
                     m_updateInstallBtn->setVisible(true);
+                }
             });
 
     connect(m_updateChecker, &UpdateChecker::failed, this,
@@ -1642,7 +1662,7 @@ void PreferenceDialog::checkForUpdates()
                         QStringLiteral("检查失败：%1").arg(error));
             });
 
-    // 下载进度
+    // 下载进度：只更新状态文字，不打断用户（snow 的 Downloading 状态同款）
     connect(m_updateChecker, &UpdateChecker::downloadProgress, this,
             [this](qint64 received, qint64 total) {
                 if (!m_updateStatus)
@@ -1650,60 +1670,32 @@ void PreferenceDialog::checkForUpdates()
                 if (total > 0) {
                     m_updateStatus->setText(
                         QStringLiteral("正在下载更新… %1 / %2 MB")
-                            .arg(received / 1024.0 / 1024.0, 0, 'f', 1)
-                            .arg(total / 1024.0 / 1024.0, 0, 'f', 1));
+                            .arg(QString::number(received / 1024.0 / 1024.0, 'f', 1),
+                                 QString::number(total / 1024.0 / 1024.0, 'f', 1)));
                 } else {
                     m_updateStatus->setText(
                         QStringLiteral("正在下载更新… %1 MB")
-                            .arg(received / 1024.0 / 1024.0, 0, 'f', 1));
+                            .arg(QString::number(received / 1024.0 / 1024.0, 'f', 1)));
                 }
             });
 
+    // 下载完成**不弹窗**：对齐 snow 的 Ready 状态。
+    // 用户看到「已就绪」和「重启并更新」按钮，自己决定什么时候装；
+    // 弹窗打断操作是 snow 明确不做的（它只在用户点按钮后才确认一次）。
     connect(m_updateChecker, &UpdateChecker::downloadFinished, this,
-            [this](const QString &filePath) {
-                // 二次确认，避免误点导致程序重启
-                ElaContentDialog confirm(this);
-                confirm.setWindowTitle(QStringLiteral("安装更新"));
-                const QString confirmText = QStringLiteral(
-                    "将关闭程序、覆盖安装并自动重启。\n"
-                    "当前配置会保留，更新失败会自动回滚。\n\n继续吗？");
-                // ElaContentDialog 的中央区没有内边距，文本会贴着边，
-                // 用带边距的布局包一层
-                auto *body = new QWidget(&confirm);
-                auto *bodyLayout = new QVBoxLayout(body);
-                bodyLayout->setContentsMargins(24, 16, 24, 8);
-                auto *msg = new ElaText(confirmText, body);
-                msg->setTextStyle(ElaTextType::Body);
-                bodyLayout->addWidget(msg);
-                confirm.setCentralWidget(body);
-                confirm.setLeftButtonText(QStringLiteral("取消"));
-                confirm.setMiddleButtonVisible(false);
-                confirm.setRightButtonText(QStringLiteral("立即更新"));
-                if (confirm.exec() != QDialog::Accepted)
-                    return;
-
-                QString installError;
-                if (!UpdateInstaller::installAndRestart(filePath,
-                                                        m_pendingRelease.version,
-                                                        &installError)) {
-                    if (m_updateStatus)
-                        m_updateStatus->setText(installError);
-                    return;
-                }
-
-                if (m_updateStatus)
-                    m_updateStatus->setText(QStringLiteral("正在重启以完成更新…"));
-                // 立刻退出，让外部脚本接管
-                QTimer::singleShot(300, qApp, []() {
-                    QCoreApplication::quit();
-                });
-            });
+            [this](const QString &filePath) { markUpdateReady(filePath); });
 
     connect(m_updateChecker, &UpdateChecker::downloadFailed, this,
             [this](const QString &error) {
+                m_readyUpdatePath.clear();
                 if (m_updateStatus)
                     m_updateStatus->setText(
                         QStringLiteral("下载失败：%1").arg(error));
+                // 失败后按钮退回「下载更新」，允许重试
+                if (m_updateInstallBtn) {
+                    m_updateInstallBtn->setText(QStringLiteral("下载更新"));
+                    m_updateInstallBtn->setVisible(m_pendingRelease.assetUrl.isValid());
+                }
             });
 
     m_updateChecker->check();
@@ -1716,4 +1708,69 @@ void PreferenceDialog::startUpdateDownload()
     if (m_updateStatus)
         m_updateStatus->setText(QStringLiteral("准备下载…"));
     m_updateChecker->download(m_pendingRelease);
+}
+
+// Ready 状态（对齐 snow 的 UpdateState::Ready）：
+// 下载+校验都过了，只改界面，不弹窗。用户主动点「重启并更新」才进确认流程。
+void PreferenceDialog::markUpdateReady(const QString &filePath)
+{
+    m_readyUpdatePath = filePath;
+
+    if (m_updateStatus) {
+        m_updateStatus->setTextFormat(Qt::PlainText);
+        m_updateStatus->setText(
+            QStringLiteral("更新已就绪：%1").arg(m_pendingRelease.version));
+    }
+    if (m_updateInstallBtn) {
+        // 和 snow 一样，就绪后按钮语义从「下载」变成「重启并更新」
+        m_updateInstallBtn->setText(QStringLiteral("重启并更新"));
+        // 最小宽度是按创建时的文字算的，换文字后必须重算，
+        // 否则「重启并更新」会比「下载更新」宽，图标被裁掉一截。
+        const QFontMetrics fm(m_updateInstallBtn->font());
+        m_updateInstallBtn->setMinimumWidth(
+            fm.horizontalAdvance(QStringLiteral("重启并更新")) + 16 + 12 + 32);
+        m_updateInstallBtn->setVisible(true);
+    }
+}
+
+// 用户点「重启并更新」后的二次确认。
+// 文案对齐 snow 的 confirmRestartAndUpdate，默认按钮是「取消」（防误触）。
+bool PreferenceDialog::confirmInstallUpdate()
+{
+    if (m_readyUpdatePath.isEmpty())
+        return false;
+
+    ElaContentDialog confirm(this);
+    confirm.setWindowTitle(QStringLiteral("重启并更新"));
+    const QString text =
+        QStringLiteral("F-Capture 将关闭并重启以安装更新。\n"
+                       "当前配置会保留，更新失败会自动回滚。\n\n继续吗？");
+    // ElaContentDialog 的中央区没有内边距，文本会贴着边
+    auto *body = new QWidget(&confirm);
+    auto *bodyLayout = new QVBoxLayout(body);
+    bodyLayout->setContentsMargins(24, 16, 24, 8);
+    auto *msg = new ElaText(text, body);
+    msg->setTextStyle(ElaTextType::Body);
+    bodyLayout->addWidget(msg);
+    confirm.setCentralWidget(body);
+    confirm.setLeftButtonText(QStringLiteral("取消"));
+    confirm.setMiddleButtonVisible(false);
+    confirm.setRightButtonText(QStringLiteral("重启并更新"));
+    if (confirm.exec() != QDialog::Accepted)
+        return false;
+
+    QString installError;
+    if (!UpdateInstaller::installAndRestart(m_readyUpdatePath,
+                                            m_pendingRelease.version,
+                                            &installError)) {
+        if (m_updateStatus)
+            m_updateStatus->setText(installError);
+        return false;
+    }
+
+    if (m_updateStatus)
+        m_updateStatus->setText(QStringLiteral("正在重启以完成更新…"));
+    // 立刻退出，让外部脚本接管
+    QTimer::singleShot(300, qApp, []() { QCoreApplication::quit(); });
+    return true;
 }

@@ -127,10 +127,11 @@ bool ToolStyleStore::supportsPenStyle(Tool tool)
     case Tool::Rectangle:
     case Tool::Ellipse:
     case Tool::Line:
-    case Tool::Arrow:
     case Tool::Polyline:
     case Tool::Pencil:
         return true;
+    // 箭头不支持线型：点划线/虚线画在锥形笔杆上会互相干扰，
+    // 视觉上分辨不出箭头样式。箭头只保留"箭头形状"这一组属性。
     default:
         return false;
     }

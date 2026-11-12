@@ -1,6 +1,9 @@
 #include "paste/PinWindow.h"
 
+#include "annotate/AnnotationEditor.h"
+#include "annotate/PaintBar.h"
 #include "core/ImageOutput.h"
+#include "paste/PinControlButton.h"
 #include "paste/PinManager.h"
 #include "platform/win/VirtualDesktop.h"
 #include "platform/win/WinUtil.h"
@@ -10,6 +13,7 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QContextMenuEvent>
+#include <QCursor>
 #include <QDebug>
 #include <QDragEnterEvent>
 #include <QDropEvent>
@@ -56,12 +60,14 @@ PinWindow::PinWindow(const QImage &image, const QString &sourceText,
     applyTopmost();
     rebuildDisplay();
     updateWindowSize();
+    createControlButtons();
 
     m_scaleHudTimer = new QTimer(this);
     m_scaleHudTimer->setSingleShot(true);
     m_scaleHudTimer->setInterval(1000);
     connect(m_scaleHudTimer, &QTimer::timeout, this, [this]() {
         m_scaleHudVisible = false;
+        m_scaleHudPosValid = false;   // 下次显示重新从光标位置起步
         update();
     });
 
@@ -72,12 +78,19 @@ PinWindow::PinWindow(const QImage &image, const QString &sourceText,
                 const bool active = (now == this);
                 if (active != m_active) {
                     m_active = active;
+                    updateControlButtonsVisibility();
                     update();
                 }
             });
 }
 
-PinWindow::~PinWindow() = default;
+PinWindow::~PinWindow()
+{
+    // 编辑工具栏是独立顶层窗口，没有父对象，必须在这里显式销毁，
+    // 否则贴图关闭后它会在屏幕上残留。
+    delete m_editBar;
+    m_editBar = nullptr;
+}
 
 // 虚拟桌面：窗口只在创建它的桌面上可见。
 // 由 AppController 在桌面切换时统一查询，不在这里主动 show/hide，
@@ -169,6 +182,66 @@ void PinWindow::updateWindowSize()
     if (content.isEmpty())
         return;
     resize(content + QSize(kShadowMargin * 2, kShadowMargin * 2));
+    layoutControlButtons();
+}
+
+// ---------------------------------------------------------------- 悬浮控制按钮
+
+void PinWindow::createControlButtons()
+{
+    m_editButton = new PinControlButton(PinControlButton::Kind::Edit, this);
+    m_closeButton = new PinControlButton(PinControlButton::Kind::Close, this);
+
+    connect(m_editButton, &PinControlButton::clicked, this, &PinWindow::enterEditMode);
+    connect(m_closeButton, &PinControlButton::clicked, this, [this]() {
+        if (m_editing)
+            cancelEdit();
+        else
+            emit requestClose(this);
+    });
+
+    m_editButton->hide();
+    m_closeButton->hide();
+    layoutControlButtons();
+}
+
+void PinWindow::layoutControlButtons()
+{
+    if (!m_editButton || !m_closeButton)
+        return;
+
+    // 贴在内容区右上角（不是含阴影的窗口右上角）。
+    // 顺序：编辑在左、关闭在右，关闭键贴最外沿，符合"叉号在最右"的直觉。
+    constexpr int kControlsInset = 8;
+    const QRect content = contentRect();
+    const int y = content.y() + kControlsInset;
+    const int closeX =
+        content.right() - kControlsInset - PinControlButton::kSize + 1;
+    const int editX = closeX - PinControlButton::kSpacing - PinControlButton::kSize;
+
+    m_editButton->move(editX, y);
+    m_closeButton->move(closeX, y);
+
+    m_editButton->raise();
+    m_closeButton->raise();
+}
+
+// 鼠标进入贴图才显示（snow 的 pointer presence 同款逻辑）。
+// 进入编辑模式后一直显示，直到用户退出编辑——否则鼠标一移开按钮就消失，
+// 用户找不到"完成/取消"的入口。
+void PinWindow::updateControlButtonsVisibility()
+{
+    if (!m_editButton || !m_closeButton)
+        return;
+
+    const bool show = (m_hovered || m_editing) && !m_cropping;
+    m_editButton->setVisible(show);
+    m_closeButton->setVisible(show);
+
+    if (show) {
+        m_editButton->raise();
+        m_closeButton->raise();
+    }
 }
 
 QRect PinWindow::imageTargetRect() const
@@ -282,6 +355,7 @@ void PinWindow::setSelected(bool sel)
     if (m_selected == sel)
         return;
     m_selected = sel;
+    updateControlButtonsVisibility();
     update();
 }
 
@@ -356,6 +430,9 @@ void PinWindow::beginResize(Corner c, const QPoint &globalPos)
     m_resizeStartContentGeo =
         QRect(geometry().topLeft() + contentRect().topLeft(), contentRect().size());
     m_resizeStartScale = m_scale;
+    // 缩放期间同样收起工具栏（snow 的 beginNativeWindowInteraction 同款）
+    if (m_editing && m_editBar)
+        m_editBar->hide();
 }
 
 void PinWindow::updateResize(const QPoint &globalPos)
@@ -453,6 +530,115 @@ void PinWindow::cancelCrop()
     update();
 }
 
+// ---------------------------------------------------------------- 重新标注
+
+void PinWindow::enterEditMode()
+{
+    if (m_editing || m_display.isNull())
+        return;
+
+    m_editing = true;
+    m_cropping = false;
+    m_cropRect = QRect();
+
+    if (!m_editor) {
+        m_editor = new AnnotationEditor(this);
+        connect(m_editor, &AnnotationEditor::accepted, this, &PinWindow::applyEdit);
+        connect(m_editor, &AnnotationEditor::cancelled, this, &PinWindow::cancelEdit);
+    }
+
+    m_editor->clearAll();
+    // 编辑器只盖住图片本身，不盖阴影边距：坐标才对得上
+    m_editor->setGeometry(imageTargetRect());
+    m_editor->show();
+    m_editor->raise();
+    m_editor->setFocus(Qt::OtherFocusReason);
+
+    // 编辑工具栏做成**独立顶层窗口**（对齐 snow 的 ScreenshotFloatingToolPaletteWindow）：
+    // 贴图窗口再大也装不下"图片外面"的位置，只有独立窗口才能自由摆在贴图右下角外侧。
+    if (!m_editBar) {
+        m_editBar = m_editor->takeToolbar();
+        if (m_editBar) {
+            m_editBar->setParent(nullptr);
+            m_editBar->setWindowFlags(Qt::Tool | Qt::FramelessWindowHint
+                                      | Qt::WindowStaysOnTopHint);
+            m_editBar->setAttribute(Qt::WA_TranslucentBackground);
+            m_editBar->setAttribute(Qt::WA_ShowWithoutActivating);
+            m_editBar->setAttribute(Qt::WA_DeleteOnClose, false);
+        }
+    }
+    if (m_editBar) {
+        m_editBar->show();
+        placeEditToolbar();
+        m_editBar->raise();
+    }
+
+    updateControlButtonsVisibility();
+    update();
+}
+
+// 把编辑工具栏摆到贴图（图片内容区）右下角外侧。
+// 贴图可能被拖动/缩放，所以每次位置变化都要重算。
+void PinWindow::placeEditToolbar()
+{
+    if (!m_editBar)
+        return;
+    const QRect anchor(mapToGlobal(imageTargetRect().topLeft()), imageTargetRect().size());
+    m_editBar->positionNearGlobal(anchor);
+}
+
+void PinWindow::applyEdit()
+{
+    if (!m_editing)
+        return;
+
+    // 有标注才烘焙，否则等于直接退出编辑
+    if (m_editor && !m_editor->isEmpty()) {
+        const QRect target = imageTargetRect();
+        if (!target.isEmpty()) {
+            QImage canvas = m_display.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            // 编辑器几何 == imageTargetRect()，本地坐标原点就是 target.topLeft()
+            m_editor->renderOnto(&canvas, QRect(QPoint(0, 0), target.size()));
+
+            // 烘焙结果是新的原图；重置变换状态，避免叠加旧旋转/缩放
+            m_original = canvas;
+            m_rotation = 0;
+            m_flipH = false;
+            m_flipV = false;
+            m_grayscale = false;
+            m_inverted = false;
+            rebuildDisplay();
+            updateWindowSize();
+        }
+    }
+
+    m_editing = false;
+    if (m_editor) {
+        m_editor->clearAll();
+        if (m_editBar) m_editBar->hide();
+        m_editor->hide();
+    }
+    setCursor(Qt::OpenHandCursor);
+    updateControlButtonsVisibility();
+    update();
+}
+
+void PinWindow::cancelEdit()
+{
+    if (!m_editing)
+        return;
+
+    m_editing = false;
+    if (m_editor) {
+        m_editor->clearAll();
+        if (m_editBar) m_editBar->hide();
+        m_editor->hide();
+    }
+    setCursor(Qt::OpenHandCursor);
+    updateControlButtonsVisibility();
+    update();
+}
+
 QPixmap PinWindow::snapshotForRecovery() const
 {
     return QPixmap::fromImage(m_display);
@@ -491,6 +677,20 @@ void PinWindow::showScaleHud()
     m_scaleHudVisible = true;
     if (m_scaleHudTimer)
         m_scaleHudTimer->start();
+    // 平滑跟随需要连续帧：显示期间按 60fps 刷新，隐藏后自动停
+    if (!m_scaleHudAnimTimer) {
+        m_scaleHudAnimTimer = new QTimer(this);
+        m_scaleHudAnimTimer->setInterval(16);
+        connect(m_scaleHudAnimTimer, &QTimer::timeout, this, [this]() {
+            if (!m_scaleHudVisible && !m_resizing) {
+                m_scaleHudAnimTimer->stop();
+                return;
+            }
+            update();
+        });
+    }
+    if (!m_scaleHudAnimTimer->isActive())
+        m_scaleHudAnimTimer->start();
 }
 
 void PinWindow::drawScaleHud(QPainter &p)
@@ -513,8 +713,30 @@ void PinWindow::drawScaleHud(QPainter &p)
     const int labelWidth = qBound(44, fm.horizontalAdvance(text) + 16, 220);
     const int labelHeight = qBound(20, fm.height() + 8, 40);
 
+    // 目标位置：贴在光标右下方一点点，避免被鼠标本身挡住。
+    // 之前固定在图片左上角，缩放时标签要么被阴影挤开、要么离鼠标很远。
+    const QPoint cursorLocal = mapFromGlobal(QCursor::pos());
+    QPointF target(cursorLocal.x() + 14, cursorLocal.y() + 18);
+
+    // 夹在窗口内，不让标签跑出可视区
+    const int maxX = width() - labelWidth - 4;
+    const int maxY = height() - labelHeight - 4;
+    target.setX(qBound(4.0, target.x(), qMax(4.0, qreal(maxX))));
+    target.setY(qBound(4.0, target.y(), qMax(4.0, qreal(maxY))));
+
+    // 平滑跟随：每帧向目标靠拢 30%，滚轮连续缩放时标签"追着"光标走
+    if (!m_scaleHudPosValid) {
+        m_scaleHudAnimPos = target;
+        m_scaleHudPosValid = true;
+    } else {
+        m_scaleHudAnimPos += (target - m_scaleHudAnimPos) * 0.30;
+        if (QLineF(m_scaleHudAnimPos, target).length() < 0.5)
+            m_scaleHudAnimPos = target;
+    }
+
     // 文字放不下时（极小的缩略图）只画百分比数字，贴满图片宽度
-    QRect label(anchor.left(), anchor.top(), labelWidth, labelHeight);
+    QRect label(qRound(m_scaleHudAnimPos.x()), qRound(m_scaleHudAnimPos.y()),
+                labelWidth, labelHeight);
     label.setWidth(qMin(labelWidth, qMax(24, anchor.width())));
     label.setHeight(qMin(labelHeight, qMax(18, anchor.height())));
     p.save();
@@ -685,6 +907,13 @@ void PinWindow::mousePressEvent(QMouseEvent *e)
 {
     const QPoint pos = e->position().toPoint();
 
+    // 编辑模式下点在图片区域内 = 落笔，不能拖动窗口。
+    // 编辑器盖在图片上，这里的判断是兜底（正常情况下事件先到编辑器）。
+    if (m_editing && e->button() == Qt::LeftButton
+        && imageTargetRect().contains(pos)) {
+        return;
+    }
+
     if (m_cropping && e->button() == Qt::LeftButton) {
         const QRect imageRect = imageTargetRect();
         if (!imageRect.contains(pos))
@@ -711,6 +940,10 @@ void PinWindow::mousePressEvent(QMouseEvent *e)
         setCursor(Qt::ClosedHandCursor);
         raise();
         activateWindow();
+        // snow 的 beginNativeWindowInteraction：拖动期间收起编辑工具栏，
+        // 避免工具栏跟着窗口一路抖，也避免挡住拖动路径
+        if (m_editing && m_editBar)
+            m_editBar->hide();
     }
 
     emit clicked(this, e->button(), e->modifiers());
@@ -774,10 +1007,22 @@ void PinWindow::mouseReleaseEvent(QMouseEvent *e)
             m_resizing = false;
             m_resizeCorner = Corner::None;
             setCursor(Qt::OpenHandCursor);
+            // 缩放结束：位置/尺寸都变了，重算工具栏位置再显示
+            if (m_editing && m_editBar) {
+                placeEditToolbar();
+                m_editBar->show();
+                m_editBar->raise();
+            }
             return;
         }
         m_dragging = false;
         setCursor(Qt::OpenHandCursor);
+        // snow 的 endNativeWindowInteraction：停手后重新定位并显示工具栏
+        if (m_editing && m_editBar) {
+            placeEditToolbar();
+            m_editBar->show();
+            m_editBar->raise();
+        }
     }
     QWidget::mouseReleaseEvent(e);
 }
@@ -940,6 +1185,7 @@ void PinWindow::contextMenuEvent(QContextMenuEvent *e)
 void PinWindow::enterEvent(QEnterEvent *e)
 {
     m_hovered = true;
+    updateControlButtonsVisibility();
     update();
     QWidget::enterEvent(e);
 }
@@ -947,6 +1193,7 @@ void PinWindow::enterEvent(QEnterEvent *e)
 void PinWindow::leaveEvent(QEvent *e)
 {
     m_hovered = false;
+    updateControlButtonsVisibility();
     update();
     QWidget::leaveEvent(e);
 }
@@ -1013,4 +1260,19 @@ void PinWindow::dropEvent(QDropEvent *e)
 void PinWindow::resizeEvent(QResizeEvent *e)
 {
     QWidget::resizeEvent(e);
+    layoutControlButtons();
+    // 编辑器几何跟随图片区域（缩放窗口后标注层不能错位）
+    if (m_editing) {
+        if (m_editor)
+            m_editor->setGeometry(imageTargetRect());
+        placeEditToolbar();
+    }
+}
+
+void PinWindow::moveEvent(QMoveEvent *e)
+{
+    QWidget::moveEvent(e);
+    // 工具栏是独立窗口，贴图拖动时要跟着走
+    if (m_editing)
+        placeEditToolbar();
 }

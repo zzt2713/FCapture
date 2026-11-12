@@ -23,7 +23,7 @@ public:
     QRectF rawBoundingRect() const override;
     void paintContent(QPainter *p) const override;
     bool hitTestContent(const QPointF &pt, qreal tolerance) const override;
-    void translate(const QPointF &delta) override;
+    void translateContent(const QPointF &delta) override;
     void scaleAbout(const QPointF &center, qreal factor) override;
     QVector<QPointF> rawHandles() const override;
     void moveHandleRaw(int index, const QPointF &pos) override;

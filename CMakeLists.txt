@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FCapture VERSION 1.5.0 LANGUAGES CXX)
+project(FCapture VERSION 1.5.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -47,6 +47,7 @@ set(APP_SOURCES
     src/core/TrayController.cpp
 
     src/annotate/Annotation.cpp
+    src/annotate/AnnotationEditor.cpp
     src/annotate/AnnotationModel.cpp
     src/annotate/AnnotationTool.cpp
     src/annotate/Palette.cpp
@@ -63,6 +64,7 @@ set(APP_SOURCES
 
     src/paste/PinContextMenu.cpp
     src/paste/PinManager.cpp
+    src/paste/PinControlButton.cpp
     src/paste/PinWindow.cpp
 
     src/snip/ImageEffects.cpp
@@ -103,7 +105,6 @@ set(APP_SOURCES
     src/ui/ElaSliderFactory.cpp
     src/ui/ElaThemeBridge.cpp
     src/ui/GroupManagerDialog.cpp
-    src/ui/HotkeyRecorder.cpp
     src/ui/ShortcutKeyButton.cpp
     src/ui/ShortcutRow.cpp
     src/ui/ShortcutConfigWidget.cpp
@@ -135,6 +136,7 @@ set(HEADERS
     src/core/TrayController.h
 
     src/annotate/Annotation.h
+    src/annotate/AnnotationEditor.h
     src/annotate/AnnotationModel.h
     src/annotate/AnnotationTool.h
     src/annotate/Palette.h
@@ -151,6 +153,7 @@ set(HEADERS
 
     src/paste/PinContextMenu.h
     src/paste/PinManager.h
+    src/paste/PinControlButton.h
     src/paste/PinWindow.h
 
     src/snip/ImageEffects.h
@@ -189,7 +192,6 @@ set(HEADERS
     src/ui/ElaSliderFactory.h
     src/ui/ElaThemeBridge.h
     src/ui/GroupManagerDialog.h
-    src/ui/HotkeyRecorder.h
     src/ui/ShortcutKeyButton.h
     src/ui/ShortcutRow.h
     src/ui/ShortcutConfigWidget.h

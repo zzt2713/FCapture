@@ -47,6 +47,7 @@ const QStringList &hotkeyActions()
         QStringLiteral("paste"),
         QStringLiteral("toggle-images"),
         QStringLiteral("long-screenshot"),
+        QStringLiteral("whiteboard"),
     };
     return actions;
 }
@@ -104,6 +105,8 @@ void AppController::initialize()
             toggleAllImages();
         else if (action == QStringLiteral("long-screenshot"))
             startLongScreenshot();
+        else if (action == QStringLiteral("whiteboard"))
+            toggleWhiteboard();
     });
 
     // 全屏应用时屏蔽快捷键（首选项可关）
@@ -182,24 +185,6 @@ void AppController::registerHotkeys()
                    << "config:" << QStringLiteral("%APPDATA%/FCapture/config.ini");
     }
 
-    syncHotkeyState();
-}
-
-void AppController::restoreHotkeys()
-{
-    if (!m_hotkeys || !m_hotkeys->isSuspended())
-        return;
-
-    const QStringList failed = m_hotkeys->resume();
-    for (const QString &action : hotkeyActions()) {
-        if (failed.contains(action))
-            m_hotkeyConflicts.insert(action);
-        else
-            m_hotkeyConflicts.remove(action);
-    }
-
-    if (!failed.isEmpty())
-        qWarning() << "AppController: hotkey restore failed:" << failed;
     syncHotkeyState();
 }
 
@@ -450,39 +435,10 @@ void AppController::showPreferences()
         // 触发 syncHotkeyState() 才补上——就是"打开不红、编辑一次才红"。
         dialog->setHotkeyFailedKeys(currentFailedKeys());
 
-        connect(dialog, &PreferenceDialog::hotkeyRecordingChanged, this,
-                [this](bool recording) {
-                    if (!m_hotkeys)
-                        return;
-                    if (recording)
-                        m_hotkeys->suspend();
-                    else
-                        restoreHotkeys();
-                });
+        // 快捷键录制期间不 suspend 全局热键：录制弹窗是模态窗口，
+        // AppController 的 hotkeyPressed 处理里已有 activeModalWidget()
+        // 兜底拦截，按下被占用的组合不会触发截图/贴图。
         connect(dialog, &PreferenceDialog::restartRequested, this, &AppController::restartApp);
-        connect(dialog, &PreferenceDialog::hotkeyChangeRequested, this,
-                [this, dialog](const QString &action, const QString &hotkey) {
-                    if (!m_hotkeys) {
-                        dialog->showHotkeyResult(action, false,
-                                                 QStringLiteral("快捷键被占用"));
-                        return;
-                    }
-
-                    if (m_hotkeys->registerHotkey(action, hotkey)
-                        != HotkeyManager::RegistrationStatus::Success) {
-                        restoreHotkeys();
-                        m_hotkeyConflicts.insert(action);
-                        syncHotkeyState();
-                        dialog->showHotkeyResult(action, false,
-                                                 QStringLiteral("快捷键被占用"));
-                        return;
-                    }
-
-                    ConfigManager::instance()->setHotkey(action, hotkey);
-                    m_hotkeyConflicts.remove(action);
-                    syncHotkeyState();
-                    dialog->showHotkeyResult(action, true);
-                });
         // 多快捷键（snow 式弹窗）：逐个注册，部分失败不影响其余键生效
         connect(dialog, &PreferenceDialog::hotkeysChangeRequested, this,
                 [this, dialog](const QString &action, const QStringList &hotkeys) {
@@ -513,8 +469,7 @@ void AppController::showPreferences()
                             : QStringLiteral("「%1」已被占用")
                                   .arg(failed.join(QStringLiteral("、"))));
                 });
-        connect(dialog, &QObject::destroyed, this, [this]() {
-            restoreHotkeys();
+        connect(dialog, &QObject::destroyed, this, []() {
             // 10 个设置页 + Ela 控件销毁后，Qt 的分配器不把内存还给 OS，
             // 任务管理器里会一直显示峰值；这里显式裁剪工作集
             WinUtil::trimWorkingSet();
@@ -536,8 +491,19 @@ void AppController::showGroupManager()
     dialog->activateWindow();
 }
 
+// 热键/托盘入口：白板已开就关掉，没开才新建（再按一次 = 关闭）。
+void AppController::toggleWhiteboard()
+{
+    if (m_whiteboard) {
+        m_whiteboard->close();
+        return;
+    }
+    showWhiteboard(QString(), false);
+}
+
 void AppController::showWhiteboard(const QString &color, bool transparent)
 {
+    // 命令行显式指定颜色/透明时一律新建，不走 toggle 语义
     if (m_whiteboard) {
         m_whiteboard->close();
         m_whiteboard = nullptr;

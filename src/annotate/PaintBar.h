@@ -2,12 +2,14 @@
 
 #include "annotate/AnnotationTool.h"
 
+#include <QElapsedTimer>
 #include <QPoint>
 #include <QPointer>
 #include <QVector>
 #include <QWidget>
 
 class QSlider;
+class QTimer;
 
 class Palette;
 
@@ -39,6 +41,9 @@ public:
 
     // 在选区下方/上方自动定位，不超出屏幕
     void positionNear(const QRect &selectionGlobalRect);
+    // 作为**独立顶层窗口**时使用：anchorGlobalRect 是全局坐标（选区/贴图在屏幕上的位置），
+    // 工具栏贴它的右下角外侧，并保证不超出所在屏幕。
+    void positionNearGlobal(const QRect &anchorGlobalRect);
 
 signals:
     void toolChanged(Tool tool);
@@ -156,6 +161,16 @@ private:
 
     int  m_hoverIndex = -1;
     int  m_pressedIndex = -1;
+    // 按下动效：按下瞬间记录时间，绘制时按进度做缩放 + 加深。
+    // 松开后进度回落到 0，形成"按下-回弹"的短促反馈。
+    QElapsedTimer m_pressClock;
+    int  m_pressAnimIndex = -1;      // 正在播放按下动效的按钮
+    QTimer *m_pressAnimTimer = nullptr;
+    void startPressAnimation(int index);
+    // 0..1 的动效进度
+    qreal pressProgress() const;
+    // 把按钮矩形按进度向内收（模拟按下）
+    QRect pressedRect(const QRect &r, int index) const;
     bool m_draggingSlider = false;
     bool m_draggingColor = false;
     bool m_colorDragMoved = false;

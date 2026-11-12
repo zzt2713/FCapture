@@ -33,6 +33,8 @@ QString ConfigManager::hotkey(const QString &action) const
         {QStringLiteral("toggle-images"), QStringLiteral("Shift+F3")},
         // 长截图：框选区域后滚动拼接长图
         {QStringLiteral("long-screenshot"), QStringLiteral("F2")},
+        // 白板：默认不绑键，由用户在首选项里自己设
+        {QStringLiteral("whiteboard"), QString()},
     };
     const QString key = QStringLiteral("hotkey/") + action;
     const QString stored = m_settings.value(key, kDefaults.value(action)).toString().trimmed();
@@ -61,6 +63,7 @@ QStringList ConfigManager::hotkeys(const QString &action) const
         {QStringLiteral("paste"), QStringLiteral("F3")},
         {QStringLiteral("toggle-images"), QStringLiteral("Shift+F3")},
         {QStringLiteral("long-screenshot"), QStringLiteral("F2")},
+        {QStringLiteral("whiteboard"), QString()},
     };
     const QString key = QStringLiteral("hotkey/") + action;
     const QString stored = m_settings.value(key, kDefaults.value(action)).toString().trimmed();

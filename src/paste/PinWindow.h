@@ -10,6 +10,9 @@
 #include <QWidget>
 
 class QTimer;
+class PinControlButton;
+class AnnotationEditor;
+class PaintBar;
 
 // 贴图窗口：置顶的悬浮图片
 class PinWindow : public QWidget
@@ -70,6 +73,13 @@ public:
     void applyCrop();
     void cancelCrop();
 
+    // 重新标注（snow 的 pinned edit mode）：在贴图上叠加一层标注模型，
+    // 确认后把标注烘焙进图片本身。
+    void enterEditMode();
+    bool isEditing() const { return m_editing; }
+    void applyEdit();
+    void cancelEdit();
+
     // 由 AppController 提供给状态栏等使用
     QPixmap snapshotForRecovery() const;
 
@@ -103,6 +113,7 @@ protected:
     void dragEnterEvent(QDragEnterEvent *e) override;
     void dropEvent(QDropEvent *e) override;
     void resizeEvent(QResizeEvent *e) override;
+    void moveEvent(QMoveEvent *e) override;
     void showEvent(QShowEvent *e) override;
 
 private:
@@ -117,6 +128,12 @@ private:
 
     void rebuildDisplay();
     void updateWindowSize();
+    // 左上角悬浮控制按钮（编辑 / 关闭）的创建与定位
+    void createControlButtons();
+    void layoutControlButtons();
+    void updateControlButtonsVisibility();
+    // 编辑工具栏是独立顶层窗口：跟随贴图摆到其右下角外侧
+    void placeEditToolbar();
     QSize scaledContentSize() const;
     QRect imageTargetRect() const;
     void drawBackground(QPainter &p);
@@ -139,7 +156,12 @@ private:
     qreal   m_scale = 1.0;
     qreal   m_opacity = 1.0;
     bool    m_scaleHudVisible = false;
+    // HUD 的显示位置（向目标点缓动，滚动滚轮时不会一路跳）
+    QPointF m_scaleHudAnimPos;
+    bool    m_scaleHudPosValid = false;
     QTimer *m_scaleHudTimer = nullptr;
+    // HUD 平滑跟随的刷新定时器（显示期间 ~60fps）
+    QTimer *m_scaleHudAnimTimer = nullptr;
     int     m_rotation = 0;
     bool    m_flipH = false;
     bool    m_flipV = false;
@@ -170,6 +192,14 @@ private:
     bool    m_cropping = false;
     QPoint  m_cropStart;
     QRect   m_cropRect;
+
+    // 悬浮控制按钮 + 重新标注
+    PinControlButton *m_editButton = nullptr;
+    PinControlButton *m_closeButton = nullptr;
+    bool    m_editing = false;
+    AnnotationEditor *m_editor = nullptr;
+    // 编辑工具栏挂在窗口上（不是编辑器里），才能摆到贴图外面的右下角
+    PaintBar *m_editBar = nullptr;
 
     QString m_group = QStringLiteral("Default");
     QUuid   m_desktopId;          // 创建时所在虚拟桌面

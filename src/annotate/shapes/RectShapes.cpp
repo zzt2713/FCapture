@@ -63,7 +63,7 @@ bool RectShape::hitTestContent(const QPointF &pt, qreal tolerance) const
     return !inner.contains(pt);
 }
 
-void RectShape::translate(const QPointF &delta)
+void RectShape::translateContent(const QPointF &delta)
 {
     m_rect.translate(delta);
 }

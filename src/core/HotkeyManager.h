@@ -31,11 +31,6 @@ public:
     void unregisterAction(const QString &action);
     void unregisterAll();
 
-    // 快捷键录制期间临时注销全局热键，结束后按原配置恢复。
-    void suspend();
-    QStringList resume();
-    bool isSuspended() const;
-
     // 某个 action 下注册失败的键（被别的程序占用 / 无法解析）。
     // 首选项用它把**单个键**标红，而不是整行标红。
     QStringList failedKeys(const QString &action) const;
@@ -73,7 +68,6 @@ private:
     QHash<int, QString>     m_byId;
     // action -> 注册失败的键名（每次 register/unregister 后维护）
     QHash<QString, QStringList> m_failedKeys;
-    bool m_suspended = false;
     bool m_blockOnFullscreen = false;
     // 全屏检测结果缓存：WM_HOTKEY 回调里做跨进程查询会卡输入
     mutable bool   m_lastFullscreen = false;

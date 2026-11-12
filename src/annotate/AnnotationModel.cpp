@@ -121,6 +121,26 @@ void AnnotationModel::clear()
     notifyChanged();
 }
 
+void AnnotationModel::bringToFront(const std::shared_ptr<Annotation> &shape)
+{
+    const int index = m_shapes.indexOf(shape);
+    if (index < 0 || index == m_shapes.size() - 1)
+        return;
+    m_shapes.removeAt(index);
+    m_shapes.append(shape);
+    notifyChanged();
+}
+
+void AnnotationModel::sendToBack(const std::shared_ptr<Annotation> &shape)
+{
+    const int index = m_shapes.indexOf(shape);
+    if (index <= 0)
+        return;
+    m_shapes.removeAt(index);
+    m_shapes.prepend(shape);
+    notifyChanged();
+}
+
 bool AnnotationModel::canUndo() const
 {
     return !m_undoStack.isEmpty();

@@ -44,8 +44,6 @@ public:
                           const QString &message = QString());
 
 signals:
-    void hotkeyRecordingChanged(bool recording);
-    void hotkeyChangeRequested(const QString &action, const QString &hotkey);
     // 多快捷键：一次给完整列表（snow 的按键配置弹窗支持多个备用键）
     void hotkeysChangeRequested(const QString &action, const QStringList &hotkeys);
     // 托盘菜单里的「重启应用」已移到「关于」页，由 AppController 执行
@@ -76,6 +74,12 @@ private:
     void checkForUpdates();
     // 关于页：下载并安装待处理的更新
     void startUpdateDownload();
+    // 已下载并校验通过、等待用户确认安装的更新包（空 = 没有待装更新）
+    QString m_readyUpdatePath;
+    // 弹出「重启并更新」确认框；返回 true 表示已交给安装器
+    bool confirmInstallUpdate();
+    // 下载完成后停在 Ready 状态：只改按钮文字，不弹窗（对齐 snow）
+    void markUpdateReady(const QString &filePath);
 
     QWidget *m_historyList = nullptr;
     ElaText *m_updateStatus = nullptr;

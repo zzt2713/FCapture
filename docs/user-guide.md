@@ -168,8 +168,9 @@
 | **OCR 文字识别** | 截图工具栏的「识别文字」按钮；结果可编辑、可换语言重识别 |
 | 长截图 | `F2` / 托盘菜单「长截图」（滚动拼接，见 2.4） |
 | 二维码识别 | 截图工具栏按钮（**计划 2.0 版本支持**） |
-| 白板 | 托盘菜单「白板」 |
+| 白板 | 托盘菜单「白板」，或首选项 → 控制里自行绑定全局热键 |
 | 分组管理 | 托盘菜单「分组管理…」 |
+| 改全局快捷键 | 首选项 → 控制（支持一个功能绑多个键） |
 | 屏幕热角 | 首选项 → 控制 |
 | 延迟截图 | 命令行 `--delay` |
 | 检查更新 | 首选项 → 关于 → 「检查更新」 |
@@ -245,7 +246,7 @@ FCapture.exe snip --active-window --delay 3 -o pin
 
 多半被其它软件占用（原版 Snipaste、输入法、录屏工具）。
 启动日志里有 `RegisterHotKey failed`，托盘悬停提示也会显示「（被占用）」。
-到「首选项 → 控制」换一个组合键即可。
+到「首选项 → 控制」点对应那一行，在弹出的按键配置窗里改即可。一个功能可绑定多个按键（最多 3 个），添加的键会以独立按钮显示在行的右侧；弹窗内点绿色对勾确认，被占用的键会标红。
 
 ### 元素识别不准
 
@@ -270,8 +271,14 @@ FCapture.exe snip --active-window --delay 3 -o pin
 ### 更新
 
 「首选项 → 关于 → 检查更新」会查询 GitHub Releases。
-有新版本时可点「立即更新」自动下载、校验 SHA256、覆盖安装并重启。
-更新失败会自动回滚到旧版本。
+
+发现新版本后按钮变为「下载更新」，点它下载并校验 SHA256。**下载完成不会自动安装**，
+状态变成「更新已就绪」，按钮变为「重启并更新」——你想什么时候装就什么时候点。
+
+点「重启并更新」后会弹一次确认框（默认按钮是「取消」，防误触）。
+确认后程序关闭、覆盖安装并自动重启；更新失败会自动回滚到旧版本。
+
+下载失败时按钮退回「下载更新」，可直接重试。
 
 ---
 
@@ -286,6 +293,10 @@ FCapture.exe snip --active-window --delay 3 -o pin
 | `hotkey/toggle-images` | `Shift+F3` | 贴图显隐热键 |
 | `hotkey/capture-active-window` | `Ctrl+Shift+A` | 活动窗口热键 |
 | `hotkey/long-screenshot` | `F2` | 长截图热键（滚动拼接长图） |
+| `hotkey/whiteboard` | 空 | 白板热键（默认不绑，在首选项里设置） |
+
+> `hotkey/*` 都支持多个键，用英文逗号分隔，例如 `capture=Ctrl+Alt+A,F1`。
+> 建议在首选项里改，手改后需重启。
 | `general/play_sound` | `true` | 截图完成提示音 |
 | `general/record_all_snips` | `false` | 记录 Esc 中止的截图 |
 | `general/copy_image_as_file` | `false` | 复制图像同时复制文件 |
@@ -297,6 +308,8 @@ FCapture.exe snip --active-window --delay 3 -o pin
 | `snip/capture_cursor` | `false` | 截图包含鼠标光标 |
 | `snip/auto_detect_window` | `true` | 自动检测窗口/元素 |
 | `snip/show_auxiliary_lines` | `true` | 显示辅助线 |
+| `snip/selection_transition_animation` | `32` | 识别框过渡动画：0=关闭 / 32=柔和 / 72=快速 |
+| `general/block_hotkeys_in_fullscreen` | `true` | 全屏**游戏**时屏蔽快捷键（全屏视频不屏蔽） |
 | `snip/corner_radius` | `0` | 圆角半径 |
 | `snip/shadow_enabled` | `false` | 导出加阴影 |
 | `snip/exclude_from_detection` | 空 | 不参与检测的进程名（逗号分隔） |

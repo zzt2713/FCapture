@@ -33,11 +33,11 @@ struct ToolGroup
 
 const ToolGroup kToolGroups[] = {
     {{Tool::Rectangle, Tool::Ellipse,     Tool::None}, 2},   // 形状
-    {{Tool::Line,      Tool::Arrow,       Tool::Polyline}, 3}, // 直线/箭头/折线
+    {{Tool::Line,      Tool::Polyline,    Tool::None}, 2},   // 直线/折线
+    {{Tool::Arrow,     Tool::None,        Tool::None}, 1},   // 箭头（独立，夹在直线和铅笔之间）
     {{Tool::Pencil,    Tool::Marker,      Tool::None}, 2},   // 手绘
     {{Tool::Text,      Tool::None,        Tool::None}, 1},
-    {{Tool::Mosaic,    Tool::Blur,        Tool::None}, 2},   // 像素处理
-    {{Tool::Eraser,    Tool::None,        Tool::None}, 1},   // 橡皮擦（独立）
+    {{Tool::Eraser,    Tool::Mosaic,      Tool::Blur}, 3},   // 橡皮擦（马赛克/模糊并入）
     {{Tool::Number,    Tool::Magnify,     Tool::Lasso}, 3},  // 序号/放大镜/套索
 };
 constexpr int kToolGroupCount = int(sizeof(kToolGroups) / sizeof(kToolGroups[0]));
@@ -429,7 +429,9 @@ void PaintBar::positionNear(const QRect &selectionLocalRect)
 
     constexpr int kSelGap = 8;
 
-    int x = sel.center().x() - hint.width() / 2;
+    // 水平对齐选区**右边缘**（工具栏右端与选区右端重合），
+    // 不再居中：选区在屏幕左侧时工具栏不会飘到中间挡视线。
+    int x = sel.right() - hint.width() + 1;
     x = qBound(avail.left() + 4, x, avail.right() - hint.width() - 4);
 
     int y = sel.bottom() + kSelGap;
@@ -450,6 +452,32 @@ void PaintBar::positionNear(const QRect &selectionLocalRect)
     move(x, y);
 }
 
+// 独立顶层窗口版本：anchorGlobalRect 用全局坐标，可用区域取该点所在屏幕。
+void PaintBar::positionNearGlobal(const QRect &anchorGlobalRect)
+{
+    const QSize hint = size();
+    const QRect anchor = anchorGlobalRect;
+
+    QScreen *screen = QGuiApplication::screenAt(anchor.center());
+    if (!screen)
+        screen = QGuiApplication::primaryScreen();
+    const QRect avail = screen ? screen->availableGeometry() : anchor;
+
+    constexpr int kGap = 8;
+
+    int x = anchor.right() - hint.width() + 1;
+    x = qBound(avail.left() + 4, x, avail.right() - hint.width() - 4);
+
+    int y = anchor.bottom() + kGap;
+    if (y + hint.height() > avail.bottom() - 4) {
+        // 下方放不下就翻到上方
+        const int aboveY = anchor.top() - hint.height() - kGap;
+        y = (aboveY >= avail.top() + 4) ? aboveY : qMax(avail.top() + 4, avail.bottom() - hint.height() - 4);
+    }
+
+    move(x, y);
+}
+
 // ---------------------------------------------------------------- 事件
 
 int PaintBar::hitButton(const QPoint &pos) const
@@ -459,6 +487,51 @@ int PaintBar::hitButton(const QPoint &pos) const
             return i;
     }
     return -1;
+}
+
+// ---------------------------------------------------------------- 按下动效
+
+qreal PaintBar::pressProgress() const
+{
+    if (m_pressAnimIndex < 0 || !m_pressClock.isValid())
+        return 0.0;
+    // 90ms 内从 1 衰减到 0：按下瞬间最深，然后回弹
+    constexpr qreal kDurationMs = 90.0;
+    const qreal t = qMin<qreal>(1.0, qreal(m_pressClock.elapsed()) / kDurationMs);
+    return 1.0 - t;
+}
+
+QRect PaintBar::pressedRect(const QRect &r, int index) const
+{
+    if (index != m_pressAnimIndex)
+        return r;
+    const qreal p = pressProgress();
+    if (p <= 0.0)
+        return r;
+    // 最多向内收 1.5px，视觉上就是"被按下去一点"
+    const int inset = qRound(p * 1.5);
+    return r.adjusted(inset, inset, -inset, -inset);
+}
+
+void PaintBar::startPressAnimation(int index)
+{
+    m_pressAnimIndex = index;
+    m_pressClock.restart();
+
+    if (!m_pressAnimTimer) {
+        m_pressAnimTimer = new QTimer(this);
+        m_pressAnimTimer->setInterval(16);   // ~60fps
+        connect(m_pressAnimTimer, &QTimer::timeout, this, [this]() {
+            if (pressProgress() <= 0.0) {
+                m_pressAnimTimer->stop();
+                m_pressAnimIndex = -1;
+            }
+            update();
+        });
+    }
+    if (!m_pressAnimTimer->isActive())
+        m_pressAnimTimer->start();
+    update();
 }
 
 void PaintBar::mousePressEvent(QMouseEvent *e)
@@ -477,6 +550,9 @@ void PaintBar::mousePressEvent(QMouseEvent *e)
         // 滑块是真实子控件，鼠标事件由它自己处理
         return;
     }
+
+    // 按下动效：所有能点的按钮都给一次短促反馈
+    startPressAnimation(idx);
 
     // 色点：按下先记录位置，移动超过阈值才算拖拽排序（否则松手仍按单击处理）
     if (b.kind == Button::Kind::ColorDot && b.index >= 0) {
@@ -1622,27 +1698,33 @@ void PaintBar::paintEvent(QPaintEvent *e)
         const Button &b = m_buttons.at(i);
         const bool hover = (i == m_hoverIndex);
         const bool pressed = (i == m_pressedIndex);
+        // 按下动效：矩形向内收一点，图标随之缩小，形成"按下去"的手感
+        const QRect visual = pressedRect(b.rect, i);
 
         if (b.kind == Button::Kind::Tool && b.tool != Tool::None) {
             if (m_tool == b.tool) {
                 p.setPen(Qt::NoPen);
                 p.setBrush(Theme::kAccent);
-                p.drawRoundedRect(b.rect, 4, 4);
+                p.drawRoundedRect(visual, 4, 4);
             } else if (pressed) {
                 p.setPen(Qt::NoPen);
                 p.setBrush(QColor(kPressLight));
-                p.drawRoundedRect(b.rect, 4, 4);
+                p.drawRoundedRect(visual, 4, 4);
             } else if (hover) {
                 p.setPen(Qt::NoPen);
                 p.setBrush(QColor(kHoverLight));
-                p.drawRoundedRect(b.rect, 4, 4);
+                p.drawRoundedRect(visual, 4, 4);
             }
 
-            const QPixmap icon = ToolIcons::forTool(b.tool, 20,
+            // 按下时图标略微缩小（20 → 18），和矩形收缩同步
+            const bool animating = (i == m_pressAnimIndex);
+            const int iconSize = animating ? 20 - qRound(pressProgress() * 2.0) : 20;
+            const QPixmap icon = ToolIcons::forTool(b.tool, iconSize,
                                                     m_tool == b.tool ? Qt::white
                                                                      : QColor(kIcon));
-            p.drawPixmap(b.rect.center() - QPoint(qRound(icon.width() / icon.devicePixelRatio() / 2),
-                                                  qRound(icon.height() / icon.devicePixelRatio() / 2)),
+            p.drawPixmap(visual.center()
+                             - QPoint(qRound(icon.width() / icon.devicePixelRatio() / 2),
+                                      qRound(icon.height() / icon.devicePixelRatio() / 2)),
                          icon);
 
             // 多成员组：右下角小三角，提示可下拉切换

@@ -133,7 +133,7 @@ bool MagnifyShape::hitTestContent(const QPointF &pt, qreal tolerance) const
     return !s.isEmpty() && s.contains(pt);
 }
 
-void MagnifyShape::translate(const QPointF &delta)
+void MagnifyShape::translateContent(const QPointF &delta)
 {
     m_targetRect.translate(delta);
 

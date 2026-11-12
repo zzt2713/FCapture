@@ -302,7 +302,7 @@ bool LineShape::hitTestContent(const QPointF &pt, qreal tolerance) const
     return false;
 }
 
-void LineShape::translate(const QPointF &delta)
+void LineShape::translateContent(const QPointF &delta)
 {
     for (QPointF &pt : m_points)
         pt += delta;

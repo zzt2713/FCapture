@@ -158,7 +158,7 @@ bool FreehandShape::hitTestContent(const QPointF &pt, qreal tolerance) const
     return false;
 }
 
-void FreehandShape::translate(const QPointF &delta)
+void FreehandShape::translateContent(const QPointF &delta)
 {
     for (QPointF &pt : m_points)
         pt += delta;

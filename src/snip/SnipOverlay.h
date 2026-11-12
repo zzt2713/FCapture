@@ -280,6 +280,13 @@ private:
     bool hitTestSelectedHandle(const QPoint &localPos, int *outIndex,
                                std::shared_ptr<Annotation> *outShape) const;
     bool hitTestRotationHandle(const QPoint &localPos, std::shared_ptr<Annotation> *outShape) const;
+    // 圆角手柄（对齐 snow 的 SelectionCornerRadiusHandle）：
+    // 只在单选一个矩形/椭圆时出现，四个角各一个，向中心内缩。
+    // 拖动它调整该形状的圆角半径。
+    QVector<QPointF> cornerRadiusHandlePositions(const std::shared_ptr<Annotation> &shape) const;
+    bool hitTestCornerRadiusHandle(const QPoint &localPos, int *outCorner,
+                                   std::shared_ptr<Annotation> *outShape) const;
+    qreal maxCornerRadiusFor(const std::shared_ptr<Annotation> &shape) const;
     void beginRotate(const QPoint &localPos);
     void updateRotate(const QPoint &localPos);
     void drawSelectionBox(QPainter &p, const std::shared_ptr<Annotation> &shape);
@@ -360,6 +367,8 @@ private:
     QElapsedTimer m_hoverAnimClock;
     QTimer *m_hoverAnimTimer = nullptr;
     QRect  m_lastHoverPaintRect;     // 上一帧高亮框（脏区计算用）
+    // 尺寸标签的显示位置（向 sizeLabelRect() 缓动，避免拖拽时标签"啪"地跳）
+    QRectF m_sizeLabelAnimRect;
     QPoint m_lastMousePaintPos;      // 上一帧鼠标位置（参考线脏区用）
     QRect  m_winRectCache;           // 窗口矩形缓存（避免每次 EnumWindows）
     QPoint m_winRectCachePos;        // 缓存对应的光标位置（必须按坐标命中）
@@ -479,6 +488,23 @@ private:
     std::vector<std::shared_ptr<Annotation>> m_selectedShapes;
     std::shared_ptr<Annotation> m_movingShape;
     int m_resizeShapeHandleIndex = -1;
+    // 正在拖动的圆角手柄（-1 = 没在拖）
+    int m_cornerRadiusDragCorner = -1;
+    // 悬停候选形状（snow 的 hovered element）：鼠标经过未选中的图形时
+    // 画一圈虚线候选框，让用户知道"点这里会选中它"。
+    std::shared_ptr<Annotation> m_hoveredShape;
+    // 悬停时的目标指示形状（用于判断是否要重绘）
+    // 选中标注的右键菜单（置顶 / 置底 / 删除）
+    void showAnnotationMenu(const QPoint &globalPos);
+    // mousePressEvent 判中"右键点在选中标注上"时置位，
+    // contextMenuEvent 据此弹标注菜单而不是选区菜单
+    bool m_annotationMenuPending = false;
+    void updateHoveredShape(const QPoint &localPos);
+    void drawHoveredShapeFrame(QPainter &p);
+    // 按当前工具返回"落笔光标"（对齐 snow 的 ToolPolicy::default_cursor）：
+    // 形状类 = 十字，橡皮 = Eraser，文字 = I 形，序号 = 十字，
+    // 选择工具 = 普通箭头。
+    Qt::CursorShape toolCursor() const;
 
     // 旋转
     std::shared_ptr<Annotation> m_rotatingShape;

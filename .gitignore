@@ -39,6 +39,7 @@ crash/
 beifen/
 preview/
 probe_tmp/
+.backup/
 *.zip
 
 # ---- AI 协作工具本机配置 ----

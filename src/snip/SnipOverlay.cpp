@@ -430,6 +430,7 @@ void SnipOverlay::startSession(const ScreenCapturer::Snapshot &snapshot)
     clearSelectionSilently();
     m_movingShape.reset();
     m_resizeShapeHandleIndex = -1;
+    m_cornerRadiusDragCorner = -1;
     m_rotatingShape.reset();
     m_lassoPoints.clear();
     m_rectSelectRect = QRect();
@@ -760,10 +761,26 @@ void SnipOverlay::mousePressEvent(QMouseEvent *e)
         }
 
         // 右键逐级"退出当前操作"，避免用户想取消工具时误退出整个截图：
-        //   1. 有选中标注 → 取消选中
+        //   0. 右键落在**已选中的标注**上 → 弹标注菜单（置顶/置底/删除）
+        //   1. 有选中标注但点在别处 → 取消选中
         //   2. 有激活工具 → 取消工具
         //   3. 都没有 → 才是取消截图（保持原有语义）
         if (!m_selectedShapes.empty()) {
+            const QPointF localRight = QPointF(e->position().toPoint());
+            bool onSelected = false;
+            for (const auto &shape : m_selectedShapes) {
+                if (shape && shape->hitTest(localRight, 4.0)) {
+                    onSelected = true;
+                    break;
+                }
+            }
+            if (onSelected) {
+                // 不设 suppress，并打上"这次右键是标注菜单"的标记：
+                // contextMenuEvent 里靠它决定弹哪个菜单，避免重复判命中。
+                m_annotationMenuPending = true;
+                update();
+                return;
+            }
             m_suppressContextMenu = true;
             clearSelection();
             update();
@@ -849,6 +866,20 @@ void SnipOverlay::mousePressEvent(QMouseEvent *e)
 
     // ---- 编辑态：已选中形状时，旋转点 > 角手柄旋转 > 锚点 > Ctrl拖克隆 > 拖动 ----
     if (m_state == State::Adjusting && !m_selectedShapes.empty()) {
+        // 圆角手柄优先级最高：它画在四角内侧，和缩放手柄位置可能重叠，
+        // 但用户是按"看起来像圆角把手"去点的，应该先认它。
+        int radiusCorner = -1;
+        std::shared_ptr<Annotation> radiusShape;
+        if (hitTestCornerRadiusHandle(local, &radiusCorner, &radiusShape)) {
+            m_cornerRadiusDragCorner = radiusCorner;
+            m_movingShape = radiusShape;
+            m_resizeShapeHandleIndex = -1;
+            m_activeAnchor = Anchor::None;
+            m_state = State::Resizing;
+            m_dragStart = local;
+            return;
+        }
+
         if (hitTestRotationHandle(local, nullptr)) {
             beginRotate(local);
             return;
@@ -905,6 +936,23 @@ void SnipOverlay::mousePressEvent(QMouseEvent *e)
         // 清掉已有选中会让"套索画太小 = 误点"这类情况把选中一起丢失。
         if (m_currentTool == Tool::None)
             clearSelection();
+    }
+
+    // ---- 快速选择（snow 的 quick_selection_enabled）----
+    //
+    // 即使某个绘制工具处于激活状态，鼠标点到**已有标注**上也应该先选中它，
+    // 而不是在它上面叠画一个新图形。之前缺少这一步，导致"鼠标悬停有虚线框
+    // 提示可以选中，但一点就开始画新东西"，用户会理解成标注无法选中。
+    //
+    // snow 在 policy.rs 里对除两种橡皮以外所有工具都开了
+    // quick_selection_enabled，这里对齐：只有"矩形/涂抹类橡皮"不参与。
+    if (m_state == State::Adjusting && !localSelection().isEmpty()
+        && m_currentTool != Tool::Eraser && m_currentTool != Tool::Lasso
+        && m_model->hitTestShape(QPointF(local), 4.0)) {
+        // Ctrl 点按 additive 语义切换；普通点击替换选中
+        selectShapeAt(local, ctrl);
+        if (!m_selectedShapes.empty())
+            return;
     }
 
     // 标注模式优先：工具栏可见且已选工具时进入绘制
@@ -976,6 +1024,14 @@ void SnipOverlay::mousePressEvent(QMouseEvent *e)
             return;
         }
         if (hitTestSelection(local)) {
+            // 有选中标注时，点在选区空白处 = 取消选中。
+            // 否则用户想"退出选中状态"就会变成拖动整个选区，
+            // 表现上像"点了没反应"，只能右键或按 Esc 才能退出。
+            if (!m_selectedShapes.empty()) {
+                clearSelection();
+                update();
+                return;
+            }
             m_state = State::Moving;
             m_dragStart = local;
             m_dragOrigin = localSelection().topLeft();
@@ -1047,6 +1103,27 @@ void SnipOverlay::mouseMoveEvent(QMouseEvent *e)
     case State::Resizing:
         if (m_rotatingShape) {
             updateRotate(local);
+        } else if (m_cornerRadiusDragCorner >= 0 && m_movingShape) {
+            auto *rectShape = dynamic_cast<RectShape *>(m_movingShape.get());
+            if (rectShape) {
+                const QRectF r = m_movingShape->rawBoundingRect();
+                // 该手柄对应的那个几何角
+                const bool rightSide = (m_cornerRadiusDragCorner == 1
+                                        || m_cornerRadiusDragCorner == 2);
+                const bool bottomSide = (m_cornerRadiusDragCorner == 2
+                                         || m_cornerRadiusDragCorner == 3);
+                const QPointF corner(rightSide ? r.right() : r.left(),
+                                     bottomSide ? r.bottom() : r.top());
+
+                // 鼠标离这个角越近 → 内缩越小 → 圆角越小；
+                // 离得越远 → 圆角越大。手感上等于"把弧往里推"。
+                const qreal dist = QLineF(corner, QPointF(local)).length();
+                const qreal maxRadius = maxCornerRadiusFor(m_movingShape);
+                const qreal radius = qBound<qreal>(0.0, dist, maxRadius);
+                rectShape->setCornerRadius(radius);
+                m_movingShape->invalidateCache();
+                update();
+            }
         } else if (m_resizeShapeHandleIndex >= 0 && m_movingShape) {
             // Shift + 拖角 = 保持宽高比（矩形/椭圆）
             auto *rectShape = dynamic_cast<RectShape *>(m_movingShape.get());
@@ -1109,7 +1186,11 @@ void SnipOverlay::mouseMoveEvent(QMouseEvent *e)
         // 已选中标注的形状手柄永远优先：画完图形会自动选中且工具仍激活，
         // 不先判手柄的话会一路落到"工具激活＝十字"，拖拽点永远是十字。
         if (!m_selectedShapes.empty() && m_state == State::Adjusting) {
-            if (hitTestRotationHandle(local, nullptr)) {
+            if (hitTestCornerRadiusHandle(local, nullptr, nullptr)) {
+                // 圆角手柄：snow 用 CursorStyle::CornerRadius，Qt 没有对应形状，
+                // 用 SizeAllCursor 表示"可拖拽调整"
+                setCursor(Qt::SizeAllCursor);
+            } else if (hitTestRotationHandle(local, nullptr)) {
                 setCursor(Qt::CrossCursor);   // 旋转点：按住 Alt/角手柄旋转
             } else {
                 int handleIndex = -1;
@@ -1143,7 +1224,7 @@ void SnipOverlay::mouseMoveEvent(QMouseEvent *e)
                         case Anchor::S:  setCursor(Qt::SizeVerCursor);  break;
                         case Anchor::E:
                         case Anchor::W:  setCursor(Qt::SizeHorCursor);  break;
-                        case Anchor::None: setCursor(Qt::CrossCursor);  break;
+                        case Anchor::None: setCursor(toolCursor());      break;
                         }
                     } else {
                         const Anchor a = hitTestAnchor(local);
@@ -1165,8 +1246,8 @@ void SnipOverlay::mouseMoveEvent(QMouseEvent *e)
                 }
             }
         } else if (m_currentTool != Tool::None && m_paintBarVisible) {
-            // 选中工具后，整个画布（含选区内部）统一是十字光标：
-            // 此时鼠标的唯一用途就是"落笔"，在选区里显示抓手/移动光标会误导。
+            // 选中工具后，整个画布（含选区内部）统一用该工具的"落笔光标"：
+            // 此时鼠标的唯一用途就是落笔，在选区里显示抓手会误导。
             // 只有拖动选区锚点时仍保留缩放光标，那是唯一需要区分的手势。
             const Anchor a = hitTestAnchor(local);
             switch (a) {
@@ -1178,10 +1259,11 @@ void SnipOverlay::mouseMoveEvent(QMouseEvent *e)
             case Anchor::S:  setCursor(Qt::SizeVerCursor);  break;
             case Anchor::E:
             case Anchor::W:  setCursor(Qt::SizeHorCursor);  break;
-            case Anchor::None: setCursor(Qt::CrossCursor);  break;
+            case Anchor::None: setCursor(toolCursor());      break;
             }
         } else if (m_state == State::Adjusting && !localSelection().isEmpty()) {
-            // 未选工具：选区锚点给缩放光标，选区内给移动光标，其余十字
+            // 未选工具：选区锚点给缩放光标，选区内给移动光标，其余箭头
+            // （对齐 snow 的 Select 工具默认光标）
             const Anchor a = hitTestAnchor(local);
             switch (a) {
             case Anchor::NW:
@@ -1193,15 +1275,21 @@ void SnipOverlay::mouseMoveEvent(QMouseEvent *e)
             case Anchor::E:
             case Anchor::W:  setCursor(Qt::SizeHorCursor);  break;
             case Anchor::None:
-                setCursor(hitTestSelection(local) ? Qt::SizeAllCursor : Qt::CrossCursor);
+                // snow 的交互：鼠标经过某个标注时显示移动光标，
+                // 提示"这里可以点选/拖动"。光标和虚线候选框一起出现。
+                if (m_model->hitTestShape(QPointF(local), 4.0))
+                    setCursor(Qt::SizeAllCursor);
+                else
+                    setCursor(hitTestSelection(local) ? Qt::SizeAllCursor : toolCursor());
                 break;
             }
         } else {
-            setCursor(Qt::CrossCursor);
+            setCursor(toolCursor());
         }
 
         updateHoverWindow();
         updateMagnifier();
+        updateHoveredShape(local);
         hoverRepaint();
         break;
     }
@@ -1253,6 +1341,15 @@ void SnipOverlay::mouseReleaseEvent(QMouseEvent *e)
     if (m_state == State::Resizing && m_rotatingShape) {
         m_rotatingShape.reset();
         m_state = State::Adjusting;
+        update();
+        return;
+    }
+
+    // 圆角拖动结束
+    if (m_state == State::Resizing && m_cornerRadiusDragCorner >= 0) {
+        m_cornerRadiusDragCorner = -1;
+        m_state = State::Adjusting;
+        m_movingShape.reset();
         update();
         return;
     }
@@ -2411,6 +2508,7 @@ void SnipOverlay::paintEvent(QPaintEvent *e)
         p.restore();
     }
 
+    drawHoveredShapeFrame(p);    // 悬停候选框（snow 的 SelectionCandidateFrame）
     drawSelectionHandles(p);     // 选中框 + 锚点
     drawLassoPreview(p);
     drawAuxiliaryLines(p);
@@ -2940,9 +3038,30 @@ void SnipOverlay::drawSizeLabel(QPainter &p)
                                : QSize(qRound(sel.width() * dpr), qRound(sel.height() * dpr));
     const QString text = QStringLiteral("%1 × %2").arg(shown.width()).arg(shown.height());
 
-    const QRect box = sizeLabelRect();
-    if (box.isEmpty())
+    const QRect target = sizeLabelRect();
+    if (target.isEmpty())
         return;
+
+    // 平滑跟随：标签位置向目标缓动（每帧靠拢 35%），
+    // 拖拽选区时标签像"黏"在框上，而不是每帧硬跳。
+    // 尺寸变化（文字宽度）直接生效，只有位置做插值。
+    if (m_sizeLabelAnimRect.isNull()) {
+        m_sizeLabelAnimRect = QRectF(target);
+    } else {
+        const QPointF cur = m_sizeLabelAnimRect.topLeft();
+        const QPointF goal = QPointF(target.topLeft());
+        const QPointF next = cur + (goal - cur) * 0.35;
+        if (QLineF(cur, goal).length() < 0.5) {
+            m_sizeLabelAnimRect.moveTopLeft(goal);
+        } else {
+            m_sizeLabelAnimRect.moveTopLeft(next);
+            // 还没到位：请求下一帧继续插值。拖拽时鼠标事件本来就在刷，
+            // 松手后靠这一次 update() 把最后几像素补完。
+            QTimer::singleShot(16, this, [this]() { update(); });
+        }
+        m_sizeLabelAnimRect.setSize(QSizeF(target.size()));
+    }
+    const QRect box = m_sizeLabelAnimRect.toRect();
 
     p.save();
     QFont f = Theme::appFont();
@@ -3343,8 +3462,62 @@ void SnipOverlay::contextMenuEvent(QContextMenuEvent *e)
         e->ignore();
         return;
     }
+
+    // 右键落在已选中的标注上（由 mousePressEvent 判定并留下标记）：
+    // 弹标注菜单。否则弹选区菜单。
+    // 压在下面的标注被别的东西盖住时，只能靠"置于顶层"把它捞出来。
+    if (m_annotationMenuPending) {
+        m_annotationMenuPending = false;
+        showAnnotationMenu(e->globalPos());
+        e->accept();
+        return;
+    }
+
     showSnipMenu(e->globalPos());
     e->accept();
+}
+
+// 选中标注的右键菜单
+void SnipOverlay::showAnnotationMenu(const QPoint &globalPos)
+{
+    if (m_selectedShapes.empty())
+        return;
+
+    AppMenu::Menu menu(this);
+
+    QAction *front = AppMenu::addIconAction(menu.get(), ElaIconType::LayerGroup,
+                                            QStringLiteral("置于顶层"));
+    connect(front, &QAction::triggered, this, [this]() {
+        for (const auto &shape : m_selectedShapes)
+            m_model->bringToFront(shape);
+        update();
+    });
+
+    QAction *back = AppMenu::addIconAction(menu.get(), ElaIconType::LayerGroup,
+                                           QStringLiteral("置于底层"));
+    connect(back, &QAction::triggered, this, [this]() {
+        for (const auto &shape : m_selectedShapes)
+            m_model->sendToBack(shape);
+        update();
+    });
+
+    menu->addSeparator();
+
+    const QString delText = m_selectedShapes.size() > 1
+                                ? QStringLiteral("删除选中的 %1 个标注\tDel")
+                                      .arg(m_selectedShapes.size())
+                                : QStringLiteral("删除标注\tDel");
+    QAction *remove = AppMenu::addIconAction(menu.get(), ElaIconType::Trash, delText);
+    connect(remove, &QAction::triggered, this, [this]() {
+        const auto shapes = m_selectedShapes;
+        for (const auto &shape : shapes)
+            m_model->removeShape(shape);
+        clearSelectionSilently();
+        m_hoveredShape.reset();
+        update();
+    });
+
+    menu->exec(globalPos);
 }
 
 // ---------------------------------------------------------------- P4 检测指示

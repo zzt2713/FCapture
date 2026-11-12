@@ -244,7 +244,7 @@ QRectF PixelShape::rawBoundingRect() const
     return affectedRect();
 }
 
-void PixelShape::translate(const QPointF &delta)
+void PixelShape::translateContent(const QPointF &delta)
 {
     if (m_mode == Mode::Rect)
         m_rect.translate(delta);

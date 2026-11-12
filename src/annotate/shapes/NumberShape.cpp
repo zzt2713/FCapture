@@ -88,7 +88,7 @@ bool NumberShape::hitTestContent(const QPointF &pt, qreal tolerance) const
     return QPointF::dotProduct(d, d) <= rr * rr;
 }
 
-void NumberShape::translate(const QPointF &delta)
+void NumberShape::translateContent(const QPointF &delta)
 {
     m_center += delta;
 }

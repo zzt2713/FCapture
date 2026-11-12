@@ -157,6 +157,14 @@ void TrayController::refreshMenus()
             QStringLiteral("隐藏所有贴图\t%1")
                 .arg(hotkeyText(QStringLiteral("toggle-images"))));
 
+    // 白板键默认未配置：空字符串时不显示制表符，避免菜单里出现一条空尾巴
+    if (m_whiteboardAction) {
+        const QString key = hotkeyText(QStringLiteral("whiteboard"));
+        m_whiteboardAction->setText(
+            key.isEmpty() ? QStringLiteral("白板")
+                          : QStringLiteral("白板\t%1").arg(key));
+    }
+
     setHotkeyHint(m_hotkeyConflicts.contains(QStringLiteral("capture"))
                       ? QString()
                       : cfg->hotkey(QStringLiteral("capture")));

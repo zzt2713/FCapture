@@ -95,6 +95,89 @@ void SnipOverlay::finishPolyline()
     update();
 }
 
+// ---------------------------------------------------------------- 光标
+
+// 对齐 snow 的 ToolPolicy::default_cursor（policy.rs）：
+//   Select          → Default（普通箭头）
+//   形状/箭头/线    → Crosshair
+//   Text            → Text（I 形）
+//   Eraser          → 十字（Qt 没有专门的橡皮光标，用十字最接近）
+//   SerialNumber    → Crosshair
+//   Watermark       → Default
+// 其余绘画类一律十字。
+Qt::CursorShape SnipOverlay::toolCursor() const
+{
+    switch (m_currentTool) {
+    case Tool::None:
+        // 没有激活标注工具 = 用户在框选截图区域，必须是十字。
+        // 注意这和 snow 的 Select 工具不同：那个是画布内"选择已有标注"，
+        // 而这里的 Tool::None 是截图选区，两者不能混为一谈。
+        return Qt::CrossCursor;
+    case Tool::Lasso:
+        return Qt::ArrowCursor;    // 套索 = snow 的 Select 工具
+    case Tool::Text:
+        return Qt::IBeamCursor;    // snow 的 CursorStyle::Text
+    case Tool::Rectangle:
+    case Tool::Ellipse:
+    case Tool::Line:
+    case Tool::Arrow:
+    case Tool::Polyline:
+    case Tool::Magnify:
+    case Tool::Number:
+    case Tool::Mosaic:
+    case Tool::Blur:
+    case Tool::Eraser:
+    case Tool::Pencil:
+    case Tool::Marker:
+        return Qt::CrossCursor;
+    }
+    return Qt::CrossCursor;
+}
+
+// ---------------------------------------------------------------- 悬停候选
+
+// snow 的 hovered element：鼠标经过某个标注时，即使还没点，
+// 也画一圈虚线框提示"这里可以选中"。只在没有选中任何图形时生效，
+// 否则会和选中框叠在一起。
+void SnipOverlay::updateHoveredShape(const QPoint &localPos)
+{
+    std::shared_ptr<Annotation> next;
+
+    // 有选中项时不再显示候选框：用户已经在编辑了，再加一层框只会乱
+    if (m_selectedShapes.empty() && m_state == State::Adjusting) {
+        next = m_model->hitTestShape(QPointF(localPos), 4.0);
+    }
+
+    if (next == m_hoveredShape)
+        return;
+    m_hoveredShape = next;
+    update();
+}
+
+void SnipOverlay::drawHoveredShapeFrame(QPainter &p)
+{
+    if (!m_hoveredShape || m_hoveredShape->isDegenerate())
+        return;
+
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    // 对齐 snow 的 SelectionCandidateFrame：1px 虚线框，主色半透明。
+    // 同样不再额外外扩：boundingRect 已含笔宽，再加一圈会离图形太远。
+    QColor accent = Theme::kAccent;
+    accent.setAlpha(170);
+
+    QPen pen(accent, 1.0, Qt::DashLine);
+    pen.setDashPattern({ 4.0, 3.0 });
+    p.setPen(pen);
+    p.setBrush(Qt::NoBrush);
+
+    const QRectF box = m_hoveredShape->boundingRect();
+    p.drawRect(box);
+
+    p.restore();
+}
+
 // ---------------------------------------------------------------- 选中
 
 void SnipOverlay::selectShapeAt(const QPoint &localPos, bool additive)
@@ -166,6 +249,74 @@ bool SnipOverlay::hitTestSelectedHandle(const QPoint &localPos, int *outIndex,
                     *outShape = shape;
                 return true;
             }
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- 圆角手柄
+
+// 只有"单选一个矩形"才给圆角手柄：椭圆没有圆角概念，
+// 多选时每个形状分别调圆角没有意义，也和 snow 一致。
+qreal SnipOverlay::maxCornerRadiusFor(const std::shared_ptr<Annotation> &shape) const
+{
+    if (!shape)
+        return 0.0;
+    const QRectF r = shape->rawBoundingRect();
+    return qMax<qreal>(0.0, qMin(r.width(), r.height()) / 2.0);
+}
+
+QVector<QPointF> SnipOverlay::cornerRadiusHandlePositions(
+    const std::shared_ptr<Annotation> &shape) const
+{
+    QVector<QPointF> out;
+    if (!shape || shape->type() != Annotation::Type::Rectangle || m_selectedShapes.size() != 1)
+        return out;
+
+    const QRectF r = shape->rawBoundingRect();
+    const qreal maxRadius = maxCornerRadiusFor(shape);
+    if (maxRadius <= 0.0)
+        return out;
+
+    // 内缩量随当前圆角半径线性变化：半径越大，手柄越靠中心。
+    // 这样手柄始终停在圆角的弧顶附近，用户能直观看到"圆角有多大"。
+    const auto *rect = dynamic_cast<const RectShape *>(shape.get());
+    const qreal currentRadius = rect ? rect->cornerRadius() : 0.0;
+    const qreal radius = qMin(qMax<qreal>(0.0, currentRadius), maxRadius);
+    const qreal minInset = 12.0;
+    const qreal maxInset = qMax(minInset, qMin(r.width(), r.height()) / 2.0 - 4.0);
+    const qreal t = maxRadius > 0.0 ? radius / maxRadius : 0.0;
+    const qreal inset = minInset + (maxInset - minInset) * t;
+
+    const QPointF c = r.center();
+    out.append(QPointF(c.x() - r.width() / 2.0 + inset, c.y() - r.height() / 2.0 + inset));
+    out.append(QPointF(c.x() + r.width() / 2.0 - inset, c.y() - r.height() / 2.0 + inset));
+    out.append(QPointF(c.x() + r.width() / 2.0 - inset, c.y() + r.height() / 2.0 - inset));
+    out.append(QPointF(c.x() - r.width() / 2.0 + inset, c.y() + r.height() / 2.0 - inset));
+    return out;
+}
+
+bool SnipOverlay::hitTestCornerRadiusHandle(const QPoint &localPos, int *outCorner,
+                                            std::shared_ptr<Annotation> *outShape) const
+{
+    if (m_selectedShapes.size() != 1)
+        return false;
+
+    const std::shared_ptr<Annotation> &shape = m_selectedShapes.front();
+    const QVector<QPointF> positions = cornerRadiusHandlePositions(shape);
+    if (positions.isEmpty())
+        return false;
+
+    // 命中范围比视觉半径大一点：手柄只有 8px，精确点中太难
+    constexpr qreal kTolerance = 9.0;
+    for (int i = 0; i < positions.size(); ++i) {
+        const QPointF d = positions.at(i) - QPointF(localPos);
+        if (QPointF::dotProduct(d, d) <= kTolerance * kTolerance) {
+            if (outCorner)
+                *outCorner = i;
+            if (outShape)
+                *outShape = shape;
+            return true;
         }
     }
     return false;
@@ -270,27 +421,35 @@ void SnipOverlay::drawSelectionHandles(QPainter &p)
         const int rotIndex = shape->rotationHandleIndex();
         const bool hasRotation = rotIndex >= 0 && rotIndex < handles.size();
 
-        // 8 个手柄统一灰白方块（不再区分角/边颜色）。
-        // 角手柄同时支持"等比缩放"和"旋转"：靠近角按住不放拖动 = 旋转，
-        // 直接拖 = 缩放（由 mousePress 里的判定决定，视觉上不再多加一根引线）。
-        constexpr int kHandleSide = 7;
+        // 对齐 snow 的 SelectionResizeHandle / SelectionRotationHandle：
+        //   圆形，半径 4，填充主色，白色描边 1.5
+        constexpr qreal kHandleRadius = 4.0;
+        constexpr qreal kHandleStroke = 1.0;
         const int count = hasRotation ? rotIndex : handles.size();
 
-        for (int i = 0; i < count; ++i) {
-            const QPointF h = handles.at(i);
-            const QRectF box(h.x() - kHandleSide / 2.0, h.y() - kHandleSide / 2.0,
-                             kHandleSide, kHandleSide);
-            p.setPen(QPen(QColor(0x50, 0x50, 0x50), 1.0));
-            p.setBrush(QColor(0xE8, 0xE8, 0xE8));
-            p.drawRect(box);
-        }
+        p.setPen(QPen(Qt::white, kHandleStroke));
+        p.setBrush(Theme::kAccent);
+        for (int i = 0; i < count; ++i)
+            p.drawEllipse(handles.at(i), kHandleRadius, kHandleRadius);
 
         if (hasRotation) {
-            // 旋转手柄：同样灰白，画成小圆点便于和方块区分；不再画引线
+            // 旋转手柄：snow 是方头（SelectionRotationHandle），
+            // 和缩放的圆点区分开，一眼能看出"这个点了是转不是缩"
             const QPointF rot = handles.at(rotIndex);
-            p.setPen(QPen(QColor(0x50, 0x50, 0x50), 1.0));
-            p.setBrush(QColor(0xE8, 0xE8, 0xE8));
-            p.drawEllipse(rot, 4.0, 4.0);
+            constexpr qreal kHalf = 4.0;
+            p.setPen(QPen(Qt::white, kHandleStroke));
+            p.setBrush(Theme::kAccent);
+            p.drawRoundedRect(QRectF(rot.x() - kHalf, rot.y() - kHalf,
+                                     kHalf * 2, kHalf * 2), 2, 2);
+        }
+
+        // 圆角手柄：4 个空心小圆（snow 的 SelectionCornerRadiusHandle），
+        // 和实心缩放锚点区分开 —— 拖它改的是圆角，不是尺寸。
+        const QVector<QPointF> radiusHandles = cornerRadiusHandlePositions(shape);
+        for (const QPointF &rh : radiusHandles) {
+            p.setPen(QPen(Theme::kAccent, 1.6));
+            p.setBrush(Qt::white);
+            p.drawEllipse(rh, 3.5, 3.5);
         }
     }
 
@@ -302,11 +461,20 @@ void SnipOverlay::drawSelectionBox(QPainter &p, const std::shared_ptr<Annotation
     if (!shape)
         return;
 
-    const QRectF box = shape->boundingRect();
-
-    // 选中框：只画淡灰细线，不用主色蓝。
-    // 蓝色会和选区边框抢视觉，用户会以为"选区被改了"。
-    p.setPen(QPen(QColor(0xC8, 0xC8, 0xC8, 160), 1, Qt::DotLine));
+    // 选中框（对齐 snow 的 SelectionFrame / SelectionMultiFrame）：
+    //   单选 → 主色实线 1px
+    //   多选 → 主色虚线（snow 的 isDashedSelectionFrame 只对 MultiFrame 返回 true）
+    // 线宽恒为 1px（snow 用 1.0 / zoom 抵消画布缩放，这里没有画布缩放，直接用 1）
+    //
+    // 不再额外加 4px padding：rawBoundingRect() 已经把 penWidth/2 + 1 算进去了，
+    // 再外扩一圈会让框离图形明显很远。snow 的 padding 是相对**几何边界**的，
+    // 我们的 boundingRect 已经是"含笔宽的外沿"，所以这里直接贴着画。
+    QPen framePen(Theme::kAccent, 1.0);
+    if (m_selectedShapes.size() > 1) {
+        framePen.setStyle(Qt::DashLine);
+        framePen.setDashPattern({ 4.0, 3.0 });
+    }
+    p.setPen(framePen);
     p.setBrush(Qt::NoBrush);
 
     if (shape->isRotatable() && !qFuzzyIsNull(shape->rotation())) {
@@ -315,7 +483,7 @@ void SnipOverlay::drawSelectionBox(QPainter &p, const std::shared_ptr<Annotation
             QPolygonF(QRectF(shape->rawBoundingRect())));
         p.drawPolygon(poly);
     } else {
-        p.drawRect(box);
+        p.drawRect(shape->boundingRect());
     }
 }
 

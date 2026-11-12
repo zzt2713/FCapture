@@ -41,6 +41,8 @@ public slots:
 
     void showGroupManager();
     void showWhiteboard(const QString &color = QString(), bool transparent = false);
+    // 热键入口：已开则关，未开则开
+    void toggleWhiteboard();
     void startPickColor();
     void pasteAsImage();
     void pasteAsPlainText();
@@ -55,7 +57,6 @@ private:
 
     void onSnipFinished(const SnipResult &result, SnipOutput output);
     void registerHotkeys();
-    void restoreHotkeys();
     void syncHotkeyState();
     // 当前每个 action 下注册失败的键（供首选项按单键标红）
     QHash<QString, QStringList> currentFailedKeys() const;

@@ -315,7 +315,7 @@ bool TextShape::hitTestContent(const QPointF &pt, qreal tolerance) const
     return layoutRect().adjusted(-tolerance, -tolerance, tolerance, tolerance).contains(pt);
 }
 
-void TextShape::translate(const QPointF &delta)
+void TextShape::translateContent(const QPointF &delta)
 {
     m_pos += delta;
 }

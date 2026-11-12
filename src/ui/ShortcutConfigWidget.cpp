@@ -1,6 +1,5 @@
 #include "ui/ShortcutConfigWidget.h"
 
-#include "core/HotkeyManager.h"
 #include "ui/ShortcutKeyButton.h"
 
 #include "ElaTheme.h"

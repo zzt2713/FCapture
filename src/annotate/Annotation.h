@@ -52,7 +52,20 @@ public:
     // 拖拽结束：子类清掉基准，下次拖拽重新快照
     virtual void endHandleDrag() {}
 
-    virtual void translate(const QPointF &delta) = 0;
+    // 平移。对外统一走 translate()：基类在这里顺带把旋转支点一起移动，
+    // 子类只负责几何（translateContent）。这样任何调用点都不会漏掉支点同步。
+    void translate(const QPointF &delta)
+    {
+        if (delta.isNull())
+            return;
+        translateContent(delta);
+        syncRotationAnchorAfterTranslate(delta);
+    }
+
+protected:
+    virtual void translateContent(const QPointF &delta) = 0;
+public:
+
     // 以 center 为基准整体缩放几何数据（Shift+滚轮 / 套索缩放）
     virtual void scaleAbout(const QPointF &center, qreal factor) = 0;
 
@@ -63,15 +76,18 @@ public:
 
     virtual bool isRotatable() const { return true; }
     qreal rotation() const { return m_rotation; }
-    // 旋转锚点永远等于形状**当前未旋转包围盒的中心**。
+    // 旋转锚点：首次旋转时把当时的中心**钉住**，之后一直用它。
     //
-    // 早先试过"首次旋转时锁定中心"，结果是：先旋转、再缩放（中心变了）、
-    // 再旋转时支点还停在旧位置，图形会绕着一个不存在的点转，看起来就是
-    // "锚点不是中心了"。正确做法是每次都用当前中心，只要几何变化时
-    // 包围盒跟着更新，旋转就是绕中心进行的。
+    // 为什么不能每次取 rawBoundingRect().center()：
+    //   旋转后再拖锚点缩放，raw 矩形会变，center 跟着移动 →
+    //   支点跑了，图形在屏幕上乱飞。
+    // 钉住之后：缩放只改 raw 几何，支点不动，图形始终绕同一个点转。
+    // 平移时支点要跟着一起走（否则旋转会绕着旧位置转）。
     void setRotation(qreal degrees);
     QPointF rotationAnchor() const;
     QTransform rotationTransform() const;
+    // 子类几何变化后由基类调用：把支点平移到新的几何位置（保持相对关系）
+    void syncRotationAnchorAfterTranslate(const QPointF &delta);
 
     // 已旋转的控制点；可旋转的形状在末尾追加一个旋转手柄
     QVector<QPointF> handlePositions() const;
@@ -114,5 +130,8 @@ protected:
     bool   m_selected = false;
     bool   m_editing = false;
     qreal  m_rotation = 0.0;
+    // 旋转支点：首次旋转时锁定，之后缩放不再改变它
+    QPointF m_rotationPivot;
+    bool   m_rotationPivotValid = false;
 
 };
