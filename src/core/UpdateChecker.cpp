@@ -60,7 +60,7 @@ QString UpdateChecker::assetNamePattern()
 UpdateChecker::UpdateChecker(QObject *parent)
     : QObject(parent)
     , m_nam(new QNetworkAccessManager(this))
-    , m_apiUrl(QStringLiteral("https://api.github.com/repos/zzt2713/F_Capture/releases"))
+    , m_apiUrl(QStringLiteral("https://api.github.com/repos/zzt2713/FCapture/releases"))
 {
 }
 
