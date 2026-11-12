@@ -14,7 +14,7 @@
 
 #define AppName        "F-Capture"
 #define AppShortName   "FCapture"
-#define AppVersion     "1.5.1"
+#define AppVersion     "1.5.2"
 #define AppPublisher   "Fool"
 #define AppCopyright   "Copyright (C) 2026 Fool"
 #define AppExeName     "FCapture.exe"
