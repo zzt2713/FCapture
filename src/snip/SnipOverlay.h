@@ -123,14 +123,19 @@ private:
     QElapsedTimer m_centerNoticeTimer;
     void drawWindowHighlight(QPainter &p);
     // 悬停高亮的过渡动画（借鉴 Snow Shot 的 SmartSelectionTransition）：
-    // 矩形从旧位置缓动到新位置，101ms 二次缓出，鼠标在元素间移动不再"啪"地跳
+    // 矩形从旧位置缓动到新位置，鼠标在元素间移动不再"啪"地跳。
+    // 时长/是否启用由 snip/selection_transition_animation 决定（0/32/72）。
     void tickHoverAnim();
+    // 当前过渡动画时长（ms）；0 = 关闭动画，直接跳到位
+    int hoverAnimDurationMs() const;
     QRect hoverAnimRect() const;
     // 只重绘"鼠标移动时会变"的部分（高亮框/参考线/光标），
     // 不整屏重绘 —— 快速滑动卡顿的根治手段
     void hoverRepaint();
     // 带缓存的窗口矩形查询：同一窗口内连续移动不再反复 EnumWindows
     QRect windowRectAtCached(const QPoint &globalPos);
+    // 带缓存的光标下顶层窗口句柄查询（同上）
+    quintptr topWindowHwndAtCached(const QPoint &globalPos);
     void drawLassoPreview(QPainter &p);
     QRect sizeLabelRect() const;
     void  drawShadowPreview(QPainter &p);
@@ -359,6 +364,11 @@ private:
     QRect  m_winRectCache;           // 窗口矩形缓存（避免每次 EnumWindows）
     QPoint m_winRectCachePos;        // 缓存对应的光标位置（必须按坐标命中）
     QElapsedTimer m_winRectCacheTimer;
+    // 光标下的顶层窗口句柄缓存。WindowFromPoint + EnumWindows 是跨进程查询，
+    // 每帧都做会把元素切换拖到十几毫秒。按坐标命中缓存，指针不动就零开销。
+    quintptr m_topWinCacheHwnd = 0;
+    QPoint   m_topWinCachePos;
+    QElapsedTimer m_topWinCacheTimer;
     // 按下左键那一刻的高亮目标（用于松手时落选区）。
     // 按下会 clearDetection() 停掉识别，这里必须先把它存下来，
     // 否则松手时只能退回到"光标下最顶层窗口"，表现为点了元素却截出整屏。

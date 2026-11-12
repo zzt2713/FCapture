@@ -260,7 +260,7 @@ SnipOverlay::SnipOverlay(QWidget *parent)
                         });
                     }
                     m_refineAt = m_elementRequestPos;
-                    m_refineHwnd = WindowDetector::windowFromPoint(m_refineAt).hwnd;
+                    m_refineHwnd = topWindowHwndAtCached(m_refineAt);
                     m_refineGate->start();
                 }
             });
@@ -454,6 +454,8 @@ void SnipOverlay::startSession(const ScreenCapturer::Snapshot &snapshot)
     m_snapshotElements.clear();
     m_lastChain.clear();
     m_lastChainPos = QPoint();
+    m_topWinCacheHwnd = 0;
+    m_topWinCacheTimer.invalidate();
     m_refining = false;
     if (m_refineGate)
         m_refineGate->stop();
@@ -1764,8 +1766,8 @@ QVector<ElementInfo> SnipOverlay::hitTestSnapshot(const QPoint &globalPos)
     // 以前用"元素中心落在最上层窗口矩形内"的几何判定，被遮挡窗口的元素
     // 混进来抢高亮（"上边的窗口无法正确识别"）；光标在桌面（没有最上层
     // 窗口）时更是完全不过滤，最小化窗口的元素全冒出来。
-    const WindowInfo topWin = WindowDetector::windowFromPoint(globalPos);
-    if (topWin.hwnd == 0) {
+    const quintptr topHwnd = topWindowHwndAtCached(globalPos);
+    if (topHwnd == 0) {
         if (samePos)
             return m_lastChain;
         m_lastChainPos = globalPos;
@@ -1781,7 +1783,7 @@ QVector<ElementInfo> SnipOverlay::hitTestSnapshot(const QPoint &globalPos)
     //   3. 最终取包含光标且面积最小的那条链（= 光标所在位置最具体的元素）
     QVector<ElementInfo> hits;
     for (const ElementInfo &e : m_snapshotElements) {
-        if (e.nativeHandle != topWin.hwnd || !e.logicalRect.contains(globalPos))
+        if (e.nativeHandle != topHwnd || !e.logicalRect.contains(globalPos))
             continue;
         hits.append(e);
     }
@@ -1920,9 +1922,9 @@ void SnipOverlay::requestElementDetection()
     // 必须把遮罩下面那个真实窗口的 HWND 传进去：
     // UIA 的 ElementFromPoint 会命中我们自己的全屏遮罩，不传窗口句柄
     // 就永远只能识别"整屏"，表现为元素检测完全失灵。
-    const WindowInfo target = WindowDetector::windowFromPoint(cursor);
+    const quintptr targetHwnd = topWindowHwndAtCached(cursor);
     m_elementRequestId =
-        ElementDetector::instance()->request(cursor, m_elementProcess, target.hwnd);
+        ElementDetector::instance()->request(cursor, m_elementProcess, targetHwnd);
     if (m_elementRequestId == 0) {
         m_elementPending = false;
         m_detectMode = DetectMode::Window;
@@ -2582,14 +2584,42 @@ void SnipOverlay::drawLassoPreview(QPainter &p)
 //   - 101ms 二次缓出（progress * (2 - progress)）—— 快、不拖泥带水
 //   - 目标和当前几乎重合（0.4px 容差）时直接跳，避免微小抖动触发整段动画
 //   - 中途目标变了就从"当前显示位置"重新起步，动线连续不跳帧
+// 对齐 snow 的 SelectionTransitionAnimation：
+//   Disabled(0) → 瞬间切换；Soft(32) → 101ms；Fast(72) → 67ms
+int SnipOverlay::hoverAnimDurationMs() const
+{
+    const int mode = ConfigManager::instance()
+                         ->value(QStringLiteral("snip/selection_transition_animation"), 32)
+                         .toInt();
+    switch (mode) {
+    case 0:  return 0;     // 关闭
+    case 72: return 67;    // 快速
+    default: return 101;   // 柔和
+    }
+}
+
 void SnipOverlay::tickHoverAnim()
 {
     const QRect target = m_hoverWindow;
+    const int durationMs = hoverAnimDurationMs();
 
     // 无高亮：直接清空（不做淡出，保持简单）
     if (target.isEmpty()) {
         if (!m_hoverAnimRect.isEmpty()) {
             m_hoverAnimRect = QRectF();
+            hoverRepaint();
+        }
+        return;
+    }
+
+    // 关闭动画：瞬间切到目标，不做任何插值
+    if (durationMs <= 0) {
+        if (m_hoverAnimTimer)
+            m_hoverAnimTimer->stop();
+        m_animFrom = QRectF();
+        m_hoverAnimClock.invalidate();
+        if (m_hoverAnimRect != QRectF(target)) {
+            m_hoverAnimRect = QRectF(target);
             hoverRepaint();
         }
         return;
@@ -2635,8 +2665,7 @@ void SnipOverlay::tickHoverAnim()
         m_hoverAnimTimer->start();
 
     // 二次缓出：progress * (2 - progress)，起快收慢
-    constexpr int kDurationMs = 101;
-    const qreal progress = qMin<qreal>(1.0, qreal(m_hoverAnimClock.elapsed()) / kDurationMs);
+    const qreal progress = qMin<qreal>(1.0, qreal(m_hoverAnimClock.elapsed()) / durationMs);
     const qreal eased = progress * (2.0 - progress);
 
     if (!m_animFrom.isValid()) {
@@ -2687,6 +2716,21 @@ void SnipOverlay::hoverRepaint()
 // 窗口矩形查询带缓存：鼠标在同一个窗口内连续移动时，
 // 直接复用上次结果，不再每帧查 WindowDetector（内部 200ms 一次
 // EnumWindows + 逐窗口取标题，每次几毫秒，会造成周期性顿挫）。
+quintptr SnipOverlay::topWindowHwndAtCached(const QPoint &globalPos)
+{
+    // 同一像素在短时间内重复查询（鼠标未移动、或一帧内多处调用）直接命中。
+    // 200ms 与窗口矩形缓存的失效周期保持一致，两者不会互相矛盾。
+    if (m_topWinCacheTimer.isValid() && m_topWinCacheTimer.elapsed() < 200
+        && m_topWinCachePos == globalPos) {
+        return m_topWinCacheHwnd;
+    }
+
+    m_topWinCacheHwnd = WindowDetector::windowFromPoint(globalPos).hwnd;
+    m_topWinCachePos = globalPos;
+    m_topWinCacheTimer.restart();
+    return m_topWinCacheHwnd;
+}
+
 QRect SnipOverlay::windowRectAtCached(const QPoint &globalPos)
 {
     // 缓存 key 必须包含**具体坐标**：以前只用"点是否落在上次的矩形内"判断，

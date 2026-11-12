@@ -297,6 +297,13 @@ void PinWindow::setClickThrough(bool on)
 
 void PinWindow::applyTopmost()
 {
+    // 注意：setWindowFlag 会销毁并重建原生窗口，构造期连续调用两次
+    // （setWindowFlags 一次 + 这里一次）会让窗口闪一下。
+    // 这里先比较，状态一致就不动。
+    const bool currently = windowFlags().testFlag(Qt::WindowStaysOnTopHint);
+    if (currently == m_topmost)
+        return;
+
     setWindowFlag(Qt::WindowStaysOnTopHint, m_topmost);
 }
 

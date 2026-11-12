@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FCapture VERSION 1.4.0 LANGUAGES CXX)
+project(FCapture VERSION 1.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -81,6 +81,7 @@ set(APP_SOURCES
 
     src/platform/win/AppLauncher.cpp
     src/platform/win/ElementDetector.cpp
+    src/platform/win/FullscreenDetector.cpp
     src/platform/win/HotkeyHook.cpp
     src/platform/win/WinOcr.cpp
     src/platform/win/VirtualDesktop.cpp
@@ -103,6 +104,10 @@ set(APP_SOURCES
     src/ui/ElaThemeBridge.cpp
     src/ui/GroupManagerDialog.cpp
     src/ui/HotkeyRecorder.cpp
+    src/ui/ShortcutKeyButton.cpp
+    src/ui/ShortcutRow.cpp
+    src/ui/ShortcutConfigWidget.cpp
+    src/ui/ShortcutConfigDialog.cpp
     src/ui/IconFactory.cpp
     src/ui/NavList.cpp
     src/ui/OcrResultDialog.cpp
@@ -162,6 +167,7 @@ set(HEADERS
 
     src/platform/win/AppLauncher.h
     src/platform/win/ElementDetector.h
+    src/platform/win/FullscreenDetector.h
     src/platform/win/HotkeyHook.h
     src/platform/win/WinOcr.h
     src/platform/win/VirtualDesktop.h
@@ -184,6 +190,10 @@ set(HEADERS
     src/ui/ElaThemeBridge.h
     src/ui/GroupManagerDialog.h
     src/ui/HotkeyRecorder.h
+    src/ui/ShortcutKeyButton.h
+    src/ui/ShortcutRow.h
+    src/ui/ShortcutConfigWidget.h
+    src/ui/ShortcutConfigDialog.h
     src/ui/IconFactory.h
     src/ui/NavList.h
     src/ui/OcrResultDialog.h

@@ -38,19 +38,62 @@ QString ConfigManager::hotkey(const QString &action) const
     const QString stored = m_settings.value(key, kDefaults.value(action)).toString().trimmed();
     // 空值一律视为未配置：旧版本曾把默认热键写成空串，导致全部热键失效。
     // 这里直接回落默认值，用户不用手动改配置文件。
-    return stored.isEmpty() ? kDefaults.value(action) : stored;
+    const QString resolved = stored.isEmpty() ? kDefaults.value(action) : stored;
+
+    // 多键存储格式是逗号分隔；这个接口只返回**主键**（第一个），
+    // 调用方（注册器/托盘提示/冲突校验）都按单键语义使用。
+    const int comma = resolved.indexOf(QLatin1Char(','));
+    return comma < 0 ? resolved : resolved.left(comma).trimmed();
 }
 
 void ConfigManager::setHotkey(const QString &action, const QString &key)
 {
+    setHotkeys(action, key.isEmpty() ? QStringList() : QStringList{ key });
+}
+
+QStringList ConfigManager::hotkeys(const QString &action) const
+{
+    // hotkey() 返回的是主键（截断到第一个逗号），这里要完整列表，
+    // 所以直接读原始存储值并做同样的默认值回落。
+    static const QHash<QString, QString> kDefaults = {
+        {QStringLiteral("capture"), QStringLiteral("F1")},
+        {QStringLiteral("capture-active-window"), QStringLiteral("Ctrl+Shift+A")},
+        {QStringLiteral("paste"), QStringLiteral("F3")},
+        {QStringLiteral("toggle-images"), QStringLiteral("Shift+F3")},
+        {QStringLiteral("long-screenshot"), QStringLiteral("F2")},
+    };
+    const QString key = QStringLiteral("hotkey/") + action;
+    const QString stored = m_settings.value(key, kDefaults.value(action)).toString().trimmed();
+    const QString resolved = stored.isEmpty() ? kDefaults.value(action) : stored;
+
+    QStringList out;
+    for (const QString &part : resolved.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+        const QString trimmed = part.trimmed();
+        if (!trimmed.isEmpty() && !out.contains(trimmed, Qt::CaseInsensitive))
+            out.append(trimmed);
+    }
+    return out;
+}
+
+void ConfigManager::setHotkeys(const QString &action, const QStringList &keys)
+{
     const QString fullKey = QStringLiteral("hotkey/") + action;
-    m_settings.setValue(fullKey, key);
+    QStringList cleaned;
+    for (const QString &k : keys) {
+        const QString trimmed = k.trimmed();
+        if (!trimmed.isEmpty() && !cleaned.contains(trimmed, Qt::CaseInsensitive))
+            cleaned.append(trimmed);
+    }
+    m_settings.setValue(fullKey, cleaned.join(QLatin1Char(',')));
     emit configChanged(fullKey);
 }
 
 QVariant ConfigManager::value(const QString &key, const QVariant &fallback) const
 {
     static const QHash<QString, QVariant> kDefaults = {
+        // 全屏应用（游戏/视频/全屏演示）前台时屏蔽全局快捷键，
+        // 避免和游戏按键抢输入。判定逻辑对齐 Snow Shot。
+        {QStringLiteral("general/block_hotkeys_in_fullscreen"), true},
         {QStringLiteral("general/auto_save_enabled"), false},
         {QStringLiteral("general/auto_save_folder"), QString()},
         {QStringLiteral("general/quick_save_folder"), QString()},
@@ -67,6 +110,9 @@ QVariant ConfigManager::value(const QString &key, const QVariant &fallback) cons
         {QStringLiteral("snip/show_auxiliary_lines"), true},
         {QStringLiteral("snip/capture_cursor"), false},
         {QStringLiteral("snip/auto_detect_window"), true},
+        // 元素/窗口高亮框的过渡动画（对齐 snow 的 SelectionTransitionAnimation）：
+        //   0 = 关闭（瞬间切换）   32 = 柔和（101ms）   72 = 快速（67ms）
+        {QStringLiteral("snip/selection_transition_animation"), 32},
         {QStringLiteral("snip/shadow_enabled"), false},
         {QStringLiteral("snip/corner_radius"), 0},
         {QStringLiteral("snip/aspect_preset"), QStringLiteral("free")},

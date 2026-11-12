@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QSettings>
 #include <QString>
+#include <QStringList>
 #include <QVariant>
 
 class ConfigManager : public QObject
@@ -14,6 +15,12 @@ public:
 
     QString hotkey(const QString &action) const;
     void setHotkey(const QString &action, const QString &key);
+
+    // 一个动作可绑定多个快捷键（对齐 Snow Shot 的多键配置）。
+    // 存储格式：hotkey/<action> 写逗号分隔的列表；旧版的单键值
+    // 读出来就是单元素列表，无需迁移。
+    QStringList hotkeys(const QString &action) const;
+    void setHotkeys(const QString &action, const QStringList &keys);
 
     QVariant value(const QString &key, const QVariant &fallback = {}) const;
     void setValue(const QString &key, const QVariant &v);

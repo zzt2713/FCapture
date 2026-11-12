@@ -88,6 +88,12 @@ void AppController::initialize()
 
     m_hotkeys = new HotkeyManager(this);
     connect(m_hotkeys, &HotkeyManager::hotkeyPressed, this, [this](const QString &action) {
+        // 有模态窗口（比如快捷键配置弹窗、文件对话框）时不响应全局热键：
+        // 此时弹窗正在跑自己的嵌套事件循环，在里面起截图层会让它被压在
+        // 模态窗口下面，表现为"卡在截屏状态、点不动"。
+        if (QApplication::activeModalWidget() != nullptr)
+            return;
+
         if (action == QStringLiteral("capture"))
             startCapture();
         else if (action == QStringLiteral("capture-active-window"))
@@ -99,6 +105,19 @@ void AppController::initialize()
         else if (action == QStringLiteral("long-screenshot"))
             startLongScreenshot();
     });
+
+    // 全屏应用时屏蔽快捷键（首选项可关）
+    m_hotkeys->setBlockOnFullscreen(
+        ConfigManager::instance()
+            ->value(QStringLiteral("general/block_hotkeys_in_fullscreen"), true)
+            .toBool());
+    // 首选项里改开关后立即生效（不用重启）
+    connect(ConfigManager::instance(), &ConfigManager::configChanged, this,
+            [this](const QString &key) {
+                if (key == QStringLiteral("general/block_hotkeys_in_fullscreen"))
+                    m_hotkeys->setBlockOnFullscreen(
+                        ConfigManager::instance()->value(key, true).toBool());
+            });
 
     registerHotkeys();
 
@@ -142,9 +161,17 @@ void AppController::registerHotkeys()
     QStringList failed;
     m_hotkeyConflicts.clear();
     for (const QString &action : hotkeyActions()) {
-        const QString key = cfg->hotkey(action);
-        if (m_hotkeys->registerHotkey(action, key)
-            != HotkeyManager::RegistrationStatus::Success) {
+        // 一个动作可能有多个键（snow 的多键配置），逐个注册
+        const QStringList keys = cfg->hotkeys(action);
+        bool actionFailed = false;
+        for (const QString &key : keys) {
+            if (m_hotkeys->registerHotkey(action, key)
+                != HotkeyManager::RegistrationStatus::Success) {
+                actionFailed = true;
+            }
+        }
+        // 一个键都没配也算失效（用户把键全删了）
+        if (actionFailed || keys.isEmpty()) {
             failed << action;
             m_hotkeyConflicts.insert(action);
         }
@@ -178,10 +205,30 @@ void AppController::restoreHotkeys()
 
 void AppController::syncHotkeyState()
 {
+    // 冲突集合以 HotkeyManager 实际注册结果为准：它能精确到单个键，
+    // 而 m_hotkeyConflicts 只是 action 级摘要。
+    if (m_hotkeys)
+        m_hotkeyConflicts = m_hotkeys->conflictedActions();
+
     if (m_tray)
         m_tray->setHotkeyConflicts(m_hotkeyConflicts);
-    if (m_preferenceDialog)
+    if (m_preferenceDialog) {
         m_preferenceDialog->setHotkeyConflicts(m_hotkeyConflicts);
+        m_preferenceDialog->setHotkeyFailedKeys(currentFailedKeys());
+    }
+}
+
+// 逐个 action 收集 HotkeyManager 里注册失败的键。
+// 首选项新建时必须立刻推一次，否则初始渲染 m_failedKeys 是空的：
+// 表现为"刚打开首选项红框不显示，点开快捷键确认一下才变红"。
+QHash<QString, QStringList> AppController::currentFailedKeys() const
+{
+    QHash<QString, QStringList> failed;
+    if (!m_hotkeys)
+        return failed;
+    for (const QString &action : hotkeyActions())
+        failed.insert(action, m_hotkeys->failedKeys(action));
+    return failed;
 }
 
 void AppController::startCapture()
@@ -227,8 +274,9 @@ void AppController::captureCommon()
     if (m_overlay)
         m_overlay->hide();
 
-    // 让待处理的绘制/显示先完成，否则会把残留画面拍进去
-    QApplication::processEvents(QEventLoop::AllEvents, 50);
+    // 不要在这里 QApplication::processEvents()：本函数可能由快捷键
+    // （原生事件回调）间接触发，强制泵事件会重入事件循环导致卡死。
+    // 用 singleShot(0) 让当前栈先退干净，再等 70ms 让窗口真正隐藏完。
     QTimer::singleShot(70, this, [this]() {
         // 始终抓不含鼠标的底图，由 SnipOverlay 按 ` / ~ 实时决定是否合成鼠标。
         const ScreenCapturer::Snapshot snap = ScreenCapturer::captureAllScreens(false);
@@ -396,6 +444,11 @@ void AppController::showPreferences()
         // 常驻会占十几 MB 且永不回落。重新打开时重建，代价远小于常驻内存。
         dialog->setAttribute(Qt::WA_DeleteOnClose, true);
         dialog->setHotkeyConflicts(m_hotkeyConflicts);
+        // 必须在这里就把"哪些键注册失败"推给新建的对话框：
+        // 构造时 buildControlPage() 已经渲染过一遍快捷键行，此时
+        // m_failedKeys 还是空的，红框不显示。只有等用户点开弹窗、
+        // 触发 syncHotkeyState() 才补上——就是"打开不红、编辑一次才红"。
+        dialog->setHotkeyFailedKeys(currentFailedKeys());
 
         connect(dialog, &PreferenceDialog::hotkeyRecordingChanged, this,
                 [this](bool recording) {
@@ -429,6 +482,36 @@ void AppController::showPreferences()
                     m_hotkeyConflicts.remove(action);
                     syncHotkeyState();
                     dialog->showHotkeyResult(action, true);
+                });
+        // 多快捷键（snow 式弹窗）：逐个注册，部分失败不影响其余键生效
+        connect(dialog, &PreferenceDialog::hotkeysChangeRequested, this,
+                [this, dialog](const QString &action, const QStringList &hotkeys) {
+                    if (!m_hotkeys) {
+                        dialog->showHotkeyResult(action, false, QStringLiteral("快捷键被占用"));
+                        return;
+                    }
+
+                    // 先注销该动作原有的键，再按新列表注册
+                    m_hotkeys->unregisterAction(action);
+
+                    QStringList failed;
+                    for (const QString &key : hotkeys) {
+                        const auto st = m_hotkeys->registerHotkey(action, key);
+                        if (st != HotkeyManager::RegistrationStatus::Success)
+                            failed.append(key);
+                    }
+
+                    // 列表里已经有一个被别的程序占着的旧键时，不能因为
+                    // 它失败就把用户新加的键一起回滚——那样"添加"永远无效。
+                    // 能注册的照常生效，列表原样保存，失败项单独标红提示。
+                    ConfigManager::instance()->setHotkeys(action, hotkeys);
+                    syncHotkeyState();
+                    dialog->showHotkeyResult(
+                        action, failed.isEmpty(),
+                        failed.isEmpty()
+                            ? QString()
+                            : QStringLiteral("「%1」已被占用")
+                                  .arg(failed.join(QStringLiteral("、"))));
                 });
         connect(dialog, &QObject::destroyed, this, [this]() {
             restoreHotkeys();

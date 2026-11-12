@@ -1,10 +1,12 @@
-# SnipasteClone — 项目配置
+# F-Capture — 项目配置
 
-本文件供 Claude Code 每次会话自动加载。**动手前先读 `docs/00-全局约定.md`*
+本文件供 Claude Code 每次会话自动加载。**动手前先读 `docs/00-全局约定.md`**
 
 ## 项目是什么
 
 用 Qt 6 Widgets (C++20) 复刻 **Snipaste Pro 2.x** 的全部功能：截图、标注、贴图三大模块 + OCR、二维码、命令行、白板等辅助工具。
+
+> 项目原名 SnipasteClone，已改名 **F-Capture**。旧文档/旧脚本里出现的 `SnipasteClone` 路径都是过时的。
 
 ## 硬约束（不可协商）
 
@@ -17,7 +19,7 @@
 | OCR | `Windows.Media.Ocr`（本地，不联网，不接第三方 API） |
 | 平台 | 仅 Windows |
 | 构建 | CMake ≥ 3.21 + **Visual Studio 17 2022 生成器**（不用 Ninja） |
-| 控件外观库 | **ElaWidgetTools 2.0.2**（`D:/cppsoft/MsvcEla`），仅用于对话框/菜单/首选项 |
+| 控件外观库 | **ElaWidgetTools**（预编译 `D:/cppsoft/MsvcEla`，源码 `D:/study/code/ElaWidgetTools`） |
 | 界面风格 | 截图层复刻 Snipaste 极简暗色；应用界面用 Ela 暗色主题（见 `docs/00-全局约定.md` §6） |
 
 ## 编译、打包、交付由我完成（AI 负责）
@@ -32,45 +34,45 @@
 | 编译器 | VS 2022 自带 `cl.exe`（MSVC 19.44） | **不在 Qt 目录里**。`D:/Qt/.../bin` 只有 qmake/moc/windeployqt 等 Qt 工具 |
 | CMake | `D:/CMake/bin/cmake` | |
 | windeployqt | `D:/Qt/6.8.3/msvc2022_64/bin/windeployqt.exe` | |
+| **ElaWidgetTools 源码** | `D:/study/code/ElaWidgetTools` | **完整源码 + 官方示例**，见下节 |
 
-### 标准构建流程（**用 VS 生成器，不要用 Ninja**）
+### 标准构建流程
 
-本机 `NoDefaultCurrentDirectoryInExePath=1`，在 bash 里 `cmd //c "call vcvars64.bat && ..."` 会失败，**已实测**。改用 Visual Studio 生成器，CMake 自动定位 MSVC，无需 vcvars 环境：
+**一律跑 `./scripts/build.sh`**（含手册/zip/SHA256/安装包），不要手动拼命令。
+
+只做快速验证时（改完代码看效果）：
 
 ```bash
-# 1. 配置
-D:/CMake/bin/cmake -S . -B build -G "Visual Studio 17 2022" -A x64 \
-  -DCMAKE_PREFIX_PATH=D:/Qt/6.8.3/msvc2022_64
-
-# 2. 编译
 D:/CMake/bin/cmake --build build --config Release
-
-# 3. 复制 exe 到 dist（VS 生成器的产物在 build/Release/）
-mkdir -p dist/SnipasteClone
-cp -f build/Release/SnipasteClone.exe dist/SnipasteClone/
-
-# 4. 打包依赖
-D:/Qt/6.8.3/msvc2022_64/bin/windeployqt.exe --release --no-translations \
-  --no-system-d3d-compiler --no-opengl-sw dist/SnipasteClone/SnipasteClone.exe
+cp -f build/Release/FCapture.exe dist/F-Capture/
 ```
 
-**或者直接用脚本**（已写好）：
-```bash
-./scripts/build.sh          # 构建 + 打包
-./scripts/build.sh clean    # 全量重建
-./scripts/smoke-test.sh     # 冒烟测试
-```
+本机 `NoDefaultCurrentDirectoryInExePath=1`，在 bash 里 `cmd //c "call vcvars64.bat && ..."` 会失败，**已实测**。用 Visual Studio 生成器，CMake 自动定位 MSVC，无需 vcvars 环境。
 
 ### 打包产物
 
-- 输出目录：`dist/SnipasteClone/`
-- 必须存在：`SnipasteClone.exe`、`Qt6Core.dll`、`Qt6Gui.dll`、`Qt6Widgets.dll`、`platforms/qwindows.dll`
-- 报告时给出 **`D:\study\QT\Snipaste\dist\SnipasteClone\SnipasteClone.exe` 完整路径**，用户双击即可运行
+- 输出目录：`dist/F-Capture/`
+- 主程序：`dist/F-Capture/FCapture.exe`
+- 日志：`%LOCALAPPDATA%/F-Capture/log/`
+- 报告时给出 **`D:\study\QT\Snipaste\dist\F-Capture\FCapture.exe` 完整路径**
 
 ### 编译失败时
 
 - 自己读错误、自己修、自己重试，不要一报错就丢给用户
 - 连续 3 次修不好才向用户报告，并附完整错误日志
+
+## 交付方式
+
+用户**自己测试**软件，AI 只负责编译 + 打包 + 启动。
+
+编译完成后用后台方式启动，让用户直接看效果：
+
+```bash
+taskkill //F //IM FCapture.exe 2>/dev/null
+start "" "D:\study\QT\Snipaste\dist\F-Capture\FCapture.exe"
+```
+
+报告里写一句「程序已启动，可以直接截图验证」。**不要跑冒烟测试、不要读日志找 ERROR** —— 用户会自己反馈。
 
 ## 文档地图
 
@@ -80,14 +82,40 @@ D:/Qt/6.8.3/msvc2022_64/bin/windeployqt.exe --release --no-translations \
 
 ## 界面控件库：ElaWidgetTools
 
-- 位置：`D:/cppsoft/MsvcEla`（2.0.2 预编译，ABI 已核对兼容 Qt 6.8.3）
+- 预编译库：`D:/cppsoft/MsvcEla`（2.0.0，ABI 已核对兼容 Qt 6.8.3）
+- **完整源码 + 官方示例**：`D:/study/code/ElaWidgetTools`
+  - 组件实现：`ElaWidgetTools/ElaWidgetTools/*.cpp`
+  - 官方用法示例：`ElaWidgetTools/ElaWidgetToolsExample/ExamplePage/*.cpp`
 - **只允许 `src/ui/` 和 `main.cpp` 引入 Ela 头文件**，业务层不得依赖
 - 截图层（`SnipOverlay` / `PaintBar` / `PinWindow` / `Whiteboard` / `TextInputBox` / `SizeInputBox`）**保持自绘，不换 Ela**
-- **设置窗口不用 `ElaWindow`**（带导航栏的主窗口壳），用 `ElaDialog + ElaTabWidget`
+- **设置窗口不用 `ElaWindow`**（带导航栏的主窗口壳）
 
-## 阶段进度
+### ⚠️ Ela 组件使用规则（血泪教训，用前必读源码）
 
-不再单独维护阶段进度文档。功能范围和验收依据统一以 `docs/功能清单.md` 为准。
+**不要靠猜 API 和尺寸，直接读 `D:/study/code/ElaWidgetTools` 源码。** 下面每一条都是实际踩过的坑：
+
+| 组件 | 坑 | 正确做法 |
+|---|---|---|
+| `ElaScrollPageArea` | 构造函数里写死 `setFixedHeight(75)`，是**单行卡片** | 只放一行（一个开关/按钮 + 文字）；多行分组用 `ElaGroupBox` |
+| `ElaScrollPage` | `addCentralWidget()` 会把内容包进中间容器，`addWidget` **没给 stretch** | 内容布局末尾**必须** `addStretch()`，否则高度塌到最小（"压扁"） |
+| `ElaScrollPage` | 内部是 `QStackedWidget` + 标题区 + 面包屑，是整页导航壳 | 单页设置用 `ElaScrollArea` 更合适；用 `ElaScrollPage` 时 `setTitleVisible(false)` |
+| `ElaGroupBox` | 标题画在**边框线上**（`frameRect.top() + titleHeight/2`），且样式没重写 `subControlRect` | 布局顶部边距必须留 `fontMetrics().height() + 4`，否则首行内容压在标题上 |
+| `ElaPushButton` | 默认色/文字色分亮暗两套 | 改色要同时设 `setLight*Color` 和 `setDark*Color` |
+| 任何控件 | `new Xxx(parent)` 只建立父子关系，**不进布局就停在 (0,0)** | 必须 `addWidget()` 到某个布局，否则会压在标题/左上角上 |
+
+### 首选项当前架构
+
+```
+PreferenceDialog : ElaDialog
+├── NavList（自绘左侧导航）
+└── ThemedStack : QStackedWidget
+    └── 每页 = ElaScrollArea（Ela 滚动条 + 拖拽手势）
+        └── ThemedPage（透明，QVBoxLayout）
+            └── ElaGroupBox × N（多行分组）
+                └── 行控件（ElaToggleSwitch / ElaComboBox / ElaPushButton …）
+```
+
+快捷键设置走 snow 式弹窗：行内 `ElaPushButton` 显示当前键 → 点击弹 `ElaContentDialog` → 弹窗内 `HotkeyConfigWidget` 支持多键增删 → 确定才生效。冲突时按钮文字变成 `F1 · 被占用` 并变红。
 
 ## 编码规范速查
 
@@ -106,27 +134,21 @@ D:/Qt/6.8.3/msvc2022_64/bin/windeployqt.exe --release --no-translations \
 - `SnipOverlay` 的状态机、`Annotation` 基类接口、`PinManager` 的生命周期是后续阶段的依赖基础，**改这些接口要同步检查相关实现和测试**
 - 每个阶段有验收清单，交付时必须逐条对照回答，不允许跳过
 
-## 交付标准（AI 自测通过才算完成）
+## 排查问题的纪律
 
-每个阶段/每次改动交付前，AI 自己走完这条链：
+**不要靠猜。** 这次会话在设置界面上反复猜了 5 轮，全部猜错，真正的原因是 `ElaScrollPageArea` 写死 75px 高。
 
-1. ✅ **编译通过**（零错误；警告自己先看一遍，能修就修）
-2. ✅ **打包完成** → `dist/SnipasteClone/SnipasteClone.exe`
-3. ✅ **启动冒烟测试**：`dist/SnipasteClone/SnipasteClone.exe` 能起来，进程存活 3 秒不崩（用 `tasklist` / 退出码验证）
-4. ✅ **日志无 ERROR**：启动后读 `%LOCALAPPDATA%/SnipasteClone/log/` 最新日志，确认无异常
-5. ✅ 对照验收清单逐条自查（能自动化的跑一下，不能自动化的标注"需人工确认"）
-6. ✅ **保持程序运行，交给用户截图验证**
-   - 冒烟测试通过后**不要关闭进程**
-   - 用 `start "" "D:\study\QT\Snipaste\dist\SnipasteClone\SnipasteClone.exe"` 以后台方式启动（不阻塞 shell）
-   - 报告里写一句「程序已启动，可以直接截图验证」
-   - **用户的工作方式：看到程序在跑，自己按 F1 截图测试并截图反馈**
+正确的顺序：
 
-**不允许**把编译不过、启动崩溃、或明显未完成的东西交给用户。
+1. **先读源码**（Ela 组件在 `D:/study/code/ElaWidgetTools`）
+2. **再读官方示例**（`ElaWidgetToolsExample/ExamplePage/`）
+3. 还不确定就**加日志量实际几何**（`size()` / `geometry()` / `sizeHint()` / `sizePolicy()`），拿数据说话
+4. 最后才改代码
 
 ## 红线（用户全局规则同样适用）
 
 - 不自动 `git commit` / `git push`
-- 不删除文件/目录
+- 不删除文件/目录（含 `rm -rf`，恢复备份也要先问）
 - 不修改 `.env`、密钥、CI 配置
 - 临时文件用完自己删
 

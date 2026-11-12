@@ -8,15 +8,16 @@
 #include <QPointer>
 #include <QSet>
 #include <QString>
+#include <QStringList>
 
 class ElaComboBox;
 class ElaLineEdit;
 class ElaSpinBox;
 class ElaText;
 class ElaToggleSwitch;
-class HotkeyRecorder;
 class NavList;
 class ElaPushButton;
+class ShortcutRow;
 
 class QHideEvent;
 class QShowEvent;
@@ -37,12 +38,16 @@ public:
     ~PreferenceDialog() override;
 
     void setHotkeyConflicts(const QSet<QString> &actions);
+    // 按单个键标记冲突：action -> 注册失败的键（被其他程序占用/无法解析）
+    void setHotkeyFailedKeys(const QHash<QString, QStringList> &failedKeys);
     void showHotkeyResult(const QString &action, bool success,
                           const QString &message = QString());
 
 signals:
     void hotkeyRecordingChanged(bool recording);
     void hotkeyChangeRequested(const QString &action, const QString &hotkey);
+    // 多快捷键：一次给完整列表（snow 的按键配置弹窗支持多个备用键）
+    void hotkeysChangeRequested(const QString &action, const QStringList &hotkeys);
     // 托盘菜单里的「重启应用」已移到「关于」页，由 AppController 执行
     void restartRequested();
 
@@ -90,10 +95,12 @@ private:
     // 把一个 int 配置项绑到 spinBox 上
     void bindInt(ElaSpinBox *box, const QString &key);
 
+    // 按冲突状态刷新快捷键按钮（文字 + 红色高亮）
+    void applyHotkeyButtonState(const QString &action);
+
     NavList *m_nav = nullptr;
     QStackedWidget *m_stack = nullptr;
-    QPointer<HotkeyRecorder> m_recordingRecorder;
-    QHash<QString, HotkeyRecorder *> m_hotkeyRecorders;
-    QHash<QString, ElaText *> m_hotkeyHints;
+    QHash<QString, ShortcutRow *> m_hotkeyRows;
     QSet<QString> m_conflictedActions;
+    QHash<QString, QStringList> m_failedKeys;
 };

@@ -292,6 +292,13 @@ struct TreeNode
     // Failed = 该节点展开失败，不再重试
     enum class State { Unloaded, Loaded, Failed } state = State::Unloaded;
     QVector<TreeChild> children;
+    // 子节点很多时（弹幕、列表、表格，几百个兄弟）线性扫描会明显拖慢，
+    // 这里按 top 坐标做行分桶：命中时只扫目标点所在的那两三个桶。
+    // 空桶不占内存；桶大小按整体纵向范围均分。
+    QVector<QVector<int>> rowBuckets;   // 每桶存 children 下标
+    int bucketTop = 0;                  // 分桶覆盖的纵向起点
+    int bucketHeight = 0;               // 每桶高度（像素）
+    int bucketCount = 0;                // 桶数量（0 = 未建立，退化线性扫描）
     ComPtr<IUIAutomationElement> element;   // Unloaded 时用于 BuildUpdatedCache
     bool timeoutRetried = false;
 };
@@ -359,6 +366,47 @@ public:
         return path;
     }
 
+    // 纯本地命中：只走已展开的节点，**绝不**触发 BuildUpdatedCache。
+    // 鼠标连续移动时用它（树已经建立的窗口内零跨进程调用）。
+    // 返回 false 表示下钻路径上遇到未展开节点，需要调用方走完整 hitTest。
+    bool hitTestCachedOnly(const POINT &pt, QVector<RECT> *out) const
+    {
+        if (!out || m_nodes.isEmpty() || !containsPoint(m_nodes[0].bounds, pt))
+            return false;
+
+        int current = 0;
+        for (int depth = 0; depth < kTreeMaxSteps; ++depth) {
+            const TreeNode &n = m_nodes.at(current);
+            if (n.state == TreeNode::State::Unloaded || n.state == TreeNode::State::Failed)
+                return false;   // 路径上还有没展开的，需要完整查询
+
+            const int child = hitChild(current, pt);
+            if (child < 0)
+                break;
+            current = child;
+        }
+
+        QVector<RECT> path;
+        const RECT rootBounds = m_nodes.at(0).bounds;
+        int node = current;
+        while (node > 0 && path.size() < kTreeMaxRects - 1) {
+            const RECT &b = m_nodes[node].bounds;
+            const bool dup = std::any_of(path.cbegin(), path.cend(),
+                                         [&b](const RECT &r) {
+                                             return r.left == b.left && r.top == b.top
+                                                    && r.right == b.right && r.bottom == b.bottom;
+                                         });
+            if (!(b.left == rootBounds.left && b.top == rootBounds.top
+                  && b.right == rootBounds.right && b.bottom == rootBounds.bottom)
+                && !dup)
+                path.append(b);
+            node = m_nodes[node].parent;
+        }
+        path.append(rootBounds);
+        *out = path;
+        return true;
+    }
+
     // 清空缓存（窗口结构变化时由上层调用）
     void invalidate() { m_nodes.clear(); }
 
@@ -376,7 +424,29 @@ private:
     // 命中本节点的哪个子级：取"最后一个"包含光标的（后绘制=上层，snow 同款）
     int hitChild(int node, const POINT &pt) const
     {
-        const QVector<TreeChild> &kids = m_nodes.at(node).children;
+        const TreeNode &n = m_nodes.at(node);
+        const QVector<TreeChild> &kids = n.children;
+
+        // 有分桶索引：只看目标点覆盖到的那一两个桶。
+        // 弹幕/列表这类一层几百个兄弟的场景，线性扫描是主要延迟来源。
+        if (n.bucketCount > 0 && n.bucketHeight > 0) {
+            const int rel = pt.y - n.bucketTop;
+            const int b = rel / n.bucketHeight;
+            if (b >= 0 && b < n.bucketCount) {
+                // 取「最后一个包含该点」的兄弟（后绘制=上层），与线性扫描语义一致。
+                // 跨桶的兄弟（高度跨越多桶）会被登记进每个覆盖到的桶。
+                int best = -1;
+                for (int idx : n.rowBuckets.at(b)) {
+                    const TreeChild &c = kids.at(idx);
+                    if (containsPoint(c.bounds, pt) && idx > best)
+                        best = idx;
+                }
+                if (best >= 0)
+                    return kids.at(best).node;
+                // 桶内没命中 → 该点落在桶边界附近，退回线性扫描兜底
+            }
+        }
+
         for (int i = kids.size() - 1; i >= 0; --i) {
             if (containsPoint(kids.at(i).bounds, pt))
                 return kids.at(i).node;
@@ -511,6 +581,39 @@ private:
                 m_nodes.append(child);
                 entries.append({ clipped, index });
             }
+        }
+
+        // 兄弟很多时建立行分桶索引（对齐 snow 的"子节点 > 16 用 R-tree"思路，
+        // 这里用更轻的行分桶）。不建索引时 hitChild 要线性扫全部兄弟，
+        // 弹幕/长列表一层几百个元素时，鼠标每次移动都会卡在这一步。
+        constexpr int kBucketThreshold = 24;
+        if (entries.size() > kBucketThreshold) {
+            int top = INT_MAX;
+            int bottom = INT_MIN;
+            for (const TreeChild &c : entries) {
+                top = qMin(top, int(c.bounds.top));
+                bottom = qMax(bottom, int(c.bounds.bottom));
+            }
+            const int span = qMax(1, bottom - top);
+            // 每桶约 64px，桶数上限 512（避免超大列表建太多空桶）
+            const int bucketH = qMax(16, span / 128);
+            const int bucketN = qMin(512, qMax(1, (span + bucketH - 1) / bucketH + 1));
+
+            QVector<QVector<int>> buckets(bucketN);
+            for (int i = 0; i < entries.size(); ++i) {
+                const RECT &r = entries.at(i).bounds;
+                int b0 = (int(r.top) - top) / bucketH;
+                int b1 = (int(r.bottom) - top) / bucketH;
+                b0 = qBound(0, b0, bucketN - 1);
+                b1 = qBound(0, b1, bucketN - 1);
+                for (int b = b0; b <= b1; ++b)
+                    buckets[b].append(i);
+            }
+
+            m_nodes[node].rowBuckets = std::move(buckets);
+            m_nodes[node].bucketTop = top;
+            m_nodes[node].bucketHeight = bucketH;
+            m_nodes[node].bucketCount = bucketN;
         }
 
         m_nodes[node].children = entries;
@@ -802,13 +905,6 @@ public slots:
         const qreal dpr = dprAtPhysical(probe);
         const POINT pt{ qRound(screenPos.x() * dpr), qRound(screenPos.y() * dpr) };
 
-        {
-            static int __d = 0;
-            if ((__d++ % 10) == 0)
-                qInfo().nospace() << "[detect] pos=" << screenPos << " hwnd=" << targetHwnd
-                                  << " useMsaa=" << useMsaa << " uia=" << bool(m_uia);
-        }
-
         // UIA 是主路径（snow 同款：它默认后台就是 UIA，MSAA 只作为可选降级）。
         // 以前这里"MSAA 结果不粗就直接返回"，导致 Chrome 这类
         // MSAA 桥只暴露窗口/标签栏的程序**永远进不了 UIA**，
@@ -820,10 +916,20 @@ public slots:
             return;
         }
 
-        // 先用 MSAA 的快速结果垫一帧（如果它比窗口更具体），保证跟手
-        const QVector<ElementInfo> msaaResult = detectWithMsaa(pt, targetHwnd);
-        if (!msaaResult.isEmpty() && !isCoarseHit(msaaResult, targetHwnd))
-            emit resultReady(requestId, msaaResult, true);
+        // 懒加载树已经热了（这个窗口展开过）：**跳过 MSAA**。
+        //
+        // 以前每次请求都同步跑一遍 MSAA（AccessibleObjectFromWindow +
+        // accHitTest，跨进程几十毫秒），而它的结果只用来"垫第一帧"。
+        // 树热之后纯本地命中是微秒级 —— 为了垫帧先花几十毫秒等 MSAA，
+        // 反而成了拖动时的主要延迟（弹幕/长列表场景尤其明显）。
+        QVector<ElementInfo> msaaResult;
+        const auto warmIt = m_trees.constFind(targetHwnd);
+        const bool treeWarm = (warmIt != m_trees.constEnd() && warmIt->hasLoaded());
+        if (!treeWarm) {
+            msaaResult = detectWithMsaa(pt, targetHwnd);
+            if (!msaaResult.isEmpty() && !isCoarseHit(msaaResult, targetHwnd))
+                emit resultReady(requestId, msaaResult, true);
+        }
 
         // 必须**同步**调用精化：detect() 本身就运行在 worker 线程里，
         // 再 invokeMethod(QueuedConnection) 只是把任务挪到本线程的事件队列尾部。
@@ -933,6 +1039,8 @@ private:
         }
 
         QVector<ElementInfo> hierarchy;
+        // 本轮懒加载树是否真的可用（决定后面要不要走昂贵的兜底路径）
+        bool treeUsable = false;
 
         if (targetHwnd && m_uia) {
             if (!m_cacheRequest) {
@@ -959,12 +1067,6 @@ private:
 
             ComPtr<IUIAutomation2> automation2;
             m_uia.As(&automation2);
-            {
-                static int __c = 0;
-                if ((__c++ % 10) == 0)
-                    qInfo().nospace() << "[refine-tree] cacheReq=" << bool(m_cacheRequest)
-                                      << " auto2=" << bool(automation2);
-            }
             if (m_cacheRequest && automation2) {
                 UiaLazyTree &tree = m_trees[targetHwnd];
                 if (!tree.isValid()) {
@@ -973,8 +1075,15 @@ private:
                         tree.setRoot(targetHwnd, wr);
                 }
                 if (tree.isValid()) {
-                    const QVector<RECT> path = tree.hitTest(
-                        automation2.Get(), m_cacheRequest.Get(), pt, 168, QRect(), dpr);
+                    treeUsable = true;
+                    // 先试纯本地命中：树已展开过就零跨进程调用。
+                    // 弹幕/长列表这类场景，鼠标连续滑动时每次移动都能即时出框；
+                    // 只有下钻路径上有未展开节点时才走完整查询（会触发 UIA）。
+                    QVector<RECT> path;
+                    if (!tree.hitTestCachedOnly(pt, &path)) {
+                        path = tree.hitTest(automation2.Get(), m_cacheRequest.Get(), pt,
+                                            168, QRect(), dpr);
+                    }
                     for (const RECT &r : path) {
                         ElementInfo info;
                         info.logicalRect = rectToLogical(r, dpr);
@@ -985,8 +1094,12 @@ private:
             }
         }
 
-        if (hierarchy.isEmpty()) {
-            // 兜底：懒加载树不可用（窗口没有 UIA 树等），退回旧的逐层下钻
+        // 兜底只在"懒加载树压根不可用"时跑。
+        // 以前只要本次路径为空就再走一整套 ElementFromHandle + 逐层下钻 +
+        // 上溯（每步都是跨进程调用），鼠标在空白/纯色区域移动时每次都白跑，
+        // 表现为识别明显变慢。树可用但本点没有更深元素，是正常结果，
+        // 不该再补一次昂贵查询。
+        if (hierarchy.isEmpty() && !treeUsable) {
             ComPtr<IUIAutomationElement> hit;
             if (targetHwnd) {
                 ComPtr<IUIAutomationElement> root;

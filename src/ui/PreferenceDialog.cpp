@@ -14,7 +14,9 @@
 #include "snip/SnipHistory.h"
 #include "tools/HotCorner.h"
 #include "ui/ElaThemeBridge.h"
-#include "ui/HotkeyRecorder.h"
+#include "ui/ShortcutConfigDialog.h"
+#include "ui/ShortcutKeyButton.h"
+#include "ui/ShortcutRow.h"
 #include "ui/NavList.h"
 
 #include "ElaComboBox.h"
@@ -23,6 +25,8 @@
 #include "ElaLineEdit.h"
 #include "ElaMessageBar.h"
 #include "ElaPushButton.h"
+#include "ElaScrollArea.h"
+#include "ElaScrollPage.h"
 #include "ElaSpinBox.h"
 #include "ElaText.h"
 #include "ElaTheme.h"
@@ -91,10 +95,25 @@ QString findHotkeyConflict(const QString &candidate, const QString &currentActio
     for (const QString &action : kActions) {
         if (action == currentAction)
             continue;
-        if (sameHotkey(candidate, ConfigManager::instance()->hotkey(action)))
-            return action;
+        // 每个动作可能有多个键，要逐个比，只比主键会漏掉备用键的冲突
+        for (const QString &key : ConfigManager::instance()->hotkeys(action)) {
+            if (sameHotkey(candidate, key))
+                return action;
+        }
     }
     return QString();
+}
+
+QString conflictLabel(const QString &action)
+{
+    static const QHash<QString, QString> kLabels = {
+        { QStringLiteral("capture"), QStringLiteral("截图") },
+        { QStringLiteral("capture-active-window"), QStringLiteral("抓活动窗口") },
+        { QStringLiteral("paste"), QStringLiteral("贴图") },
+        { QStringLiteral("toggle-images"), QStringLiteral("隐藏/显示所有贴图") },
+        { QStringLiteral("long-screenshot"), QStringLiteral("长截图") },
+    };
+    return kLabels.value(action, action);
 }
 
 QColor dialogBaseColor()
@@ -198,161 +217,50 @@ void themeInputs(QWidget *root)
     }
 }
 
-// 设置页容器：把内容宽度钉死为视口宽度，只在纵向滚动。
+// 设置页容器 —— 按 Ela 官方示例的用法（ElaWidgetToolsExample/T_BaseComponents.cpp）：
 //
-// 为什么要专门子类化：Ela 控件的 minimumSizeHint 偏大，
-// QScrollArea 即使开了 setWidgetResizable(true) 也只会把内容撑到
-// minimumSizeHint 那么宽，超出视口的部分被裁掉（开关、浏览按钮全被推出去）。
-class FittedScrollArea : public QScrollArea
+//   ElaScrollPage 页面类内部：
+//     content(QWidget) -> QVBoxLayout -> 若干 ElaGroupBox -> addStretch()
+//     addCentralWidget(content, true, true, 0)
+//
+// 关键点（之前全踩错了）：
+//   1. ElaScrollPage::addCentralWidget 会把内容包进一个中间容器，且
+//      addWidget 没给 stretch —— 内容必须自己带 addStretch() 撑开，
+//      否则高度塌到最小（就是"压缩扁了"）。
+//   2. ElaScrollPageArea 固定 75px 高（源码 setFixedHeight(75)），只适合
+//      单行卡片；多行分组用 ElaGroupBox。
+//   3. 一个 ElaScrollPage 只放一个 central widget；多页要用 navigation()。
+class SettingsScrollPage final : public ElaScrollPage
 {
 public:
-    explicit FittedScrollArea(QWidget *parent = nullptr) : QScrollArea(parent)
+    explicit SettingsScrollPage(QWidget *content, QWidget *parent = nullptr)
+        : ElaScrollPage(parent)
     {
-        setWidgetResizable(true);
-        setFrameShape(QFrame::NoFrame);
-        setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        setAutoFillBackground(true);
-        viewport()->setAutoFillBackground(true);
-
-        connect(ElaThemeBridge::instance(), &ElaThemeBridge::themeChanged,
-                this, &FittedScrollArea::applyTheme);
-        applyTheme();
-    }
-
-    void setOnShow(std::function<void()> onShow) { m_onShow = std::move(onShow); }
-
-protected:
-    void showEvent(QShowEvent *event) override
-    {
-        QScrollArea::showEvent(event);
-        // 页面重新可见时兜底重刷输入控件主题（下拉弹层等首次展开才定型）
-        if (m_onShow)
-            m_onShow();
-        // 首次显示时子控件布局还没结算完，滚动条会按过期的 sizeHint 误判
-        // （表现为"刚打开有滚动条，切一次页面就消失"）。
-        // 这里做两轮结算：先把宽度夹紧并同步激活布局，再让 QScrollArea
-        // 重算滚动条 —— 等价于"切走再切回"的修复效果，但自动完成。
-        // 两轮是因为 Ela 控件的尺寸要等 polish/字体结算后才稳定。
-        settle(0);
-        settle(60);
-    }
-
-    void resizeEvent(QResizeEvent *event) override
-    {
-        // 必须先夹紧宽度再让基类算滚动条：基类按夹紧前的 sizeHint 判断，
-        // 偏宽的内容会让虚高的文本换行变多、高度偏大，误显示竖向滚动条。
-        fitWidget();
-        QScrollArea::resizeEvent(event);
-    }
-
-private:
-    std::function<void()> m_onShow;
-
-    void fitWidget()
-    {
-        if (QWidget *w = widget()) {
-            // 始终预留滚动条的宽度：如果按"当前视口宽度"定内容宽，
-            // 滚动条一出现视口就变窄 → 内容重排变高 → 更需要滚动条，
-            // 形成"滚动条永远在"的自激循环。
-            constexpr int kScrollBarReserve = 12;
-            const int avail = qMax(120, viewport()->width() - kScrollBarReserve);
-            w->setMinimumWidth(0);
-            w->setMaximumWidth(avail);
-        }
-    }
-
-    void settle(int delayMs)
-    {
-        QTimer::singleShot(delayMs, this, [this]() {
-            fitWidget();
-            if (QWidget *w = widget()) {
-                w->updateGeometry();
-                if (w->layout())
-                    w->layout()->activate();
-            }
-            // 先按"不需要滚动条"的满宽重算，再交给基类判定，
-            // 避免上一次残留的滚动条宽度影响本轮换行与高度
-            updateScrollBarVisibility();
-            update();
-        });
-    }
-
-    // 按内容实际高度决定要不要滚动条（而不是靠基类的尺寸推断）
-    void updateScrollBarVisibility()
-    {
-        QWidget *w = widget();
-        if (!w)
-            return;
-
-        // 用实际布局高度而不是 sizeHint：sizeHint 对含 Ela 控件的页面会偏大，
-        // 切换页面瞬间还可能残留上一页的值，导致"有时候有滚动条"。
-        const int contentH = w->layout() ? w->layout()->sizeHint().height()
-                                         : w->height();
-        // 2px 容差：亚像素布局差异不该触发滚动条
-        const bool need = contentH > viewport()->height() + 2;
-        setVerticalScrollBarPolicy(need ? Qt::ScrollBarAsNeeded
-                                        : Qt::ScrollBarAlwaysOff);
-    }
-
-    void applyTheme()
-    {
-        // 视口自己上 Ela 对话框底色，不能靠透明透出（ElaDialog 不画内容区）。
-        applyWindowTheme(this);
-        applyWindowTheme(viewport());
-        if (QWidget *content = widget())
-            applyWindowTheme(content);
-
-        const ElaThemeType::ThemeMode mode = eTheme->getThemeMode();
-        const QColor handle =
-            eTheme->getThemeColor(mode, ElaThemeType::ScrollBarHandle);
-        setStyleSheet(QStringLiteral(
-                          "QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }"
-                          "QScrollBar::handle:vertical { background: %1; border-radius: 5px;"
-                          " min-height: 30px; }"
-                          "QScrollBar::handle:vertical:hover { background: %2; }"
-                          "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
-                          "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {"
-                          " background: transparent; }")
-                          .arg(handle.name(), handle.lighter(140).name()));
-        update();
+        setTitleVisible(false);
+        setPageTitleSpacing(0);
+        content->setWindowTitle(QStringLiteral("settingsPage"));
+        addCentralWidget(content, true, true, 0);
     }
 };
 
 QWidget *wrapScrollable(QWidget *content, std::function<void()> onShow = {})
 {
-    auto *scroll = new FittedScrollArea;
-    scroll->setWidget(content);
-    scroll->setOnShow(std::move(onShow));
-    return scroll;
+    Q_UNUSED(onShow);
+    return new SettingsScrollPage(content);
 }
 
+// 页面内容容器 —— 作为 ElaScrollPage 的 centralWidget。
+// 透明：底色由 ElaScrollPage 内部容器提供。
 class ThemedPage final : public QWidget
 {
 public:
     explicit ThemedPage(QWidget *parent = nullptr)
         : QWidget(parent)
     {
-        // ElaDialog 不画内容区，页面必须自己填充当前主题底色。
-        setAutoFillBackground(true);
+        setAttribute(Qt::WA_TranslucentBackground);
+        setAutoFillBackground(false);
         setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
         setMinimumWidth(0);
-        connect(ElaThemeBridge::instance(), &ElaThemeBridge::themeChanged,
-                this, &ThemedPage::applyTheme);
-        applyTheme();
-    }
-
-protected:
-    void paintEvent(QPaintEvent *) override
-    {
-        QPainter painter(this);
-        painter.fillRect(rect(), dialogBaseColor());
-    }
-
-private:
-    void applyTheme()
-    {
-        applyWindowTheme(this);
-        update();
     }
 };
 
@@ -387,8 +295,11 @@ QWidget *page()
 {
     auto *w = new ThemedPage;
     auto *layout = new QVBoxLayout(w);
-    layout->setContentsMargins(24, 20, 24, 20);
-    layout->setSpacing(14);
+    // snow PageContainerWidget：
+    //   setContentsMargins(paddingLG, paddingXXS, paddingLG, paddingLG)
+    //   左右 24 / 上 4 / 下 24
+    layout->setContentsMargins(24, 4, 24, 24);
+    layout->setSpacing(12);
     return w;
 }
 
@@ -562,12 +473,44 @@ T *narrowable(T *widget)
 }
 
 // 带分组框的容器，内部用 QVBoxLayout 追加行
+// 页内分组容器 —— 用 ElaGroupBox。
+//
+// 为什么不用 ElaScrollPageArea：它的构造函数里写死了
+//   setFixedHeight(75);
+// 是给"一行控件"设计的单行卡片（官方示例里每个 Area 里就一个开关）。
+// 拿它装多行内容会被压进 75px —— 就是"每个框里内容都压扁"。
+// 多行分组要用 ElaGroupBox（有标题、高度自适应）。
+// 分组容器 —— 不用 ElaGroupBox。
+//
+// ElaGroupBox 用 QProxyStyle 自己画边框和标题：标题画在边框线上
+// （frameRect.top() + titleHeight/2），但布局的 contentsMargins 和它
+// 完全独立，两者对不上就会出现"内容压标题"。
+// snow 也不用 QGroupBox —— 它用普通容器 + 独立标题。
+// 这里照做：一个普通 QWidget，内部 QVBoxLayout = 标题 + 内容。
 QWidget *groupBox(QWidget *parent, const QString &title, QVBoxLayout **outLayout)
 {
-    auto *box = new ElaGroupBox(title, parent);
-    auto *layout = new QVBoxLayout(box);
-    layout->setContentsMargins(16, 12, 16, 12);
-    layout->setSpacing(10);
+    auto *box = new QWidget(parent);
+    box->setAttribute(Qt::WA_StyledBackground, false);
+    // 必须显式扩展：普通 QWidget 默认 Preferred，在父布局里会被压到最小宽度
+    box->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+
+    auto *outer = new QVBoxLayout(box);
+    outer->setContentsMargins(0, 0, 0, 16);
+    outer->setSpacing(8);
+
+    if (!title.isEmpty()) {
+        auto *heading = new ElaText(title, box);
+        heading->setTextPixelSize(15);
+        outer->addWidget(heading);
+    }
+
+    auto *content = new QWidget(box);
+    content->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    auto *layout = new QVBoxLayout(content);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(8);
+    outer->addWidget(content);
+
     *outLayout = layout;
     return box;
 }
@@ -631,74 +574,70 @@ PreferenceDialog::PreferenceDialog(QWidget *parent)
     m_stack->setCurrentIndex(0);
 }
 
+// 按冲突状态刷新单个快捷键行（snow 的 setRegistrationStatus）
+void PreferenceDialog::applyHotkeyButtonState(const QString &action)
+{
+    ShortcutRow *row = m_hotkeyRows.value(action);
+    if (!row)
+        return;
+
+    // 一个动作可绑多个键：每个键画一个独立的框，行宽放不下的自动隐藏。
+    // 只有真正注册失败的键标红，同一个动作下能用的键保持正常色。
+    const QStringList keys = ConfigManager::instance()->hotkeys(action);
+    const QStringList failed = m_failedKeys.value(action);
+
+    row->setShortcutKeys(keys);
+    row->setInvalidKeys(failed);
+    row->setToolTipText(failed.isEmpty()
+                            ? QString()
+                            : QStringLiteral("「%1」已被其他程序占用，点击重新设置")
+                                  .arg(failed.join(QStringLiteral("、"))));
+}
+
 void PreferenceDialog::setHotkeyConflicts(const QSet<QString> &actions)
 {
-    const QSet<QString> previous = m_conflictedActions;
     m_conflictedActions = actions;
+    for (auto it = m_hotkeyRows.constBegin(); it != m_hotkeyRows.constEnd(); ++it)
+        applyHotkeyButtonState(it.key());
+}
 
-    for (const QString &action : previous) {
-        if (actions.contains(action))
-            continue;
-        if (HotkeyRecorder *recorder = m_hotkeyRecorders.value(action))
-            recorder->setHotkeyText(ConfigManager::instance()->hotkey(action));
-        if (ElaText *hint = m_hotkeyHints.value(action))
-            hint->hide();
-    }
-
-    for (const QString &action : actions) {
-        if (HotkeyRecorder *recorder = m_hotkeyRecorders.value(action))
-            recorder->showConflict(ConfigManager::instance()->hotkey(action));
-        if (ElaText *hint = m_hotkeyHints.value(action))
-            hint->hide();
-    }
+void PreferenceDialog::setHotkeyFailedKeys(const QHash<QString, QStringList> &failedKeys)
+{
+    m_failedKeys = failedKeys;
+    for (auto it = m_hotkeyRows.constBegin(); it != m_hotkeyRows.constEnd(); ++it)
+        applyHotkeyButtonState(it.key());
 }
 
 void PreferenceDialog::showHotkeyResult(const QString &action, bool success,
                                         const QString &message)
 {
-    HotkeyRecorder *recorder = m_hotkeyRecorders.value(action);
-    ElaText *hint = m_hotkeyHints.value(action);
-    const QString activeHotkey = ConfigManager::instance()->hotkey(action);
-
-    if (recorder) {
-        if (success) {
-            m_conflictedActions.remove(action);
-            recorder->setHotkeyText(activeHotkey);
-        } else {
-            m_conflictedActions.insert(action);
-            recorder->showConflict(activeHotkey);
-            if (hint)
-                hint->hide();
-            return;
-        }
+    if (success) {
+        m_conflictedActions.remove(action);
+        m_failedKeys.remove(action);
+    } else {
+        m_conflictedActions.insert(action);
+        // 失败键列表由调用方通过 message 传达，这里只在能从配置重新
+        // 推导时留空——具体哪些键红由 AppController 随后的
+        // setHotkeyFailedKeys() 补齐。
     }
+    applyHotkeyButtonState(action);
 
-    if (!hint)
-        return;
-    if (success || message.isEmpty()) {
-        hint->hide();
-        return;
+    // 部分键注册失败时必须给用户可见反馈，否则只是按钮变红，
+    // 用户会以为"新加的键没生效"
+    if (!message.isEmpty()) {
+        ElaMessageBar::warning(ElaMessageBarType::Top, QStringLiteral("快捷键"),
+                               message, 3000, this);
     }
-
-    hint->setText(message);
-    hint->show();
 }
 
 void PreferenceDialog::showEvent(QShowEvent *event)
 {
     ElaDialog::showEvent(event);
-
-    const QSet<QString> conflictedActions = m_conflictedActions;
-    for (const QString &action : conflictedActions) {
-        if (HotkeyRecorder *recorder = m_hotkeyRecorders.value(action))
-            recorder->showConflict(ConfigManager::instance()->hotkey(action));
-    }
+    setHotkeyConflicts(m_conflictedActions);
 }
 
 void PreferenceDialog::hideEvent(QHideEvent *event)
 {
-    if (m_recordingRecorder)
-        m_recordingRecorder->cancelRecording();
     ElaDialog::hideEvent(event);
 
     // ElaDialog 的关闭按钮走的是 hide() 而不是 close()，
@@ -749,10 +688,9 @@ void PreferenceDialog::buildPages()
         m_stack->addWidget(wrapScrollable(content, [content]() { themeInputs(content); }));
     }
 
-    // 一次只显示一页，避免隐藏页仍参与绘制
+    // QStackedWidget 本身只显示当前页，不需要手动 setVisible ——
+    // 之前的循环会在切页瞬间把所有页显示/隐藏一遍，导致布局重算与重影。
     connect(m_nav, &NavList::currentChanged, this, [this](int row) {
-        for (int i = 0; i < m_stack->count(); ++i)
-            m_stack->widget(i)->setVisible(i == row);
         m_stack->setCurrentIndex(row);
         if (m_historyList && row == m_historyPageIndex)
             refreshHistory();
@@ -886,6 +824,10 @@ QWidget *PreferenceDialog::buildGeneralPage()
                                     QStringLiteral("general/enable_web_image_paste")));
     miscLayout->addWidget(toggleRow(miscBox, QStringLiteral("复制或保存图片后显示提示"),
                                     QStringLiteral("general/show_operation_toast")));
+    // 全屏应用（游戏/视频/全屏演示）前台时让出全局快捷键，
+    // 避免和游戏按键抢输入。判定对齐 Snow Shot。
+    miscLayout->addWidget(toggleRow(miscBox, QStringLiteral("全屏游戏时屏蔽快捷键（全屏视频不屏蔽）"),
+                                    QStringLiteral("general/block_hotkeys_in_fullscreen")));
 
     // 开机自启：直接写 HKCU Run 键，不经 config.ini（注册表才是唯一事实来源）。
     // 便携模式下不提供：便携版的语义就是"不往系统里留东西"。
@@ -942,6 +884,29 @@ QWidget *PreferenceDialog::buildSnipPage()
                                       QStringLiteral("snip/show_auxiliary_lines")));
     detectLayout->addWidget(toggleRow(detectBox, QStringLiteral("截图中包含鼠标光标"),
                                       QStringLiteral("snip/capture_cursor")));
+
+    // 元素/窗口高亮框在两个目标之间移动时的过渡动画。
+    // 对齐 snow 的「Selection animation」：Off / Soft / Fast。
+    auto *transitionForm = new QFormLayout;
+    transitionForm->setSpacing(8);
+    auto *transition = narrowable(new ElaComboBox(detectBox));
+    transition->addItem(QStringLiteral("关闭（瞬间切换）"), 0);
+    transition->addItem(QStringLiteral("柔和（约 100ms）"), 32);
+    transition->addItem(QStringLiteral("快速（约 67ms）"), 72);
+    const int transitionIdx = transition->findData(
+        ConfigManager::instance()
+            ->value(QStringLiteral("snip/selection_transition_animation"), 32)
+            .toInt());
+    if (transitionIdx >= 0)
+        transition->setCurrentIndex(transitionIdx);
+    connect(transition, &QComboBox::currentIndexChanged, this, [transition](int) {
+        ConfigManager::instance()->setValue(
+            QStringLiteral("snip/selection_transition_animation"),
+            transition->currentData().toInt());
+    });
+    transitionForm->addRow(new ElaText(QStringLiteral("识别框过渡动画")), transition);
+    detectLayout->addLayout(transitionForm);
+
     layout->addWidget(detectBox);
 
     QVBoxLayout *excludeLayout = nullptr;
@@ -1030,8 +995,6 @@ QWidget *PreferenceDialog::buildControlPage()
 
     QVBoxLayout *hotkeyLayout = nullptr;
     QWidget *hotkeyBox = groupBox(w, QStringLiteral("全局快捷键（修改后立即生效）"), &hotkeyLayout);
-    auto *hotkeyForm = new QFormLayout;
-    hotkeyForm->setSpacing(8);
 
     struct Binding { const char *key; const char *label; };
     const Binding bindings[] = {
@@ -1044,66 +1007,38 @@ QWidget *PreferenceDialog::buildControlPage()
 
     for (const Binding &b : bindings) {
         const QString action = QString::fromLatin1(b.key);
+        const QString label = QString::fromUtf8(b.label);
 
-        // 自绘录制框直接处理 QKeyEvent，不依赖 ElaKeyBinder 的私有事件循环。
-        auto *recorder = new HotkeyRecorder(hotkeyBox);
-        // 必须走 hotkey()：它会在配置缺项时回落到默认值。
-        // 直接 value("hotkey/xxx") 拿到空串再回写，会把默认热键永久抹成空。
-        recorder->setHotkeyText(ConfigManager::instance()->hotkey(action));
+        // snow 的 ShortcutKeyRow：整行是 Outline 按钮，右侧内嵌快捷键按钮
+        auto *row = new ShortcutRow(label, action, hotkeyBox);
+        m_hotkeyRows.insert(action, row);
 
-        auto *hint = new ElaText(hotkeyBox);
-        hint->setTextStyle(ElaTextType::Caption);
-        hint->hide();
-        m_hotkeyRecorders.insert(action, recorder);
-        m_hotkeyHints.insert(action, hint);
+        connect(row, &ShortcutRow::clicked, this, [this, action, row, label]() {
+            ShortcutConfigDialog dialog(label,
+                                        ConfigManager::instance()->hotkeys(action),
+                                        window());
+            dialog.setValidator([action](const QString &key) -> QString {
+                const QString conflict = findHotkeyConflict(key, action);
+                if (conflict.isEmpty())
+                    return QString();
+                return QStringLiteral("「%1」已被「%2」占用").arg(key, conflictLabel(conflict));
+            });
 
-        connect(recorder, &HotkeyRecorder::validationFailed, this,
-                [hint](const QString &message) {
-                    hint->setText(message);
-                    hint->show();
-                });
+            if (dialog.exec() != QDialog::Accepted)
+                return;
 
-        connect(recorder, &HotkeyRecorder::recordingStarted, this,
-                [this, recorder]() {
-                    if (m_recordingRecorder == recorder)
-                        return;
-                    // 同一时间只允许一个录制框持有焦点；切换前先结束旧录制。
-                    if (m_recordingRecorder)
-                        m_recordingRecorder->cancelRecording();
-                    m_recordingRecorder = recorder;
-                    emit hotkeyRecordingChanged(true);
-                });
+            const QStringList keys = dialog.keys();
+            if (keys.isEmpty())
+                return;
 
-        connect(recorder, &HotkeyRecorder::recordingFinished, this,
-                [this, recorder]() {
-                    if (m_recordingRecorder != recorder)
-                        return;
-                    m_recordingRecorder.clear();
-                    emit hotkeyRecordingChanged(false);
-                });
+            emit hotkeysChangeRequested(action, keys);
+        });
 
-        connect(recorder, &HotkeyRecorder::hotkeyRecorded, this,
-                [this, action](const QString &hotkey) {
-                    const QString conflict = findHotkeyConflict(hotkey, action);
-                    if (!conflict.isEmpty()) {
-                        showHotkeyResult(action, false, QStringLiteral("快捷键被占用"));
-                        return;
-                    }
-
-                    emit hotkeyChangeRequested(action, hotkey);
-                });
-
-        auto *cell = new QWidget(hotkeyBox);
-        cell->setAutoFillBackground(false);
-        auto *cellLayout = new QVBoxLayout(cell);
-        cellLayout->setContentsMargins(0, 0, 0, 0);
-        cellLayout->setSpacing(2);
-        cellLayout->addWidget(recorder);
-        cellLayout->addWidget(hint);
-
-        hotkeyForm->addRow(new ElaText(QString::fromUtf8(b.label)), cell);
+        hotkeyLayout->addWidget(row);
+        applyHotkeyButtonState(action);
     }
-    hotkeyLayout->addLayout(hotkeyForm);
+    // 关键：hotkeyBox 必须加进页面布局，否则它停在 (0,0)，
+    // 和后面的分组叠在一起 —— 就是"快捷键那块啥也不显示/重叠"。
     layout->addWidget(hotkeyBox);
 
     QVBoxLayout *cornerLayout = nullptr;

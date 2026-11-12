@@ -117,8 +117,8 @@ void TrayController::setHotkeyHint(const QString &captureHotkey)
 
 void TrayController::setHotkeyConflicts(const QSet<QString> &actions)
 {
-    if (m_hotkeyConflicts == actions)
-        return;
+    // 不能因为冲突集合没变就跳过刷新：用户改快捷键时冲突集合通常不变，
+    // 但菜单上显示的键名变了，跳过后托盘菜单会一直显示旧键。
     m_hotkeyConflicts = actions;
     refreshMenus();
 }

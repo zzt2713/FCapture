@@ -92,8 +92,10 @@ void show(PinWindow *w, const QPoint &globalPos, QWidget *parent)
     menu->addSeparator();
 
     // --- 窗口属性 ---
+    // 「始终置顶」默认开启（PinWindow 构造时 m_topmost = true）。
+    // 勾选状态 = 当前状态，再点一次取消勾选即恢复普通窗口层级。
     QAction *topmost = AppMenu::addIconAction(menu.get(), ElaIconType::Thumbtack,
-                                           QStringLiteral("置顶"));
+                                           QStringLiteral("始终置顶"));
     topmost->setCheckable(true);
     topmost->setChecked(w->isTopmost());
 

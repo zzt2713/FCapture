@@ -3,9 +3,11 @@
 #include "core/CommandLine.h"
 #include "snip/SnipResult.h"
 
+#include <QHash>
 #include <QObject>
 #include <QPointer>
 #include <QSet>
+#include <QStringList>
 
 class SnipOverlay;
 class TrayController;
@@ -55,6 +57,8 @@ private:
     void registerHotkeys();
     void restoreHotkeys();
     void syncHotkeyState();
+    // 当前每个 action 下注册失败的键（供首选项按单键标红）
+    QHash<QString, QStringList> currentFailedKeys() const;
     void captureCommon();
     // 长截图（F2 / 托盘）：截图中直接进入长截图流程，否则开新会话并记住意图
     void startLongScreenshot();

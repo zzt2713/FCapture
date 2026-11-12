@@ -18,9 +18,15 @@ namespace {
 
 
 
-// 让新窗口出现在光标处，但不超出屏幕可用区域。
+// 让新窗口出现在光标处，但不超出屏幕范围。
 // anchor 用图片内容位置选屏幕，避免窗口阴影临时越界时选错显示器。
-QPoint clampToScreen(const QPoint &pos, const QSize &size, const QPoint &anchor)
+//
+// useWorkArea：true = 限制在工作区（availableGeometry，避开任务栏）；
+// false = 限制在整块屏幕（geometry）。截图原位贴图必须传 false：
+// 用户截的是任务栏那一块，贴出来就该留在任务栏位置，不能被"让位"
+// 顶到任务栏上边去。
+QPoint clampToScreen(const QPoint &pos, const QSize &size, const QPoint &anchor,
+                     bool useWorkArea)
 {
     QScreen *screen = QGuiApplication::screenAt(anchor);
     if (!screen)
@@ -32,7 +38,7 @@ QPoint clampToScreen(const QPoint &pos, const QSize &size, const QPoint &anchor)
     if (!screen)
         return pos;
 
-    const QRect avail = screen->availableGeometry();
+    const QRect avail = useWorkArea ? screen->availableGeometry() : screen->geometry();
     int x = pos.x();
     int y = pos.y();
     if (x + size.width() - 1 > avail.right())
@@ -162,18 +168,21 @@ void PinManager::placementPosition(PinWindow *w, const QPoint &requested, bool u
     if (!screen)
         screen = QGuiApplication::primaryScreen();
 
-    // 磁性吸附：靠近屏幕边缘/其他贴图时吸附
+    // 磁性吸附：靠近屏幕边缘/其他贴图时吸附。
+    // 吸附基准必须和钳制基准一致：截图原位贴图用整块屏幕边界，
+    // 否则贴到任务栏区域时会被"吸附"到工作区底边，看起来像自己往上跳。
     const int magnet = ConfigManager::instance()
                            ->value(QStringLiteral("paste/magnetic_attach_threshold"), 20).toInt();
     if (magnet > 0 && screen) {
-        const QRect avail = screen->availableGeometry();
-        if (!avail.isEmpty()) {
-            const int right = avail.left() + avail.width();
-            const int bottom = avail.top() + avail.height();
-            if (qAbs(contentPos.x() - avail.left()) < magnet)
-                contentPos.setX(avail.left());
-            if (qAbs(contentPos.y() - avail.top()) < magnet)
-                contentPos.setY(avail.top());
+        const QRect bounds =
+            useExactPos ? screen->geometry() : screen->availableGeometry();
+        if (!bounds.isEmpty()) {
+            const int right = bounds.left() + bounds.width();
+            const int bottom = bounds.top() + bounds.height();
+            if (qAbs(contentPos.x() - bounds.left()) < magnet)
+                contentPos.setX(bounds.left());
+            if (qAbs(contentPos.y() - bounds.top()) < magnet)
+                contentPos.setY(bounds.top());
             if (qAbs(contentPos.x() + contentSize.width() - right) < magnet)
                 contentPos.setX(right - contentSize.width());
             if (qAbs(contentPos.y() + contentSize.height() - bottom) < magnet)
@@ -182,7 +191,7 @@ void PinManager::placementPosition(PinWindow *w, const QPoint &requested, bool u
     }
 
     const QPoint windowPos = contentPos - contentOffset;
-    w->move(clampToScreen(windowPos, w->size(), contentPos));
+    w->move(clampToScreen(windowPos, w->size(), contentPos, /*useWorkArea=*/!useExactPos));
 }
 
 PinWindow *PinManager::pasteImage(const QImage &img, const QPoint &globalPos,
