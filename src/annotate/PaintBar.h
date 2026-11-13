@@ -56,6 +56,8 @@ signals:
     void copyRequested();
     void saveRequested();
     void pinRequested();
+    // 钉住窗口：把选区所在的窗口实时镜像成贴图（snow 的 Live Window）
+    void pinWindowRequested();
     void sendToRequested();
     void ocrRequested();
     void barcodeRequested();

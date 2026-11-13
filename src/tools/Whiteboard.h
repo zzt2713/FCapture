@@ -48,6 +48,9 @@ private:
     void copyToClipboard();
     void saveToFile();
     QImage renderImage() const;
+    // 画网格底纹：纯白底 + 极淡浅灰等距方格（类似工程图纸）。
+    // 屏幕绘制和导出图片共用同一套逻辑，保证看到什么就导出什么。
+    void paintGridBackground(QPainter &p, const QRect &area) const;
     std::shared_ptr<Annotation> createShapeForTool(Tool tool) const;
     void applyToolStyleTo(std::shared_ptr<Annotation> shape) const;
 

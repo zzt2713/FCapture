@@ -59,6 +59,7 @@ enum ActionId {
     ActCopy,
     ActSave,
     ActPin,
+    ActPinWindow,   // 钉住窗口：实时镜像该窗口（snow 的 Live Window）
     ActSendTo,
     ActRecognize,   // 识别：OCR + 二维码/条码，二选一菜单
     ActClose,
@@ -229,6 +230,7 @@ void PaintBar::rebuildLayout()
         {ActSendTo, true},
         {ActRecognize, true},
         {ActClose, true},
+        {ActPinWindow, true},
         {ActPin, true},
         {ActSave, true},
         {ActCopy, true},
@@ -463,15 +465,15 @@ void PaintBar::positionNearGlobal(const QRect &anchorGlobalRect)
         screen = QGuiApplication::primaryScreen();
     const QRect avail = screen ? screen->availableGeometry() : anchor;
 
-    constexpr int kGap = 8;
+    constexpr int kAnchorGap = 8;
 
     int x = anchor.right() - hint.width() + 1;
     x = qBound(avail.left() + 4, x, avail.right() - hint.width() - 4);
 
-    int y = anchor.bottom() + kGap;
+    int y = anchor.bottom() + kAnchorGap;
     if (y + hint.height() > avail.bottom() - 4) {
         // 下方放不下就翻到上方
-        const int aboveY = anchor.top() - hint.height() - kGap;
+        const int aboveY = anchor.top() - hint.height() - kAnchorGap;
         y = (aboveY >= avail.top() + 4) ? aboveY : qMax(avail.top() + 4, avail.bottom() - hint.height() - 4);
     }
 
@@ -691,6 +693,7 @@ void PaintBar::mouseReleaseEvent(QMouseEvent *e)
             case ActCopy:  emit copyRequested(); break;
             case ActSave:  emit saveRequested(); break;
             case ActPin:   emit pinRequested(); break;
+            case ActPinWindow: emit pinWindowRequested(); break;
             case ActSendTo: emit sendToRequested(); break;
             case ActRecognize: showRecognizeMenu(QCursor::pos()); break;
             case ActClose: emit closeRequested(); break;
@@ -1581,6 +1584,7 @@ QString PaintBar::hoverText() const
     case ActCopy: return QStringLiteral("复制到剪贴板  Enter");
     case ActSave: return QStringLiteral("保存到文件  Ctrl+S");
     case ActPin: return QStringLiteral("贴到屏幕  Ctrl+T");
+    case ActPinWindow: return QStringLiteral("钉住窗口（实时更新）");
     case ActSendTo: return QStringLiteral("发送到其他应用");
     case ActRecognize: return QStringLiteral("识别文字 / 二维码");
     case ActClose: return QStringLiteral("关闭  Esc");
@@ -1886,6 +1890,9 @@ void PaintBar::paintEvent(QPaintEvent *e)
         case ActCopy:  icon = ToolIcons::copyIcon(20, iconColor); break;
         case ActSave:  icon = ToolIcons::saveIcon(20, iconColor); break;
         case ActPin:   icon = ToolIcons::pinIcon(20, iconColor); break;
+        // 实时窗口钉住：复用钉子图标加一个小"播放"示意，
+        // 和普通贴图按钮区分开
+        case ActPinWindow: icon = ToolIcons::liveWindowIcon(20, iconColor); break;
         case ActSendTo: icon = ToolIcons::sendIcon(20, iconColor); break;
         case ActRecognize: icon = ToolIcons::ocrIcon(20, iconColor); break;
         case ActClose: icon = ToolIcons::closeIcon(20, iconColor); break;

@@ -41,8 +41,10 @@ public:
     // targetWindow：截图遮罩下面那个真实窗口的 HWND。必须传，否则
     // ElementFromPoint 只会命中我们自己的全屏遮罩（等于只能识别整屏）。
     // 返回本次请求的 id；结果通过 detected / timedOut 信号带回。
+    // budgetMs：树查询时间预算。默认 168ms（普通悬停）；
+    // 精化传 1500ms，让 Edge/Chromium 这类深树能展开到具体控件。
     quint64 request(const QPoint &screenPos, const QString &processName,
-                    quintptr targetWindow = 0);
+                    quintptr targetWindow = 0, int budgetMs = 168);
 
     // 该进程名是否在 MSAA 降级列表里（配置项 snip/element_msaa_apps）
     static bool prefersMsaa(const QString &processName);

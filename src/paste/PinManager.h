@@ -28,6 +28,9 @@ public:
                           const QString &sourceText = QString(),
                           qreal imageDpr = 1.0,
                           bool useExactPos = false);
+    // 实时窗口贴图：首帧用 initialFrame 占位，随后由 LiveWindowSource 持续更新
+    PinWindow *pasteLiveWindow(quintptr targetWindow, const QImage &initialFrame,
+                               const QPoint &globalPos, qreal imageDpr = 1.0);
     QVector<PinWindow *> pasteImageSet(const QVector<QImage> &images);
 
     // --- 查询 ---
@@ -84,6 +87,8 @@ private:
 
     // 虚拟桌面切换时同步贴图可见性（公开接口没有桌面切换通知，只能轮询）
     void syncDesktopVisibility();
+    // 屏幕分辨率/任务栏/显示器数量变化后，把贴图拉回可视工作区
+    void reconcilePinnedPlacement();
 
     void attachWindow(PinWindow *w);
     void detachWindow(PinWindow *w);

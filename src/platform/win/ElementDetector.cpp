@@ -273,6 +273,15 @@ constexpr int kMaxSnapshotElements = 20000;
 //
 // 我们之前的做法是每次请求从窗口根重新下钻，等于每次都付全款；
 // 全量抓树则相反——一次抓太多，ControlView 又裁掉具体控件。
+// 路径深度阈值：命中链短于这个层数时，认为树可能是残缺的，
+// 不信任纯本地缓存，强制走一次完整查询。
+// 4 层对应：窗口 → Pane → Pane → Document，正好是 Edge 卡住的位置。
+constexpr int kShallowPathDepth = 4;
+
+// 子级数低于这个值的节点视为"展开不完整"，精化阶段允许重新展开。
+// Chromium 的 Document 层首次只给 10 个左右，补齐后是 105 个。
+constexpr int kSparseChildCount = 20;
+
 constexpr int kTreeMaxSteps = 80;      // 单次查询最多下降层数
 constexpr int kTreeMaxRects = 100;     // 单次查询最多返回矩形数
 constexpr int kTreeLinearLimit = 16;   // 子节点 ≤16 用线性扫，否则建索引
@@ -282,6 +291,11 @@ struct TreeChild
 {
     RECT  bounds{};
     int   node = -1;
+    // 结构性节点：Pane/Group 且与父级同尺寸。
+    // Chromium/Edge 里这种"透明包装层"会和真正的内容分支同矩形，
+    // UIA 的兄弟顺序又不保证层级，导致下钻路径被它截断。
+    // snow 靠回溯这类节点继续深挖（见 structural_alternative）。
+    bool  structural = false;
 };
 
 struct TreeNode
@@ -301,6 +315,9 @@ struct TreeNode
     int bucketCount = 0;                // 桶数量（0 = 未建立，退化线性扫描）
     ComPtr<IUIAutomationElement> element;   // Unloaded 时用于 BuildUpdatedCache
     bool timeoutRetried = false;
+    // 展开失败/返回空的累计次数。Chromium 的惰性 UIA 树需要多试几次，
+    // 但不能无限重试（每次都是一次跨进程往返）。
+    int  expandAttempts = 0;
 };
 
 // 单个窗口的懒加载 UIA 树。只在 UIA 工作线程内使用，不跨线程。
@@ -311,6 +328,7 @@ public:
     {
         m_hwnd = hwnd;
         m_nodes.clear();
+        m_loadedAny = false;
         TreeNode root;
         root.bounds = bounds;
         m_nodes.append(root);
@@ -318,6 +336,7 @@ public:
 
     bool isValid() const { return !m_nodes.isEmpty(); }
     bool hasLoaded() const { return m_loadedAny; }
+    int  nodeCount() const { return m_nodes.size(); }
 
     // 命中查询：从根逐层下降，返回 元素(深) → … → 窗口(浅) 的矩形链。
     // 只有未展开的节点才会触发一次 BuildUpdatedCache，其余全读缓存。
@@ -346,8 +365,17 @@ public:
                 break;
 
             const int child = hitChild(current, pt);
-            if (child < 0)
+            if (child < 0) {
+                // UIA 兄弟顺序不保证层级：Chromium/Edge 里一个与父级同尺寸的
+                // 结构性 Pane 会盖住真正的内容分支。沿"同尺寸结构性祖先"回溯，
+                // 找它的兄弟继续下钻（snow 的 structural_alternative 同款）。
+                const int alternative = structuralAlternative(current, pt);
+                if (alternative >= 0) {
+                    current = alternative;
+                    continue;
+                }
                 break;
+            }
             current = child;
         }
 
@@ -381,9 +409,39 @@ public:
                 return false;   // 路径上还有没展开的，需要完整查询
 
             const int child = hitChild(current, pt);
-            if (child < 0)
+            if (child < 0) {
+                // 停在这里：可能是这层真的没有更深元素（正常），
+                // 也可能是树是残缺的（Chromium 惰性构建，日志里 idx=15 只给 10 个子级）。
+                // 纯本地判断分不出来，所以**只有路径够深时**才当作缓存命中；
+                // 路径太浅就返回 false，让调用方走完整查询（那里会重建树）。
                 break;
+            }
             current = child;
+        }
+
+        // 路径深度太浅 → 不信任缓存，让调用方走完整查询。
+        // 但**不能因此返回空**：如果完整查询也没改善，至少还要有窗口级框，
+        // 否则用户看到的是"整个屏幕"（用户反馈的"只能识别一次，之后一直全屏"）。
+        int probe = current;
+        int depthCount = 0;
+        while (probe > 0) {
+            ++depthCount;
+            probe = m_nodes.at(probe).parent;
+        }
+        if (depthCount <= kShallowPathDepth) {
+            // 仍然把当前能拿到的路径填出去（哪怕是浅的），
+            // 返回 false 只是"建议再查一次"，不是"没有结果"。
+            QVector<RECT> shallow;
+            int n = current;
+            while (n > 0) {
+                const RECT &b = m_nodes.at(n).bounds;
+                if (!sameRect(b, m_nodes.at(0).bounds))
+                    shallow.prepend(b);
+                n = m_nodes.at(n).parent;
+            }
+            shallow.append(m_nodes.at(0).bounds);
+            *out = shallow;
+            return false;
         }
 
         QVector<RECT> path;
@@ -407,8 +465,13 @@ public:
         return true;
     }
 
-    // 清空缓存（窗口结构变化时由上层调用）
-    void invalidate() { m_nodes.clear(); }
+    // 清空缓存（窗口结构变化时由上层调用）。
+    // m_loadedAny 必须一起复位，否则重建后的空树仍会被当成"可用"。
+    void invalidate()
+    {
+        m_nodes.clear();
+        m_loadedAny = false;
+    }
 
 private:
     static bool containsPoint(const RECT &r, const POINT &p)
@@ -419,6 +482,44 @@ private:
     static bool sameRect(const RECT &a, const RECT &b)
     {
         return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+    }
+
+    // 沿着"结构性且与父级同尺寸"的祖先往上回溯，返回它的一个包含光标的兄弟。
+    // 返回 -1 表示没有可回溯的路径。
+    //
+    // 场景：Chromium/Edge 的 UIA 树里，内容分支上方常压着一层同尺寸的
+    // 结构性 Pane。hitChild 会命中这层 Pane（它包含光标），然后在这层里
+    // 找不到子级 → 下钻提前结束，结果只到大块容器。
+    // snow 的解法：识别出"这只是个包装层"，回溯到父级，换下一个兄弟继续走。
+    int structuralAlternative(int node, const POINT &pt) const
+    {
+        int current = node;
+        for (int guard = 0; guard < kTreeMaxSteps; ++guard) {
+            if (current <= 0)
+                return -1;
+            const TreeNode &n = m_nodes.at(current);
+            const TreeNode &parent = m_nodes.at(n.parent);
+            // 只有"结构性且与父级同矩形"的节点才允许被跳过
+            const bool isStructural = std::any_of(
+                parent.children.cbegin(), parent.children.cend(),
+                [&](const TreeChild &c) { return c.node == current && c.structural; });
+            // 严格对齐 snow：只要求节点本身是结构性的，
+            // 不再额外要求"与父级同矩形"（snow 里没有这个条件）。
+            if (!isStructural)
+                return -1;
+
+            // 在父级里找另一个包含光标的兄弟（跳过自己）
+            const QVector<TreeChild> &siblings = parent.children;
+            for (int i = siblings.size() - 1; i >= 0; --i) {
+                const TreeChild &s = siblings.at(i);
+                if (s.node == current)
+                    continue;
+                if (containsPoint(s.bounds, pt))
+                    return s.node;
+            }
+            current = n.parent;   // 父级本身也可能是结构性的，继续往上
+        }
+        return -1;
     }
 
     // 命中本节点的哪个子级：取"最后一个"包含光标的（后绘制=上层，snow 同款）
@@ -498,20 +599,23 @@ private:
             }
         }
         if (FAILED(hr) || !cached) {
-            m_nodes[node].state = TreeNode::State::Failed;
-            static int __fail = 0;
-            if ((__fail++ % 20) == 0)
-                qInfo().nospace() << "[expand-fail] node=" << node
-                                  << " hr=0x" << QString::number(quint32(hr), 16)
-                                  << " hwnd=" << quintptr(m_hwnd);
+            // 不永久标记失败：Chromium/Edge 的 UIA 树是惰性构建的，
+            // 首次请求常常超时，之后就能拿到内容。最多重试 3 次。
+            if (++m_nodes[node].expandAttempts < 3) {
+                m_nodes[node].state = TreeNode::State::Unloaded;
+            } else {
+                m_nodes[node].state = TreeNode::State::Failed;
+            }
             return false;
         }
 
         int count = 0;
         const RECT rootBounds = m_nodes.at(0).bounds;
+        const RECT parentBounds = m_nodes.at(node).bounds;
         QVector<TreeChild> entries;
         ComPtr<IUIAutomationElementArray> kids;
-        if (SUCCEEDED(cached->GetCachedChildren(kids.GetAddressOf())) && kids) {
+        HRESULT kidsHr = E_FAIL;
+        if (SUCCEEDED(kidsHr = cached->GetCachedChildren(kids.GetAddressOf())) && kids) {
             kids->get_Length(&count);
             entries.reserve(count);
             for (int i = 0; i < count; ++i) {
@@ -534,13 +638,22 @@ private:
                     || clipped.right <= clipped.left || clipped.bottom <= clipped.top)
                     continue;
 
+                // 结构性节点判定（严格对齐 snow 的 Candidate::structural）：
+                // 只要 ControlType 是 Pane/Group 就算结构性，**不要求**与父级同矩形。
+                // 之前多加了 sameRect 条件，导致能回溯的节点大幅减少，
+                // Chromium/Edge 的下钻路径依然被包装层截断。
+                CONTROLTYPEID ct = 0;
+                kid->get_CachedControlType(&ct);
+                const bool structural =
+                    (ct == UIA_PaneControlTypeId || ct == UIA_GroupControlTypeId);
+
                 const int index = m_nodes.size();
                 TreeNode child;
                 child.bounds = clipped;
                 child.parent = node;
                 child.element = kid;
                 m_nodes.append(child);
-                entries.append({ clipped, index });
+                entries.append({ clipped, index, structural });
             }
         }
 
@@ -617,23 +730,30 @@ private:
         }
 
         m_nodes[node].children = entries;
-        m_nodes[node].state = TreeNode::State::Loaded;
-        m_nodes[node].element.Reset();   // 子级已展开，父元素引用不再需要
-        m_loadedAny = true;
+        // 空子级不要立刻固化成 Loaded。
+        // Chromium/Edge 的 UIA 树是惰性构建的：第一次问它要子级，
+        // 往往返回空数组（日志里 uiaKids=0），要等它自己构建完才能拿到。
+        // 固化成 Loaded 之后就再也不会重试，于是永远只识别到这一层。
+        // 只在预算充裕时（精化阶段 remainingMs 较大）才重试空节点，
+        // 普通悬停仍然是"问一次就过"，不会为此拖慢跟手感。
+        // Chromium/Edge 的 Document 层第一次可能只给一小批子级
+        //（日志实测 10 个，稍后才补齐到 105 个）。
+        // 这种"展开不完整"节点必须能重新问一遍，所以：
+        //   1. 子级偏少时**保留 element 句柄**（否则没法重新 BuildUpdatedCache）
+        //   2. 标记成 Unloaded，下一次查询会重新展开
+        const bool emptyFromUia = entries.isEmpty() && count == 0;
+        const bool sparseFromUia = count > 0 && count < kSparseChildCount;
+        const bool retryable = (emptyFromUia || sparseFromUia) && remainingMs > 200;
+        const bool canRetry = retryable && ++m_nodes[node].expandAttempts < 4;
+        m_nodes[node].state = canRetry ? TreeNode::State::Unloaded
+                                       : TreeNode::State::Loaded;
 
-        static int __n = 0;
-        if ((__n++ % 20) == 0) {
-            qInfo().nospace() << "[expand] node=" << node << " uiaKids=" << count
-                              << " entries=" << entries.size() << " hwnd=" << quintptr(m_hwnd)
-                              << (entries.isEmpty()
-                                      ? QString()
-                                      : QStringLiteral(" first=")
-                                            + QString::number(entries.first().bounds.right
-                                                              - entries.first().bounds.left)
-                                            + "x"
-                                            + QString::number(entries.first().bounds.bottom
-                                                              - entries.first().bounds.top));
+        if (canRetry) {
+            // 保留句柄以便重新展开；旧子级先留着（命中测试仍可用）
+        } else {
+            m_nodes[node].element.Reset();   // 子级已展开，父元素引用不再需要
         }
+        m_loadedAny = m_loadedAny || !entries.isEmpty();
         return true;
     }
 
@@ -706,6 +826,8 @@ public slots:
         req->AddProperty(UIA_ControlTypePropertyId);
         req->AddProperty(UIA_NamePropertyId);
         req->put_TreeScope(TreeScope_Subtree);
+        // Full 模式：Chromium/Edge 在纯缓存模式下 walk 子级会返回空
+        req->put_AutomationElementMode(AutomationElementMode_Full);
         m_cacheReq = req;
 
         // 控件视图条件（uia.rs 的 SetTreeFilter(ControlViewCondition) 同款）：
@@ -899,7 +1021,13 @@ public slots:
     }
 
     // 元素检测主入口：MSAA 优先（毫秒级），粗命中时让 UIA 精化。
-    void detect(quint64 requestId, QPoint screenPos, quintptr targetHwnd, bool useMsaa)
+    // budgetMs：本次树查询的时间预算。
+    //   普通悬停用 168ms（snow 的 QueryControl::foreground）
+    //   精化用 1500ms（snow 的 QueryControl::refinement）——
+    //   Edge/Chromium 的树很深，168ms 展开不到具体控件，
+    //   表现就是"Edge 里只能识别到大块、识别不到按钮"。
+    void detect(quint64 requestId, QPoint screenPos, quintptr targetHwnd, bool useMsaa,
+                int budgetMs = 168)
     {
         const POINT probe{ screenPos.x(), screenPos.y() };
         const qreal dpr = dprAtPhysical(probe);
@@ -938,7 +1066,7 @@ public slots:
         // 结果是"鼠标在动就一直不做 UIA 查询"，树永远长不出来（实测日志：
         // [detect] 有输出、[expand] 一次都没有）。
         // 懒加载树本身有缓存，重复命中零跨进程调用，同步执行不会拖慢。
-        refineWithUia(requestId, pt, targetHwnd, dpr, msaaResult);
+        refineWithUia(requestId, pt, targetHwnd, dpr, msaaResult, budgetMs);
     }
 
 signals:
@@ -1021,20 +1149,9 @@ private:
     // 之后在同一分支里移动**零跨进程 UIA 调用**，只读本地矩形。
     // 这是"snow 悬停流畅"的核心，我们之前每次请求都从根重建，等于每次付全款。
     void refineWithUia(quint64 requestId, POINT pt, quintptr targetHwnd, qreal dpr,
-                       const QVector<ElementInfo> &msaaResult)
+                       const QVector<ElementInfo> &msaaResult, int budgetMs)
     {
-        {
-            static int __r = 0;
-            if ((__r++ % 10) == 0)
-                qInfo().nospace() << "[refine] id=" << requestId
-                                  << " latest=" << g_latestDetectId.load()
-                                  << " hwnd=" << targetHwnd;
-        }
         if (requestId != g_latestDetectId.load()) {
-            static int __s = 0;
-            if ((__s++ % 10) == 0)
-                qInfo().nospace() << "[refine-skip] id=" << requestId
-                                  << " latest=" << g_latestDetectId.load();
             return;
         }
 
@@ -1057,6 +1174,11 @@ private:
                     req->AddProperty(UIA_NativeWindowHandlePropertyId);
                     req->put_TreeScope(
                         static_cast<TreeScope>(TreeScope_Element | TreeScope_Children));
+                    // 必须用 Full 模式（snow 同款）：
+                    // 缓存模式（Cache）下，Chromium/Edge 这类提供者只返回
+                    // 缓存里那几项属性，walk 子级时会因为缺少必要接口而直接
+                    // 返回空 —— 表现就是"Edge 里一个元素都识别不到"。
+                    req->put_AutomationElementMode(AutomationElementMode_Full);
                     ComPtr<IUIAutomationCondition> cond;
                     if (SUCCEEDED(m_uia->get_ControlViewCondition(cond.GetAddressOf()))
                         && cond)
@@ -1082,13 +1204,54 @@ private:
                     QVector<RECT> path;
                     if (!tree.hitTestCachedOnly(pt, &path)) {
                         path = tree.hitTest(automation2.Get(), m_cacheRequest.Get(), pt,
-                                            168, QRect(), dpr);
+                                            budgetMs, QRect(), dpr);
                     }
-                    for (const RECT &r : path) {
-                        ElementInfo info;
-                        info.logicalRect = rectToLogical(r, dpr);
-                        info.nativeHandle = targetHwnd;
-                        hierarchy.append(info);
+
+                    // ---- Chromium/Edge 的关键补救 ----
+                    //
+                    // Edge 的 UIA 树是**惰性构建**的：第一次问它要子级，
+                    // Document 层可能只返回 10 个容器（日志实测），
+                    // 要过一会儿才能拿到完整的 105 个。
+                    // 普通悬停（168ms）里来不及，于是路径只有 5 层，
+                    // 用户看到的就是"只识别到大块，点不到具体元素"。
+                    //
+                    // 补救：**精化阶段**（预算充裕）如果发现路径太浅
+                    // （只到 Document 或更浅），就把这棵树整个丢掉重建，
+                    // 用一次完整查询重新下钻。重建后 Chromium 会给出完整树。
+                    const bool refineMode = budgetMs > 200;
+                    const int kShallowPath = 4;
+                    // 只对"确实因为预算耗尽而没展开"的节点重新查询，
+                    // **不重建整棵树** —— 重建会丢掉已展开的路径，
+                    // 而 Chromium 重建后仍给残缺数据（实测 nodes 50→16，
+                    // 之后 pathLen 一直是 2，比之前更差）。
+                    //
+                    // 正确做法（snow 的 retry_timeout 语义）：
+                    // 在同一棵树上，用更大预算再走一遍，让 expand()
+                    // 把路径上 Unloaded 的节点展开出来。
+                    if (refineMode && path.size() <= kShallowPath) {
+                        // Chromium 的 Document 层第一次只返回少量子级，
+                        // 稍后才会补齐。这里**在同一棵树上再问一遍**：
+                        // expand() 对 Unloaded 节点会重新请求，
+                        // 树就能把之前缺的那批子级补进来。
+                        const QVector<RECT> retry =
+                            tree.hitTest(automation2.Get(), m_cacheRequest.Get(), pt,
+                                         budgetMs, QRect(), dpr);
+                        if (retry.size() > path.size())
+                            path = retry;
+                    }
+
+                    // 只有真拿到子级才算"树可用"。
+                    // 以前只看 tree.isValid()（= 根节点在），
+                    // 树存在但一个子级都没展开时也标记可用，
+                    // 于是 hierarchy 为空也不走兜底 → 永远只识别到窗口。
+                    treeUsable = tree.hasLoaded();
+                    if (!path.isEmpty()) {
+                        for (const RECT &r : path) {
+                            ElementInfo info;
+                            info.logicalRect = rectToLogical(r, dpr);
+                            info.nativeHandle = targetHwnd;
+                            hierarchy.append(info);
+                        }
                     }
                 }
             }
@@ -1562,14 +1725,14 @@ quint64 ElementDetector::requestRefinement(const QPoint &screenPos, quintptr tar
         return 0;
     ensureWorker();
 
-    // 精化沿用普通请求通道：懒加载树已经把命中的分支展开了，
-    // 这次查询只会在已缓存节点上多走几层（甚至零跨进程调用），
-    // 所以不需要单独的线程/队列。
-    return request(screenPos, QString(), targetWindow);
+    // 精化沿用普通请求通道，但给更大的时间预算（snow 的 refinement = 1500ms）。
+    // Edge/Chromium 的 UIA 树很深，168ms 展开不到具体按钮，
+    // 这是"Edge 识别不到元素"的主要原因。
+    return request(screenPos, QString(), targetWindow, 1500);
 }
 
 quint64 ElementDetector::request(const QPoint &screenPos, const QString &processName,
-                                quintptr targetWindow)
+                                quintptr targetWindow, int budgetMs)
 {
     if (m_disabled)
         return 0;
@@ -1586,12 +1749,16 @@ quint64 ElementDetector::request(const QPoint &screenPos, const QString &process
     g_latestDetectId.store(id);   // 工作线程据此作废过期的 UIA 精化
 
     const bool useMsaa = prefersMsaa(processName);
-    QMetaObject::invokeMethod(m_worker, [this, id, screenPos, targetWindow, useMsaa]() {
-        m_worker->detect(id, screenPos, targetWindow, useMsaa);
+    const int budget = budgetMs > 0 ? budgetMs : 168;
+    QMetaObject::invokeMethod(m_worker, [this, id, screenPos, targetWindow, useMsaa, budget]() {
+        m_worker->detect(id, screenPos, targetWindow, useMsaa, budget);
     }, Qt::QueuedConnection);
 
-    // 超时：工作线程大概率卡死在 UIA 调用里，丢弃结果并重建线程
-    QTimer::singleShot(kTimeoutMs, this, [this, id]() {
+    // 超时：工作线程大概率卡死在 UIA 调用里，丢弃结果并重建线程。
+    // 阈值必须跟着预算走 —— 精化给 1500ms 预算，若仍按 800ms 判定超时，
+    // 每次精化都会被误杀并重建线程，Edge 永远等不到结果。
+    const int timeoutMs = qMax(kTimeoutMs, budget + 400);
+    QTimer::singleShot(timeoutMs, this, [this, id]() {
         if (m_pendingRequestId != id)
             return;
         m_pendingRequestId = 0;

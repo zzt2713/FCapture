@@ -26,6 +26,16 @@ namespace {
 
 constexpr int kMinShape = 3;
 
+// 网格规格（对齐"工程图纸"那种极简淡网格）：
+//   格子 32 逻辑像素，线宽 1px
+//   竖线比横线略深一点点 —— 这是原图里的细节，让视觉重心偏向纵向
+//   颜色对比度压得很低，只作为"若有若无"的底纹
+constexpr int    kGridSize        = 32;
+constexpr int    kGridMajorEvery  = 4;      // 每 4 格加一条稍深的线，形成大格
+constexpr QColor kGridLineH(0xE4, 0xE4, 0xE4);   // 横线：更淡
+constexpr QColor kGridLineV(0xDC, 0xDC, 0xDC);   // 竖线：略深
+constexpr QColor kGridMajor(0xD2, 0xD2, 0xD2);   // 每 4 格的粗线
+
 } // namespace
 
 Whiteboard::Whiteboard(const QColor &background, bool transparent, QWidget *parent)
@@ -106,13 +116,52 @@ void Whiteboard::paintEvent(QPaintEvent *e)
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
 
-    if (!m_transparent)
-        p.fillRect(rect(), m_background);
+    if (m_transparent) {
+        // 透明白板：不画底色，网格也不画（网格是"纸张"，透明版就是玻璃）
+    } else {
+        paintGridBackground(p, rect());
+    }
 
     m_model->render(&p, QRectF(rect()));
 
     if (m_inProgress)
         m_inProgress->paint(&p);
+}
+
+// 网格底纹。线条用 0.5 偏移让 1px 线落在像素中心，避免发虚。
+void Whiteboard::paintGridBackground(QPainter &p, const QRect &area) const
+{
+    p.save();
+    // 底色铺满整个绘制设备的可见区域（导出时 painter 可能已被 scale，
+    // 用 device 尺寸而不是逻辑 area，避免高 DPI 下只填了 1/dpr 的一块）
+    p.save();
+    p.resetTransform();
+    p.fillRect(QRect(0, 0, p.device()->width(), p.device()->height()), m_background);
+    p.restore();
+
+    // 网格不需要抗锯齿：1px 直线开着 AA 反而会变成两条半透明灰线
+    p.setRenderHint(QPainter::Antialiasing, false);
+
+    const int step = kGridSize;
+    const int left = area.left();
+    const int right = area.right();
+    const int top = area.top();
+    const int bottom = area.bottom();
+
+    // 竖线（略深）
+    for (int x = left; x <= right; x += step) {
+        const bool major = ((x - left) / step) % kGridMajorEvery == 0;
+        p.setPen(QPen(major ? kGridMajor : kGridLineV, 1));
+        p.drawLine(x, top, x, bottom);
+    }
+    // 横线（更淡）
+    for (int y = top; y <= bottom; y += step) {
+        const bool major = ((y - top) / step) % kGridMajorEvery == 0;
+        p.setPen(QPen(major ? kGridMajor : kGridLineH, 1));
+        p.drawLine(left, y, right, y);
+    }
+
+    p.restore();
 }
 
 // ---------------------------------------------------------------- 输入
@@ -384,16 +433,19 @@ QImage Whiteboard::renderImage() const
 {
     QImage img(size() * devicePixelRatioF(), QImage::Format_ARGB32_Premultiplied);
     img.setDevicePixelRatio(devicePixelRatioF());
-
-    if (m_transparent)
-        img.fill(Qt::transparent);
-    else
-        img.fill(m_background);
+    img.fill(m_transparent ? Qt::transparent : m_background);
 
     QPainter p(&img);
     p.setRenderHint(QPainter::Antialiasing);
     p.setRenderHint(QPainter::TextAntialiasing);
+
+    // 网格在**逻辑坐标**下画（paintGridBackground 内部按 rect() 布局），
+    // 所以先不缩放；画完再缩放给标注用。否则 dpr=1.5 时网格会被放大 1.5 倍。
+    if (!m_transparent)
+        paintGridBackground(p, rect());
+
     p.scale(devicePixelRatioF(), devicePixelRatioF());
+
     m_model->render(&p, QRectF(rect()));
     p.end();
 

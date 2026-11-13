@@ -13,6 +13,7 @@ class QTimer;
 class PinControlButton;
 class AnnotationEditor;
 class PaintBar;
+class LiveWindowSource;
 
 // 贴图窗口：置顶的悬浮图片
 class PinWindow : public QWidget
@@ -54,7 +55,9 @@ public:
     void replaceImage(const QImage &img);
 
     // 一次性调整：缩放、旋转、镜像、灰度、反色
-    void zoomBy(qreal factor);
+    // anchor 是窗口本地坐标；缩放时该点保持不动。
+    // 默认取窗口中心（键盘 +/- 用），滚轮会显式传鼠标位置。
+    void zoomBy(qreal factor, const QPoint &anchor = QPoint(-1, -1));
     void setScale(qreal s);
     qreal scale() const { return m_scale; }
     void rotateCW();
@@ -79,6 +82,13 @@ public:
     bool isEditing() const { return m_editing; }
     void applyEdit();
     void cancelEdit();
+
+    // 实时窗口贴图（snow 的 Live Window）：
+    // 把 targetWindow 的画面持续镜像到这个贴图上。
+    // 失败返回 false，error 里是可展示的原因。
+    bool startLiveWindow(quintptr targetWindow, QString *error = nullptr);
+    void stopLiveWindow();
+    bool isLiveWindow() const { return m_liveSource != nullptr; }
 
     // 由 AppController 提供给状态栏等使用
     QPixmap snapshotForRecovery() const;
@@ -135,6 +145,8 @@ private:
     // 编辑工具栏是独立顶层窗口：跟随贴图摆到其右下角外侧
     void placeEditToolbar();
     QSize scaledContentSize() const;
+    // 初始缩放适配屏幕工作区（超图自动缩小，小图保持 100%）
+    void fitScaleToScreen();
     QRect imageTargetRect() const;
     void drawBackground(QPainter &p);
     void drawShadow(QPainter &p, bool active);
@@ -200,6 +212,9 @@ private:
     AnnotationEditor *m_editor = nullptr;
     // 编辑工具栏挂在窗口上（不是编辑器里），才能摆到贴图外面的右下角
     PaintBar *m_editBar = nullptr;
+
+    // 实时窗口捕获（非空 = 这张贴图是 Live Window）
+    LiveWindowSource *m_liveSource = nullptr;
 
     QString m_group = QStringLiteral("Default");
     QUuid   m_desktopId;          // 创建时所在虚拟桌面

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FCapture VERSION 1.5.2 LANGUAGES CXX)
+project(FCapture VERSION 1.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -85,6 +85,7 @@ set(APP_SOURCES
     src/platform/win/ElementDetector.cpp
     src/platform/win/FullscreenDetector.cpp
     src/platform/win/HotkeyHook.cpp
+    src/platform/win/LiveWindowSource.cpp
     src/platform/win/WinOcr.cpp
     src/platform/win/VirtualDesktop.cpp
     src/platform/win/QrScanner.cpp
@@ -172,6 +173,7 @@ set(HEADERS
     src/platform/win/ElementDetector.h
     src/platform/win/FullscreenDetector.h
     src/platform/win/HotkeyHook.h
+    src/platform/win/LiveWindowSource.h
     src/platform/win/WinOcr.h
     src/platform/win/VirtualDesktop.h
     src/platform/win/QrScanner.h
@@ -313,6 +315,7 @@ qt_add_resources(FCapture "icon_resources"
         resources/icons/copy.svg
         resources/icons/save.svg
         resources/icons/pin.svg
+        resources/icons/pin-window.svg
         resources/icons/send.svg
         resources/icons/scan-text.svg
         resources/icons/qr-code.svg

@@ -154,6 +154,7 @@ SnipOverlay::SnipOverlay(QWidget *parent)
     connect(m_paintBar, &PaintBar::copyRequested, this, [this]() { finishSnip(SnipOutput::Copy); });
     connect(m_paintBar, &PaintBar::saveRequested, this, [this]() { finishSnip(SnipOutput::FileDialog); });
     connect(m_paintBar, &PaintBar::pinRequested, this, [this]() { finishSnip(SnipOutput::Pin); });
+    connect(m_paintBar, &PaintBar::pinWindowRequested, this, &SnipOverlay::pinSelectedWindow);
     connect(m_paintBar, &PaintBar::closeRequested, this, [this]() { abortSnip(); });
     connect(m_paintBar, &PaintBar::resetNumberRequested, this,
             [](int groupId) { NumberShape::resetNumbering(groupId); });
@@ -2361,6 +2362,7 @@ bool SnipOverlay::finishSnip(SnipOutput output)
     result.image = composeResultImage();
     result.logicalRect = globalSelection();
     result.valid = !result.image.isNull();
+    result.pinTargetWindow = m_pinTargetWindow;
 
     if (!result.valid) {
         abortSnip();
@@ -2401,6 +2403,7 @@ bool SnipOverlay::finishSnip(SnipOutput output)
     }
 
     case SnipOutput::Pin:
+    case SnipOutput::PinWindow:
         // 真正的贴图由 AppController 在 onSnipFinished 里完成，
         // 这里不要复制到剪贴板（否则会污染剪贴板，且贴图内容会重复）
         break;
@@ -2416,6 +2419,26 @@ bool SnipOverlay::finishSnip(SnipOutput output)
     releaseSessionImages();
     close();
     return true;
+}
+
+// 钉住窗口：用户想"实时"看到某个窗口，而不是截一张静态图。
+// 取选区中心下面的顶层窗口，把它交给 AppController 建成 Live 贴图。
+void SnipOverlay::pinSelectedWindow()
+{
+    const QRect sel = localSelection();
+    if (sel.isEmpty())
+        return;
+
+    // 选区中心在屏幕上的位置（遮罩自己会被 WindowDetector 排除）
+    const QPoint globalCenter = mapToGlobal(sel.center());
+    const WindowInfo target = WindowDetector::windowFromPoint(globalCenter);
+    if (!target.hwnd) {
+        showCenterNotice(QStringLiteral("没有找到可钉住的窗口"));
+        return;
+    }
+
+    m_pinTargetWindow = target.hwnd;
+    finishSnip(SnipOutput::PinWindow);
 }
 
 void SnipOverlay::releaseSessionImages()

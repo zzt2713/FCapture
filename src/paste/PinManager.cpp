@@ -21,12 +21,12 @@ namespace {
 // 让新窗口出现在光标处，但不超出屏幕范围。
 // anchor 用图片内容位置选屏幕，避免窗口阴影临时越界时选错显示器。
 //
-// useWorkArea：true = 限制在工作区（availableGeometry，避开任务栏）；
-// false = 限制在整块屏幕（geometry）。截图原位贴图必须传 false：
-// 用户截的是任务栏那一块，贴出来就该留在任务栏位置，不能被"让位"
-// 顶到任务栏上边去。
-QPoint clampToScreen(const QPoint &pos, const QSize &size, const QPoint &anchor,
-                     bool useWorkArea)
+// 一律用工作区（availableGeometry）做钳制 —— 对齐 snow 的
+// recoverPinnedPlacement：贴图不允许盖住任务栏。
+//
+// 之前为了"截图原位贴图"，对 useExactPos 放行了一整块屏幕（geometry），
+// 结果是截到任务栏的图贴出来会压在任务栏上，反而挡操作。
+QPoint clampToScreen(const QPoint &pos, const QSize &size, const QPoint &anchor)
 {
     QScreen *screen = QGuiApplication::screenAt(anchor);
     if (!screen)
@@ -38,7 +38,7 @@ QPoint clampToScreen(const QPoint &pos, const QSize &size, const QPoint &anchor,
     if (!screen)
         return pos;
 
-    const QRect avail = useWorkArea ? screen->availableGeometry() : screen->geometry();
+    const QRect avail = screen->availableGeometry();
     int x = pos.x();
     int y = pos.y();
     if (x + size.width() - 1 > avail.right())
@@ -71,6 +71,25 @@ PinManager::PinManager(QObject *parent)
         m_lastDesktopId = VirtualDesktop::currentDesktopId();
         m_desktopTimer->start();
     }
+
+    // 屏幕环境变化：分辨率改了、显示器拔了、任务栏挪了位置，
+    // 贴图很可能已经落在可视区外面 —— 用户再也找不到它。
+    // 对齐 snow 的 reconcilePlatformEnvironment：延迟一拍再做，
+    // 因为 Qt 在信号发出时还没完成自己的窗口重排。
+    const auto scheduleReconcile = [this]() {
+        QTimer::singleShot(0, this, &PinManager::reconcilePinnedPlacement);
+    };
+    for (QScreen *screen : QGuiApplication::screens()) {
+        connect(screen, &QScreen::geometryChanged, this, scheduleReconcile);
+        connect(screen, &QScreen::availableGeometryChanged, this, scheduleReconcile);
+    }
+    connect(qGuiApp, &QGuiApplication::screenAdded, this,
+            [this, scheduleReconcile](QScreen *screen) {
+                connect(screen, &QScreen::geometryChanged, this, scheduleReconcile);
+                connect(screen, &QScreen::availableGeometryChanged, this, scheduleReconcile);
+                scheduleReconcile();
+            });
+    connect(qGuiApp, &QGuiApplication::screenRemoved, this, scheduleReconcile);
 }
 
 PinManager::~PinManager()
@@ -96,6 +115,57 @@ void PinManager::syncDesktopVisibility()
             w->show();
         else if (!onCurrent && w->isVisible())
             w->hide();
+    }
+}
+
+// 屏幕环境变化后，把每张贴图重新拉回可视工作区。
+//
+// 对齐 snow 的 recoverPinnedPlacement：
+//   1. 找出贴图当前所在（或最近的）屏幕
+//   2. 用该屏的工作区把位置夹回去
+//   3. 贴图比工作区还大时，等比缩小到放得下
+// 只动位置/缩放，不动用户设置的其他状态。
+void PinManager::reconcilePinnedPlacement()
+{
+    for (PinWindow *w : m_windows) {
+        if (!w)
+            continue;
+
+        // 屏幕被拔出后窗口可能已经不在任何屏幕内，用中心点找最近的
+        QScreen *screen = QGuiApplication::screenAt(w->frameGeometry().center());
+        if (!screen)
+            screen = QGuiApplication::screenAt(QCursor::pos());
+        if (!screen)
+            screen = QGuiApplication::primaryScreen();
+        if (!screen)
+            continue;
+
+        const QRect work = screen->availableGeometry();
+        if (work.isEmpty())
+            continue;
+
+        // 先按工作区收缩：贴图比屏幕还大时等比缩小
+        const QRect content = w->contentRect();
+        const QSize contentSize = content.size();
+        if (contentSize.width() > work.width() || contentSize.height() > work.height()) {
+            const qreal fit = qMin(qreal(work.width()) / contentSize.width(),
+                                   qreal(work.height()) / contentSize.height());
+            if (fit > 0.0 && fit < 1.0)
+                w->setScale(w->scale() * fit);
+        }
+
+        // 再把窗口位置夹回工作区
+        const QRect geo = w->frameGeometry();
+        int x = geo.left();
+        int y = geo.top();
+        if (x + geo.width() - 1 > work.right())
+            x = work.right() - geo.width() + 1;
+        if (y + geo.height() - 1 > work.bottom())
+            y = work.bottom() - geo.height() + 1;
+        x = qMax(work.left(), x);
+        y = qMax(work.top(), y);
+        if (x != geo.left() || y != geo.top())
+            w->move(x, y);
     }
 }
 
@@ -168,14 +238,13 @@ void PinManager::placementPosition(PinWindow *w, const QPoint &requested, bool u
     if (!screen)
         screen = QGuiApplication::primaryScreen();
 
-    // 磁性吸附：靠近屏幕边缘/其他贴图时吸附。
-    // 吸附基准必须和钳制基准一致：截图原位贴图用整块屏幕边界，
-    // 否则贴到任务栏区域时会被"吸附"到工作区底边，看起来像自己往上跳。
+    // 磁性吸附：靠近工作区边缘/其他贴图时吸附。
+    // 吸附基准与钳制基准一致（都取 availableGeometry），
+    // 否则会出现在任务栏区域"吸上去又弹回来"的抖动。
     const int magnet = ConfigManager::instance()
                            ->value(QStringLiteral("paste/magnetic_attach_threshold"), 20).toInt();
     if (magnet > 0 && screen) {
-        const QRect bounds =
-            useExactPos ? screen->geometry() : screen->availableGeometry();
+        const QRect bounds = screen->availableGeometry();
         if (!bounds.isEmpty()) {
             const int right = bounds.left() + bounds.width();
             const int bottom = bounds.top() + bounds.height();
@@ -191,7 +260,7 @@ void PinManager::placementPosition(PinWindow *w, const QPoint &requested, bool u
     }
 
     const QPoint windowPos = contentPos - contentOffset;
-    w->move(clampToScreen(windowPos, w->size(), contentPos, /*useWorkArea=*/!useExactPos));
+    w->move(clampToScreen(windowPos, w->size(), contentPos));
 }
 
 PinWindow *PinManager::pasteImage(const QImage &img, const QPoint &globalPos,
@@ -211,6 +280,33 @@ PinWindow *PinManager::pasteImage(const QImage &img, const QPoint &globalPos,
     placementPosition(w, globalPos, useExactPos);
     w->show();
     w->raise();
+    return w;
+}
+
+// 实时窗口贴图：先按首帧建窗口（尺寸跟着首帧走），
+// 然后再挂上 LiveWindowSource 持续刷新。
+PinWindow *PinManager::pasteLiveWindow(quintptr targetWindow, const QImage &initialFrame,
+                                       const QPoint &globalPos, qreal imageDpr)
+{
+    if (initialFrame.isNull() || !targetWindow)
+        return nullptr;
+
+    auto *w = new PinWindow(initialFrame, QString(), imageDpr);
+    attachWindow(w);
+
+    if (ConfigManager::instance()->value(QStringLiteral("snip/paste_current_desktop_only")).toBool())
+        w->setDesktopId(VirtualDesktop::currentDesktopId());
+
+    placementPosition(w, globalPos, /*useExactPos=*/true);
+    w->show();
+    w->raise();
+
+    QString error;
+    if (!w->startLiveWindow(targetWindow, &error)) {
+        // 捕获失败：退化成普通静态贴图，至少内容还在
+        qWarning() << "PinManager: live window failed, falling back to static pin:" << error;
+        w->setToolTip(QStringLiteral("实时捕获失败，已显示静态画面"));
+    }
     return w;
 }
 

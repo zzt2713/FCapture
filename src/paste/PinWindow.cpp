@@ -3,6 +3,7 @@
 #include "annotate/AnnotationEditor.h"
 #include "annotate/PaintBar.h"
 #include "core/ImageOutput.h"
+#include "platform/win/LiveWindowSource.h"
 #include "paste/PinControlButton.h"
 #include "paste/PinManager.h"
 #include "platform/win/VirtualDesktop.h"
@@ -59,6 +60,10 @@ PinWindow::PinWindow(const QImage &image, const QString &sourceText,
 
     applyTopmost();
     rebuildDisplay();
+    // 超大图片（网页图、4K 截图）先缩到能放进屏幕工作区再显示，
+    // 否则贴出来比屏幕还大，用户只能看到局部，还得自己滚轮缩小。
+    // 对齐 snow 的 pin_to_screen/auto_resize_window（默认开启）。
+    fitScaleToScreen();
     updateWindowSize();
     createControlButtons();
 
@@ -86,6 +91,9 @@ PinWindow::PinWindow(const QImage &image, const QString &sourceText,
 
 PinWindow::~PinWindow()
 {
+    // 实时捕获要在窗口销毁前停掉，否则捕获会话会继续往已释放的对象投递帧
+    stopLiveWindow();
+
     // 编辑工具栏是独立顶层窗口，没有父对象，必须在这里显式销毁，
     // 否则贴图关闭后它会在屏幕上残留。
     delete m_editBar;
@@ -176,6 +184,44 @@ QSize PinWindow::scaledContentSize() const
                  qRound(base.height() * m_scale)).expandedTo(QSize(16, 16));
 }
 
+// 把初始缩放压到"能放进屏幕工作区"的大小。
+//
+// 对齐 snow 的 fitImageToAvailableGeometry（pinnedgeometry.h）：
+//   scale = min(1.0, 可用宽 / 图片宽, 可用高 / 图片高)
+// 只在**放不下时**缩小，绝不放大小图（小图放大反而糊）。
+// 用 availableGeometry 而不是 geometry：贴图不允许压在任务栏上。
+void PinWindow::fitScaleToScreen()
+{
+    if (m_display.isNull())
+        return;
+
+    QScreen *screen = QGuiApplication::screenAt(QCursor::pos());
+    if (!screen)
+        screen = QGuiApplication::primaryScreen();
+    if (!screen)
+        return;
+
+    // 预留窗口阴影边距 + 一点呼吸空间，避免贴上去正好顶满屏幕边缘
+    constexpr int kMargin = 16;
+    const QRect avail = screen->availableGeometry().adjusted(
+        kMargin, kMargin, -kMargin, -kMargin);
+    if (avail.width() <= 0 || avail.height() <= 0)
+        return;
+
+    const QSize base = baseLogicalSize();
+    if (base.isEmpty())
+        return;
+
+    // 只在放不下时缩，且最多缩到 1/20（和 m_scale 下限一致）
+    const qreal fitW = qreal(avail.width()) / base.width();
+    const qreal fitH = qreal(avail.height()) / base.height();
+    const qreal fit = qMin(fitW, fitH);
+    if (fit >= 1.0)
+        return;   // 放得下：保持 100%
+
+    m_scale = qBound(kMinScale, fit, 1.0);
+}
+
 void PinWindow::updateWindowSize()
 {
     const QSize content = scaledContentSize();
@@ -212,15 +258,20 @@ void PinWindow::layoutControlButtons()
 
     // 贴在内容区右上角（不是含阴影的窗口右上角）。
     // 顺序：编辑在左、关闭在右，关闭键贴最外沿，符合"叉号在最右"的直觉。
+    // 实时窗口没有编辑按钮，关闭键直接贴到最右。
     constexpr int kControlsInset = 8;
     const QRect content = contentRect();
     const int y = content.y() + kControlsInset;
     const int closeX =
         content.right() - kControlsInset - PinControlButton::kSize + 1;
-    const int editX = closeX - PinControlButton::kSpacing - PinControlButton::kSize;
 
-    m_editButton->move(editX, y);
-    m_closeButton->move(closeX, y);
+    if (isLiveWindow()) {
+        m_closeButton->move(closeX, y);
+    } else {
+        const int editX = closeX - PinControlButton::kSpacing - PinControlButton::kSize;
+        m_editButton->move(editX, y);
+        m_closeButton->move(closeX, y);
+    }
 
     m_editButton->raise();
     m_closeButton->raise();
@@ -235,11 +286,14 @@ void PinWindow::updateControlButtonsVisibility()
         return;
 
     const bool show = (m_hovered || m_editing) && !m_cropping;
-    m_editButton->setVisible(show);
+    // 实时窗口贴图不提供「重新标注」：内容是活的，烘焙标注没有意义。
+    // 只留关闭按钮。
+    m_editButton->setVisible(show && !isLiveWindow());
     m_closeButton->setVisible(show);
 
     if (show) {
-        m_editButton->raise();
+        if (m_editButton->isVisible())
+            m_editButton->raise();
         m_closeButton->raise();
     }
 }
@@ -264,8 +318,10 @@ void PinWindow::replaceImage(const QImage &img)
     rebuildDisplay();
 }
 
-void PinWindow::zoomBy(qreal factor)
+// 缩放：**左上角固定**。滚轮和键盘 +/- 行为一致。
+void PinWindow::zoomBy(qreal factor, const QPoint &anchorIn)
 {
+    Q_UNUSED(anchorIn);
     const qreal next = qBound(kMinScale, m_scale * factor, kMaxScale);
     if (qFuzzyCompare(next, m_scale))
         return;
@@ -536,6 +592,9 @@ void PinWindow::enterEditMode()
 {
     if (m_editing || m_display.isNull())
         return;
+    // 实时窗口不进入标注编辑：内容是活的，烘焙标注没有意义
+    if (isLiveWindow())
+        return;
 
     m_editing = true;
     m_cropping = false;
@@ -637,6 +696,63 @@ void PinWindow::cancelEdit()
     setCursor(Qt::OpenHandCursor);
     updateControlButtonsVisibility();
     update();
+}
+
+// ---------------------------------------------------------------- 实时窗口
+
+bool PinWindow::startLiveWindow(quintptr targetWindow, QString *error)
+{
+    if (!targetWindow) {
+        if (error)
+            *error = QStringLiteral("没有找到可捕获的窗口");
+        return false;
+    }
+
+    stopLiveWindow();
+    m_liveSource = new LiveWindowSource(this);
+    connect(m_liveSource, &LiveWindowSource::frameReady, this,
+            [this](const QImage &frame) {
+                if (frame.isNull())
+                    return;
+                // 实时帧直接成为显示图；保留第一帧作为 original，
+                // 这样暂停/断开后仍能显示最后一帧内容。
+                if (m_original.isNull())
+                    m_original = frame;
+                m_display = frame;
+                m_pixmap = QPixmap::fromImage(frame);
+                // 实时画面固定按 1:1 显示，不做旋转/镜像等变换
+                if (m_scale <= 0.0)
+                    m_scale = 1.0;
+                updateWindowSize();
+                update();
+            });
+    connect(m_liveSource, &LiveWindowSource::stateChanged, this,
+            [this](LiveWindowSource::State state, const QString &message) {
+                if (state == LiveWindowSource::State::Live)
+                    return;
+                // 最小化/关闭/不可用：保留最后一帧并提示，不销毁窗口
+                if (!message.isEmpty())
+                    setToolTip(message);
+            });
+
+    if (!m_liveSource->start(targetWindow, error)) {
+        m_liveSource->deleteLater();
+        m_liveSource = nullptr;
+        return false;
+    }
+
+    // 捕获对象自己会持续出帧；首帧到来前先把窗口摆出来
+    setToolTip(QStringLiteral("实时窗口（内容会自动更新）"));
+    return true;
+}
+
+void PinWindow::stopLiveWindow()
+{
+    if (!m_liveSource)
+        return;
+    m_liveSource->stop();
+    m_liveSource->deleteLater();
+    m_liveSource = nullptr;
 }
 
 QPixmap PinWindow::snapshotForRecovery() const

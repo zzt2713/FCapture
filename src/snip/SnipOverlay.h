@@ -149,6 +149,10 @@ private:
     QImage  composeResultImage() const;
     // 返回是否真正结束了会话（保存对话框被取消 = false）
     bool    finishSnip(SnipOutput output);
+    // 钉住窗口：把选区所在的窗口实时镜像成贴图
+    void    pinSelectedWindow();
+    // pinSelectedWindow 选中的目标窗口，随 SnipResult 交给 AppController
+    quintptr m_pinTargetWindow = 0;
     void    abortSnip();
 
     // --- P4 检测 ---

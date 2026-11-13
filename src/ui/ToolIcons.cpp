@@ -119,6 +119,7 @@ QPixmap clearIcon(int size, const QColor &color) { return renderNamed(QStringLit
 QPixmap copyIcon(int size, const QColor &color)  { return renderNamed(QStringLiteral("copy"), size, color); }
 QPixmap saveIcon(int size, const QColor &color)  { return renderNamed(QStringLiteral("save"), size, color); }
 QPixmap pinIcon(int size, const QColor &color)   { return renderNamed(QStringLiteral("pin"), size, color); }
+QPixmap liveWindowIcon(int size, const QColor &color) { return renderNamed(QStringLiteral("pin-window"), size, color); }
 QPixmap sendIcon(int size, const QColor &color)  { return renderNamed(QStringLiteral("send"), size, color); }
 QPixmap ocrIcon(int size, const QColor &color)   { return renderNamed(QStringLiteral("scan-text"), size, color); }
 QPixmap barcodeIcon(int size, const QColor &color) { return renderNamed(QStringLiteral("qr-code"), size, color); }

@@ -7,13 +7,20 @@
 #include <QPainter>
 
 namespace {
-// 面板排版常量（snow ScreenshotShortcutHintsWidget 同款节奏：
-// 内边距 16 / 行高 22 / 行距 16 / chip 水平内边距 16）
+// 严格对齐 snow 的 ScreenshotShortcutHintsWidget 常量：
+//   Margin 16 / Padding 16 / Radius 6 / FontSize 14 / LineHeight 22
+//   RowSpacing 16 / ColonMarginLeft 2 / ColonMarginRight 8
+//   ChipPaddingH 16 / ChipPaddingV 2 / ChipRadius 6
 constexpr int kTipsPad = 16;
-constexpr int kTipsBar = 3;      // 左侧主色条宽度
 constexpr int kTipsGap = 16;
 constexpr int kChipPadH = 16;
 constexpr int kChipPadV = 2;
+constexpr int kChipRadius = 6;
+constexpr int kPanelRadius = 6;
+constexpr int kColonMarginLeft = 2;
+constexpr int kColonMarginRight = 8;
+constexpr int kHintFontPx = 14;
+constexpr int kHintLineHeight = 22;
 } // namespace
 
 ShortcutTipsWidget::ShortcutTipsWidget(QWidget *parent)
@@ -47,9 +54,9 @@ void ShortcutTipsWidget::setRows(const QVector<Row> &rows)
 void ShortcutTipsWidget::relayout()
 {
     m_metrics = computeMetrics();
-    const QSize size(kTipsBar + kTipsPad + m_metrics.labelColumn + m_metrics.colonWidth
-                         + m_metrics.chipColumn + kTipsPad,
-                     kTipsPad * 2 + m_metrics.rowHeight * m_rows.size()
+    const QSize size(kTipsPad * 2 + m_metrics.labelColumn + m_metrics.colonWidth
+                         + m_metrics.chipColumn,
+                     kTipsPad * 2 + kHintLineHeight * m_rows.size()
                          + kTipsGap * qMax(0, m_rows.size() - 1));
     setFixedSize(size);
     update();
@@ -58,13 +65,14 @@ void ShortcutTipsWidget::relayout()
 ShortcutTipsWidget::Metrics ShortcutTipsWidget::computeMetrics() const
 {
     QFont font = Theme::appFont();
-    font.setPointSize(9);
+    font.setPixelSize(kHintFontPx);
     const QFontMetrics fm(font);
 
     Metrics m;
-    m.chipHeight = fm.height() + kChipPadV * 2;
-    m.rowHeight = qMax(22, m.chipHeight);
-    m.colonWidth = fm.horizontalAdvance(QLatin1Char(':')) + 2 + 8;
+    m.chipHeight = kHintLineHeight + kChipPadV * 2;
+    m.rowHeight = kHintLineHeight;
+    m.colonWidth = fm.horizontalAdvance(QLatin1Char(':')) + kColonMarginLeft
+                   + kColonMarginRight;
     for (const Row &r : m_rows) {
         m.labelColumn = qMax(m.labelColumn, fm.horizontalAdvance(r.desc));
         m.chipColumn = qMax(m.chipColumn,
@@ -99,48 +107,45 @@ void ShortcutTipsWidget::paintEvent(QPaintEvent *e)
     p.setRenderHint(QPainter::TextAntialiasing, true);
 
     QFont font = Theme::appFont();
-    font.setPointSize(9);
+    font.setPixelSize(kHintFontPx);
     p.setFont(font);
 
-    const QRect box = rect();
-
-    // 面板：snow 同款黑 163 底 + 圆角 6
+    // 面板：黑 163 底 + 圆角 6（snow 同款，无左侧色条）
     p.setPen(Qt::NoPen);
     p.setBrush(QColor(0, 0, 0, 163));
-    p.drawRoundedRect(box.adjusted(0, 0, -1, -1), 6, 6);
+    p.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5),
+                      kPanelRadius, kPanelRadius);
 
-    // 左侧 3px 主色条（裁进圆角，不越出面板轮廓）
-    p.save();
-    p.setClipRect(0, 0, kTipsBar, height());
-    p.setBrush(QColor(0x3D, 0x8B, 0xFD));
-    p.drawRoundedRect(box.adjusted(0, 0, -1, -1), 6, 6);
-    p.restore();
+    const QFontMetrics fm(font);
+    const QColor contentColor(Qt::white);
+    int rowTop = kTipsPad;
 
-    int top = kTipsPad;
     for (const Row &r : m_rows) {
-        const int labelX = kTipsBar + kTipsPad;
-
-        // 说明在前（snow 版式），次要白
+        // 说明文字：白 184
+        const int labelWidth = fm.horizontalAdvance(r.desc);
         p.setPen(QColor(255, 255, 255, 184));
-        p.drawText(QRect(labelX, top, m_metrics.labelColumn, m_metrics.rowHeight),
-                   Qt::AlignVCenter | Qt::AlignLeft, r.desc);
+        p.drawText(QRect(kTipsPad, rowTop, labelWidth, kHintLineHeight),
+                   Qt::AlignLeft | Qt::AlignVCenter, r.desc);
 
         // 冒号
-        int x = labelX + m_metrics.labelColumn + 2;
-        p.setPen(QColor(255, 255, 255, 128));
-        p.drawText(QRect(x, top, m_metrics.colonWidth, m_metrics.rowHeight),
-                   Qt::AlignVCenter | Qt::AlignLeft, QStringLiteral(":"));
-        x += m_metrics.colonWidth;
+        const int colonLeft = kTipsPad + labelWidth + kColonMarginLeft;
+        const int colonWidth = fm.horizontalAdvance(QLatin1Char(':'));
+        p.setPen(QColor(255, 255, 255, 184));
+        p.drawText(QRect(colonLeft, rowTop, colonWidth, kHintLineHeight),
+                   Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral(":"));
 
-        // 主色描边 chip
-        const QRect chipRect(x, top + (m_metrics.rowHeight - m_metrics.chipHeight) / 2,
-                             m_metrics.chipColumn, m_metrics.chipHeight);
-        p.setPen(QPen(QColor(0x3D, 0x8B, 0xFD), 1));
+        // 按键 chip：**白色** 1px 描边 + 白色文字（snow 用 contentColor，不是主色）
+        const int chipLeft = colonLeft + colonWidth + kColonMarginRight;
+        const QRectF chipRect(chipLeft, rowTop - kChipPadV,
+                              m_metrics.chipColumn, kHintLineHeight + kChipPadV * 2);
+        p.setPen(QPen(contentColor, 1.0));
         p.setBrush(Qt::NoBrush);
-        p.drawRoundedRect(chipRect, 6, 6);
-        p.setPen(QColor(0x9D, 0xC1, 0xFF));
+        p.drawRoundedRect(chipRect.adjusted(0.5, 0.5, -0.5, -0.5),
+                          kChipRadius, kChipRadius);
+
+        p.setPen(contentColor);
         p.drawText(chipRect, Qt::AlignCenter, r.keys);
 
-        top += m_metrics.rowHeight + kTipsGap;
+        rowTop += kHintLineHeight + kTipsGap;
     }
 }

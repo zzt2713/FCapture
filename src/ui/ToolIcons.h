@@ -17,6 +17,7 @@ QPixmap clearIcon(int size, const QColor &color);
 QPixmap copyIcon(int size, const QColor &color);
 QPixmap saveIcon(int size, const QColor &color);
 QPixmap pinIcon(int size, const QColor &color);
+QPixmap liveWindowIcon(int size, const QColor &color);
 QPixmap sendIcon(int size, const QColor &color);
 QPixmap ocrIcon(int size, const QColor &color);
 QPixmap barcodeIcon(int size, const QColor &color);

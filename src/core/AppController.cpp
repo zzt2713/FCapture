@@ -339,6 +339,19 @@ void AppController::onSnipFinished(const SnipResult &result, SnipOutput output)
             qWarning() << "AppController: failed to pin completed snip";
         break;
     }
+    case SnipOutput::PinWindow: {
+        // 钉住窗口：贴图内容是该窗口的**实时**画面，不是这张静态截图
+        const QPoint origin = result.logicalRect.topLeft();
+        qreal dpr = 1.0;
+        if (QScreen *screen = QGuiApplication::screenAt(origin))
+            dpr = screen->devicePixelRatio();
+
+        PinWindow *w = PinManager::instance()->pasteLiveWindow(
+            result.pinTargetWindow, result.image, origin, dpr);
+        if (!w)
+            qWarning() << "AppController: failed to create live window pin";
+        break;
+    }
     }
 
     // 自动保存：截图完成后静默保存一份
